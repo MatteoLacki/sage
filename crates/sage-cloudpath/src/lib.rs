@@ -15,6 +15,9 @@ pub use util::FileFormat;
 #[cfg(feature = "parquet")]
 pub mod parquet;
 
+#[cfg(feature = "parquet")]
+pub mod pmsms;
+
 /// Convert a path string (local path or cloud URL) into a [`Url`].
 pub fn to_url(s: &str) -> Result<Url, Error> {
     if let Ok(url) = Url::parse(s) {
@@ -151,6 +154,9 @@ pub enum Error {
     TDF(#[from] timsrust::TimsRustError),
     #[error("MGF error: {0}")]
     MGF(#[from] mgf::MgfError),
+    #[cfg(feature = "parquet")]
+    #[error("pmsms error: {0}")]
+    Pmsms(#[from] pmsms::PmsmsError),
 }
 
 #[cfg(test)]

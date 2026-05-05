@@ -8,6 +8,7 @@ pub enum FileFormat {
     MzML,
     MGF,
     TDF,
+    Pmsms,
     Unidentified,
 }
 
@@ -22,6 +23,7 @@ impl FileFormat {
             FileFormat::MzML => false,
             FileFormat::MGF => false,
             FileFormat::TDF => true,
+            FileFormat::Pmsms => false,
             FileFormat::Unidentified => false,
         }
     }
@@ -36,6 +38,8 @@ impl From<&str> for FileFormat {
             FileFormat::TDF
         } else if path_lower.ends_with(".mzml.gz") || path_lower.ends_with(".mzml") {
             FileFormat::MzML
+        } else if path_lower.ends_with(".pmsms") {
+            FileFormat::Pmsms
         } else {
             FileFormat::Unidentified
         }
@@ -67,8 +71,25 @@ pub fn read_spectra<S: AsRef<str>>(
         FileFormat::MzML => read_mzml(path, file_id, sn),
         FileFormat::MGF => read_mgf(path, file_id),
         FileFormat::TDF => read_tdf(path, file_id, bruker_processor, requires_ms1),
-        FileFormat::Unidentified => panic!("Unable to get type for '{}'", path.as_ref()), // read_mzml(path, file_id, sn),
+        FileFormat::Pmsms => read_pmsms(path, file_id),
+        FileFormat::Unidentified => panic!("Unable to get type for '{}'", path.as_ref()),
     }
+}
+
+#[cfg(feature = "parquet")]
+pub fn read_pmsms<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
+    // SAGE passes file:// URLs; resolve to a local filesystem path.
+    let local_dir = crate::to_url(path.as_ref())
+        .and_then(|u| u.to_file_path().map_err(|_| Error::InvalidUri))?;
+    crate::pmsms::parse(&local_dir, file_id).map_err(Error::Pmsms)
+}
+
+#[cfg(not(feature = "parquet"))]
+pub fn read_pmsms<S: AsRef<str>>(path: S, _file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
+    panic!(
+        "pmsms format requires the 'parquet' feature; recompile with --features parquet (path: {})",
+        path.as_ref()
+    )
 }
 
 pub fn read_mzml<S: AsRef<str>>(
@@ -174,5 +195,6 @@ mod test {
         assert_eq!(FileFormat::from("foo.tdf"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d/"), FileFormat::TDF);
+        assert_eq!(FileFormat::from("./data/run.pmsms"), FileFormat::Pmsms);
     }
 }
