@@ -49,6 +49,9 @@ pub struct Search {
     #[serde(skip_serializing)]
     pub annotate_matches: bool,
 
+    #[serde(skip_serializing)]
+    pub disable_rescoring: bool,
+
     pub score_type: ScoreType,
 }
 
@@ -80,6 +83,7 @@ pub struct Input {
     pub annotate_matches: Option<bool>,
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
+    pub disable_rescoring: Option<bool>,
     pub score_type: Option<ScoreType>,
 }
 
@@ -226,6 +230,10 @@ impl Input {
             input.annotate_matches = Some(annotate_matches);
         }
 
+        if let Some(disable_rescoring) = matches.get_one::<bool>("disable-rescoring").copied() {
+            input.disable_rescoring = Some(disable_rescoring);
+        }
+
         // avoid to later panic if these parameters are not set (but doesn't check if files exist)
 
         ensure!(
@@ -367,6 +375,7 @@ impl Input {
             min_matched_peaks: self.min_matched_peaks.unwrap_or(4),
             max_fragment_charge: self.max_fragment_charge,
             annotate_matches: self.annotate_matches.unwrap_or(false),
+            disable_rescoring: self.disable_rescoring.unwrap_or(false),
             precursor_charge: self.precursor_charge.unwrap_or((2, 4)),
             override_precursor_charge: self.override_precursor_charge.unwrap_or(false),
             isotope_errors: self.isotope_errors.unwrap_or((0, 0)),

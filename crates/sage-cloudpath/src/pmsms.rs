@@ -10,7 +10,8 @@
 
 #![cfg(feature = "parquet")]
 
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -28,6 +29,14 @@ pub enum PmsmsError {
     MissingColumn(&'static str),
     #[error("tof index {0} out of range (tof2mz len={1})")]
     TofOutOfRange(u32, usize),
+    #[error("tof filter metadata key missing: {0}")]
+    MissingFilterMetadata(&'static str),
+    #[error("unsupported tof filter encoding: {0}")]
+    UnsupportedFilterEncoding(String),
+    #[error("tof filter count mismatch: {0}")]
+    FilterCountMismatch(String),
+    #[error("missing dataindex row for fragment_spectrum_start={0}")]
+    MissingDataindexRow(u64),
 }
 
 struct PrecursorRow {
@@ -131,6 +140,82 @@ unsafe fn mmap_as_slice<T: Copy>(path: &Path) -> Result<(Mmap, &'static [T]), Pm
     Ok((mmap, slice))
 }
 
+struct TofFilter {
+    precursor_keep: Vec<u8>,
+    fragment_keep: Vec<u8>,
+    dataindex_idx: Vec<u64>,
+}
+
+fn metadata_value<'a>(metadata: &'a str, key: &'static str) -> Result<&'a str, PmsmsError> {
+    metadata
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+        .ok_or(PmsmsError::MissingFilterMetadata(key))
+}
+
+fn unpack_lsb_bits(path: &Path, n_bits: usize) -> Result<Vec<u8>, PmsmsError> {
+    let mut file = File::open(path)?;
+    let mut packed = Vec::new();
+    file.read_to_end(&mut packed)?;
+    let needed = (n_bits + 7) / 8;
+    if packed.len() < needed {
+        return Err(PmsmsError::FilterCountMismatch(format!(
+            "{} too short: expected at least {} bytes, got {}",
+            path.display(),
+            needed,
+            packed.len()
+        )));
+    }
+    let mut bits = vec![0; n_bits];
+    for i in 0..n_bits {
+        bits[i] = (packed[i / 8] >> (i % 8)) & 1;
+    }
+    Ok(bits)
+}
+
+fn load_tof_filter(dir: &Path, n_fragments: usize) -> Result<Option<TofFilter>, PmsmsError> {
+    let filter_dir = dir.join("tof_filter");
+    if !filter_dir.exists() {
+        return Ok(None);
+    }
+
+    let metadata = fs::read_to_string(filter_dir.join("metadata.txt"))?;
+    let encoding = metadata_value(&metadata, "encoding")?;
+    if encoding != "bitpacked_lsb_u8" {
+        return Err(PmsmsError::UnsupportedFilterEncoding(encoding.to_string()));
+    }
+
+    let n_filter_precursors: usize = metadata_value(&metadata, "n_precursors")?
+        .parse()
+        .map_err(|_| PmsmsError::MissingFilterMetadata("n_precursors"))?;
+    let n_filter_fragments: usize = metadata_value(&metadata, "n_fragments")?
+        .parse()
+        .map_err(|_| PmsmsError::MissingFilterMetadata("n_fragments"))?;
+    if n_filter_fragments != n_fragments {
+        return Err(PmsmsError::FilterCountMismatch(format!(
+            "fragment count filter={} pmsms={}",
+            n_filter_fragments, n_fragments
+        )));
+    }
+
+    let (_idx_mmap, dataindex_idx) =
+        unsafe { mmap_as_slice::<u64>(&dir.join("pmsms.mmappet").join("dataindex.mmappet").join("2.bin"))? };
+    if dataindex_idx.len() != n_filter_precursors {
+        return Err(PmsmsError::FilterCountMismatch(format!(
+            "precursor count filter={} dataindex={}",
+            n_filter_precursors,
+            dataindex_idx.len()
+        )));
+    }
+
+    Ok(Some(TofFilter {
+        precursor_keep: unpack_lsb_bits(&filter_dir.join("precursor_keep.bin"), n_filter_precursors)?,
+        fragment_keep: unpack_lsb_bits(&filter_dir.join("fragment_keep.bin"), n_filter_fragments)?,
+        dataindex_idx: dataindex_idx.to_vec(),
+    }))
+}
+
 pub fn parse(dir: &Path, file_id: usize) -> Result<Vec<RawSpectrum>, PmsmsError> {
     let precursor_path = dir.join("precursors.parquet");
     let tof_bin = dir.join("tof2mz.mmappet").join("0.bin");
@@ -146,26 +231,47 @@ pub fn parse(dir: &Path, file_id: usize) -> Result<Vec<RawSpectrum>, PmsmsError>
     let (_tof2mz_mmap, tof2mz) = unsafe { mmap_as_slice::<f32>(&tof_bin)? };
     let (_frag_tof_mmap, frag_tof) = unsafe { mmap_as_slice::<u32>(&frag_tof_bin)? };
     let (_frag_int_mmap, frag_int) = unsafe { mmap_as_slice::<u32>(&frag_int_bin)? };
+    let tof_filter = load_tof_filter(dir, frag_tof.len())?;
 
     let mut spectra = Vec::with_capacity(precursors.len());
+    let mut dataindex_cursor = 0usize;
 
     for p in &precursors {
         let start = p.frag_start as usize;
         let end = start + p.frag_count as usize;
 
-        let tof_slice = &frag_tof[start..end];
-        let int_slice = &frag_int[start..end];
+        if let Some(filter) = &tof_filter {
+            while dataindex_cursor < filter.dataindex_idx.len()
+                && filter.dataindex_idx[dataindex_cursor] < p.frag_start
+            {
+                dataindex_cursor += 1;
+            }
+            if dataindex_cursor == filter.dataindex_idx.len()
+                || filter.dataindex_idx[dataindex_cursor] != p.frag_start
+            {
+                return Err(PmsmsError::MissingDataindexRow(p.frag_start));
+            }
+            if filter.precursor_keep[dataindex_cursor] == 0 {
+                continue;
+            }
+        }
 
-        let mut mz_vec = Vec::with_capacity(tof_slice.len());
-        for &tof in tof_slice {
+        let mut mz_vec = Vec::with_capacity(end - start);
+        let mut int_vec = Vec::with_capacity(end - start);
+        for j in start..end {
+            if let Some(filter) = &tof_filter {
+                if filter.fragment_keep[j] == 0 {
+                    continue;
+                }
+            }
+            let tof = frag_tof[j];
             let idx = tof as usize;
             if idx >= tof2mz.len() {
                 return Err(PmsmsError::TofOutOfRange(tof, tof2mz.len()));
             }
             mz_vec.push(tof2mz[idx]);
+            int_vec.push(frag_int[j] as f32);
         }
-
-        let int_vec: Vec<f32> = int_slice.iter().map(|&i| i as f32).collect();
         let total_ion_current: f32 = int_vec.iter().sum();
 
         // One Precursor per charge state — mirrors how the MGF parser handles

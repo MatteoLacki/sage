@@ -277,10 +277,18 @@ impl Runner {
     }
 
     fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
-        if sage_core::ml::linear_discriminant::score_psms(features, self.parameters.precursor_tol)
-            .is_none()
-        {
-            log::warn!("linear model fitting failed, falling back to heuristic discriminant score");
+        let use_heuristic = self.parameters.disable_rescoring
+            || sage_core::ml::linear_discriminant::score_psms(
+                features,
+                self.parameters.precursor_tol,
+            )
+            .is_none();
+        if use_heuristic {
+            if !self.parameters.disable_rescoring {
+                log::warn!(
+                    "linear model fitting failed, falling back to heuristic discriminant score"
+                );
+            }
             features.par_iter_mut().for_each(|feat| {
                 feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
             });

@@ -78,6 +78,12 @@ fn main() -> anyhow::Result<()> {
                 .help("Write percolator-compatible `.pin` output files"),
         )
         .arg(
+            Arg::new("disable-rescoring")
+                .long("disable-rescoring")
+                .action(clap::ArgAction::SetTrue)
+                .help("Skip LDA rescoring, use heuristic discriminant score"),
+        )
+        .arg(
             Arg::new("write-report")
                 .long("write-report")
                 .action(clap::ArgAction::SetTrue)
