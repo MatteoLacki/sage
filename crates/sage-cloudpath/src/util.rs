@@ -1,6 +1,7 @@
 use crate::{read_and_execute, tdf::BrukerProcessingConfig, Error};
 use sage_core::spectrum::RawSpectrum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10,6 +11,17 @@ pub enum FileFormat {
     TDF,
     Pmsms,
     Unidentified,
+}
+
+/// Explicit paths to the three inputs that make up one pmsms search input, given
+/// directly rather than assumed to live together in one directory with fixed
+/// filenames. Available regardless of the `parquet` feature so callers can build
+/// `Search`/`Input` unconditionally; only `read_pmsms_explicit` needs the feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmsmsPaths {
+    pub pmsms: PathBuf,
+    pub tof2mz: PathBuf,
+    pub precursors: PathBuf,
 }
 
 impl FileFormat {
@@ -81,7 +93,13 @@ pub fn read_pmsms<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpect
     // SAGE passes file:// URLs; resolve to a local filesystem path.
     let local_dir = crate::to_url(path.as_ref())
         .and_then(|u| u.to_file_path().map_err(|_| Error::InvalidUri))?;
-    crate::pmsms::parse(&local_dir, file_id).map_err(Error::Pmsms)
+    crate::pmsms::parse(
+        &local_dir.join("pmsms.mmappet"),
+        &local_dir.join("tof2mz.mmappet"),
+        &local_dir.join("precursors.parquet"),
+        file_id,
+    )
+    .map_err(Error::Pmsms)
 }
 
 #[cfg(not(feature = "parquet"))]
@@ -89,6 +107,24 @@ pub fn read_pmsms<S: AsRef<str>>(path: S, _file_id: usize) -> Result<Vec<RawSpec
     panic!(
         "pmsms format requires the 'parquet' feature; recompile with --features parquet (path: {})",
         path.as_ref()
+    )
+}
+
+/// Read a pmsms search input from three explicit paths (no fixed-filename directory
+/// convention). Precursors may be `.parquet` or `.mmappet`.
+#[cfg(feature = "parquet")]
+pub fn read_pmsms_explicit(
+    paths: &PmsmsPaths,
+    file_id: usize,
+) -> Result<Vec<RawSpectrum>, Error> {
+    crate::pmsms::parse(&paths.pmsms, &paths.tof2mz, &paths.precursors, file_id).map_err(Error::Pmsms)
+}
+
+#[cfg(not(feature = "parquet"))]
+pub fn read_pmsms_explicit(paths: &PmsmsPaths, _file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
+    panic!(
+        "pmsms format requires the 'parquet' feature; recompile with --features parquet (paths: {:?})",
+        paths
     )
 }
 

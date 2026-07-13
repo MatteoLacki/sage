@@ -420,13 +420,16 @@ impl Runner {
         log::trace!("file serial read: {}", file_serial_read);
         let inner_closure = |(idx, path)| {
             let file_id = chunk_idx * batch_size + idx;
-            let res = sage_cloudpath::util::read_spectra(
-                path,
-                file_id,
-                sn,
-                self.parameters.bruker_config,
-                self.requires_ms1(),
-            );
+            let res = match &self.parameters.pmsms_paths {
+                Some(pmsms_paths) => sage_cloudpath::util::read_pmsms_explicit(pmsms_paths, file_id),
+                None => sage_cloudpath::util::read_spectra(
+                    path,
+                    file_id,
+                    sn,
+                    self.parameters.bruker_config,
+                    self.requires_ms1(),
+                ),
+            };
 
             match res {
                 Ok(s) => {

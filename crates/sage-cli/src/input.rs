@@ -1,6 +1,7 @@
 use anyhow::{ensure, Context};
 use clap::ArgMatches;
 use sage_cloudpath::tdf::BrukerProcessingConfig;
+use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
 use sage_core::scoring::ScoreType;
 use sage_core::{
@@ -32,6 +33,7 @@ pub struct Search {
     pub report_psms: usize,
     pub predict_rt: bool,
     pub mzml_paths: Vec<Url>,
+    pub pmsms_paths: Option<PmsmsPaths>,
     pub output_paths: Vec<Url>,
     pub bruker_config: BrukerProcessingConfig,
     pub protein_grouping: bool,
@@ -73,6 +75,9 @@ pub struct Input {
     pub predict_rt: Option<bool>,
     pub output_directory: Option<String>,
     pub mzml_paths: Option<Vec<String>>,
+    pub pmsms: Option<String>,
+    pub tof2mz: Option<String>,
+    pub precursors: Option<String>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -213,6 +218,15 @@ impl Input {
         if let Some(mzml_paths) = matches.get_many::<String>("mzml_paths") {
             input.mzml_paths = Some(mzml_paths.into_iter().map(|p| p.into()).collect());
         }
+        if let Some(pmsms) = matches.get_one::<String>("pmsms") {
+            input.pmsms = Some(pmsms.into());
+        }
+        if let Some(tof2mz) = matches.get_one::<String>("tof2mz") {
+            input.tof2mz = Some(tof2mz.into());
+        }
+        if let Some(precursors) = matches.get_one::<String>("precursors") {
+            input.precursors = Some(precursors.into());
+        }
 
         if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
             input.write_pin = Some(write_pin);
@@ -232,14 +246,26 @@ impl Input {
             input.database.fasta.is_some(),
             "`database.fasta` must be set. For more information try '--help'"
         );
+
+        let pmsms_flags_given = [&input.pmsms, &input.tof2mz, &input.precursors]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
         ensure!(
-            input
-                .mzml_paths
-                .as_ref()
-                .map(|p| p.len())
-                .unwrap_or_default()
-                > 0,
-            "`mzml_paths` must be set. For more information try '--help'"
+            pmsms_flags_given == 0 || pmsms_flags_given == 3,
+            "`--pmsms`, `--tof2mz`, and `--precursors` must all be given together"
+        );
+
+        ensure!(
+            pmsms_flags_given == 3
+                || input
+                    .mzml_paths
+                    .as_ref()
+                    .map(|p| p.len())
+                    .unwrap_or_default()
+                    > 0,
+            "`mzml_paths` must be set, or `--pmsms`/`--tof2mz`/`--precursors` given together. \
+             For more information try '--help'"
         );
 
         Ok(input)
@@ -315,12 +341,26 @@ impl Input {
             self.predict_rt = Some(true);
         }
 
-        let mzml_paths = self
-            .mzml_paths
-            .expect("'mzml_paths' must be provided!")
-            .iter()
-            .map(|s| sage_cloudpath::to_url(s))
-            .collect::<Result<Vec<_>, _>>()?;
+        let pmsms_paths = match (&self.pmsms, &self.tof2mz, &self.precursors) {
+            (Some(pmsms), Some(tof2mz), Some(precursors)) => Some(PmsmsPaths {
+                pmsms: pmsms.into(),
+                tof2mz: tof2mz.into(),
+                precursors: precursors.into(),
+            }),
+            _ => None,
+        };
+
+        // A pmsms triplet still needs exactly one `mzml_paths` entry: the rest of the
+        // runner keys per-file bookkeeping (file_id, output filenames) off that list.
+        let mzml_paths = match &pmsms_paths {
+            Some(p) => vec![sage_cloudpath::to_url(&p.pmsms.to_string_lossy())?],
+            None => self
+                .mzml_paths
+                .expect("'mzml_paths' must be provided!")
+                .iter()
+                .map(|s| sage_cloudpath::to_url(s))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
 
         let output_directory = match self.output_directory {
             Some(path) => {
@@ -358,6 +398,7 @@ impl Input {
             database,
             quant: self.quant.map(Into::into).unwrap_or_default(),
             mzml_paths,
+            pmsms_paths,
             output_directory,
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,

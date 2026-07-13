@@ -11,3 +11,7 @@ data/
 *.fasta
 *.fas
 **/*.DS_Store
+
+# small committed test fixture, exempted from the blanket data/*.txt ignores above
+!crates/sage-cloudpath/tests/data/
+!crates/sage-cloudpath/tests/data/**
