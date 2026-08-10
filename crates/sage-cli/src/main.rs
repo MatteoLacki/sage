@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
                     "Paths to mzML, MGF, or .pmsms directories to process. Overrides files listed in the \
-                     configuration file. Not used together with --pmsms/--tof2mz/--precursors.",
+                     configuration file. Not used together with --pmsms/--precursors.",
                 )
                 .value_hint(ValueHint::FilePath),
         )
@@ -35,16 +35,10 @@ fn main() -> anyhow::Result<()> {
                 .long("pmsms")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Path to a pmsms.mmappet dataset. Must be given together with --tof2mz and \
-                     --precursors, as an alternative to the positional spectra paths.",
+                    "Path to a pmsms.mmappet dataset (with an `mz` column already materialized). \
+                     Must be given together with --precursors, as an alternative to the \
+                     positional spectra paths.",
                 )
-                .value_hint(ValueHint::FilePath),
-        )
-        .arg(
-            Arg::new("tof2mz")
-                .long("tof2mz")
-                .value_parser(clap::builder::NonEmptyStringValueParser::new())
-                .help("Path to a tof2mz.mmappet dataset (paired with --pmsms/--precursors).")
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
@@ -52,8 +46,7 @@ fn main() -> anyhow::Result<()> {
                 .long("precursors")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Path to a precursors table, .parquet or .mmappet (paired with \
-                     --pmsms/--tof2mz).",
+                    "Path to a precursors table, .parquet or .mmappet (paired with --pmsms).",
                 )
                 .value_hint(ValueHint::FilePath),
         )

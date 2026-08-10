@@ -1,9 +1,10 @@
 //! Reader for the ionmaiden pmsms binary format.
 //!
-//! Three inputs, given as explicit paths (never assumed to live together in one
+//! Two inputs, given as explicit paths (never assumed to live together in one
 //! directory with fixed filenames):
-//!   pmsms.mmappet/        — columnar binary: 0.bin=tof(u32), 1.bin=intensity(u32)
-//!   tof2mz.mmappet/       — 0.bin: f32 array mapping tof_index → m/z
+//!   pmsms.mmappet/        — schema.txt + one `<idx>.bin` file per column (see
+//!                           git/mmappet's Python writer); columns looked up by
+//!                           name. Needs `mz`(f32) and `intensity`(u32).
 //!   precursors, either:
 //!     .parquet            — read via the `parquet` crate
 //!     .mmappet/           — schema.txt + one `<idx>.bin` file per column (see
@@ -34,8 +35,6 @@ pub enum PmsmsError {
     MissingColumn(&'static str),
     #[error("mmappet column {0} has dtype `{1}`, expected `{2}`")]
     WrongDtype(&'static str, String, &'static str),
-    #[error("tof index {0} out of range (tof2mz len={1})")]
-    TofOutOfRange(u32, usize),
     #[error("unrecognized precursors format (expected .parquet or .mmappet): {0}")]
     UnrecognizedPrecursorsFormat(PathBuf),
 }
@@ -227,23 +226,21 @@ unsafe fn mmap_as_slice<T: Copy>(path: &Path) -> Result<(Mmap, &'static [T]), Pm
 
 pub fn parse(
     pmsms_dir: &Path,
-    tof2mz_dir: &Path,
     precursors_path: &Path,
     file_id: usize,
 ) -> Result<Vec<RawSpectrum>, PmsmsError> {
-    let tof_bin = tof2mz_dir.join("0.bin");
-    let frag_tof_bin = pmsms_dir.join("0.bin");
-    let frag_int_bin = pmsms_dir.join("1.bin");
-
     let precursors = read_precursors(precursors_path)?;
 
-    // Memory-map all binary arrays.
-    // SAFETY: files are written as packed arrays of the given numeric types by
-    // the ionmaiden pipeline. Alignment is satisfied because mmap returns
-    // page-aligned memory and u32/f32 have 4-byte alignment.
-    let (_tof2mz_mmap, tof2mz) = unsafe { mmap_as_slice::<f32>(&tof_bin)? };
-    let (_frag_tof_mmap, frag_tof) = unsafe { mmap_as_slice::<u32>(&frag_tof_bin)? };
-    let (_frag_int_mmap, frag_int) = unsafe { mmap_as_slice::<u32>(&frag_int_bin)? };
+    let frag_schema = read_mmappet_schema(pmsms_dir)?;
+    let i_mz = mmappet_column_index(&frag_schema, "mz", "float32")?;
+    let i_int = mmappet_column_index(&frag_schema, "intensity", "uint32")?;
+
+    // Memory-map both fragment column arrays.
+    // SAFETY: dtype checked against schema.txt above for each column.
+    let (_frag_mz_mmap, frag_mz) =
+        unsafe { mmap_as_slice::<f32>(&pmsms_dir.join(format!("{i_mz}.bin")))? };
+    let (_frag_int_mmap, frag_int) =
+        unsafe { mmap_as_slice::<u32>(&pmsms_dir.join(format!("{i_int}.bin")))? };
 
     let mut spectra = Vec::with_capacity(precursors.len());
 
@@ -251,17 +248,8 @@ pub fn parse(
         let start = p.frag_start as usize;
         let end = start + p.frag_count as usize;
 
-        let tof_slice = &frag_tof[start..end];
+        let mz_vec = frag_mz[start..end].to_vec();
         let int_slice = &frag_int[start..end];
-
-        let mut mz_vec = Vec::with_capacity(tof_slice.len());
-        for &tof in tof_slice {
-            let idx = tof as usize;
-            if idx >= tof2mz.len() {
-                return Err(PmsmsError::TofOutOfRange(tof, tof2mz.len()));
-            }
-            mz_vec.push(tof2mz[idx]);
-        }
 
         let int_vec: Vec<f32> = int_slice.iter().map(|&i| i as f32).collect();
         let total_ion_current: f32 = int_vec.iter().sum();
@@ -321,11 +309,10 @@ mod test {
     fn mmappet_and_parquet_precursors_agree() {
         let dir = fixture_dir();
         let pmsms_dir = dir.join("pmsms.mmappet");
-        let tof2mz_dir = dir.join("tof2mz.mmappet");
 
-        let via_parquet = parse(&pmsms_dir, &tof2mz_dir, &dir.join("precursors.parquet"), 0)
+        let via_parquet = parse(&pmsms_dir, &dir.join("precursors.parquet"), 0)
             .expect("parse via parquet precursors");
-        let via_mmappet = parse(&pmsms_dir, &tof2mz_dir, &dir.join("precursors.mmappet"), 0)
+        let via_mmappet = parse(&pmsms_dir, &dir.join("precursors.mmappet"), 0)
             .expect("parse via mmappet precursors");
 
         assert!(!via_parquet.is_empty());
@@ -348,8 +335,7 @@ mod test {
     fn unrecognized_precursors_format_errors() {
         let dir = fixture_dir();
         let bogus = dir.join("precursors.parquet").with_extension("txt");
-        let err = parse(&dir.join("pmsms.mmappet"), &dir.join("tof2mz.mmappet"), &bogus, 0)
-            .unwrap_err();
+        let err = parse(&dir.join("pmsms.mmappet"), &bogus, 0).unwrap_err();
         assert!(matches!(err, PmsmsError::UnrecognizedPrecursorsFormat(_)));
     }
 }

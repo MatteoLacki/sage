@@ -13,14 +13,13 @@ pub enum FileFormat {
     Unidentified,
 }
 
-/// Explicit paths to the three inputs that make up one pmsms search input, given
+/// Explicit paths to the two inputs that make up one pmsms search input, given
 /// directly rather than assumed to live together in one directory with fixed
 /// filenames. Available regardless of the `parquet` feature so callers can build
 /// `Search`/`Input` unconditionally; only `read_pmsms_explicit` needs the feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PmsmsPaths {
     pub pmsms: PathBuf,
-    pub tof2mz: PathBuf,
     pub precursors: PathBuf,
 }
 
@@ -95,7 +94,6 @@ pub fn read_pmsms<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpect
         .and_then(|u| u.to_file_path().map_err(|_| Error::InvalidUri))?;
     crate::pmsms::parse(
         &local_dir.join("pmsms.mmappet"),
-        &local_dir.join("tof2mz.mmappet"),
         &local_dir.join("precursors.parquet"),
         file_id,
     )
@@ -110,14 +108,14 @@ pub fn read_pmsms<S: AsRef<str>>(path: S, _file_id: usize) -> Result<Vec<RawSpec
     )
 }
 
-/// Read a pmsms search input from three explicit paths (no fixed-filename directory
+/// Read a pmsms search input from two explicit paths (no fixed-filename directory
 /// convention). Precursors may be `.parquet` or `.mmappet`.
 #[cfg(feature = "parquet")]
 pub fn read_pmsms_explicit(
     paths: &PmsmsPaths,
     file_id: usize,
 ) -> Result<Vec<RawSpectrum>, Error> {
-    crate::pmsms::parse(&paths.pmsms, &paths.tof2mz, &paths.precursors, file_id).map_err(Error::Pmsms)
+    crate::pmsms::parse(&paths.pmsms, &paths.precursors, file_id).map_err(Error::Pmsms)
 }
 
 #[cfg(not(feature = "parquet"))]

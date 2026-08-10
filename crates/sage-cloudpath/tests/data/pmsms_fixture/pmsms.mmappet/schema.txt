@@ -1,3 +1,4 @@
 uint32 tof
 uint32 intensity
 float32 score
+float32 mz

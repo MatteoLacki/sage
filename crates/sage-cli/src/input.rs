@@ -76,7 +76,6 @@ pub struct Input {
     pub output_directory: Option<String>,
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
-    pub tof2mz: Option<String>,
     pub precursors: Option<String>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
@@ -221,9 +220,6 @@ impl Input {
         if let Some(pmsms) = matches.get_one::<String>("pmsms") {
             input.pmsms = Some(pmsms.into());
         }
-        if let Some(tof2mz) = matches.get_one::<String>("tof2mz") {
-            input.tof2mz = Some(tof2mz.into());
-        }
         if let Some(precursors) = matches.get_one::<String>("precursors") {
             input.precursors = Some(precursors.into());
         }
@@ -247,24 +243,24 @@ impl Input {
             "`database.fasta` must be set. For more information try '--help'"
         );
 
-        let pmsms_flags_given = [&input.pmsms, &input.tof2mz, &input.precursors]
+        let pmsms_flags_given = [&input.pmsms, &input.precursors]
             .iter()
             .filter(|o| o.is_some())
             .count();
         ensure!(
-            pmsms_flags_given == 0 || pmsms_flags_given == 3,
-            "`--pmsms`, `--tof2mz`, and `--precursors` must all be given together"
+            pmsms_flags_given == 0 || pmsms_flags_given == 2,
+            "`--pmsms` and `--precursors` must be given together"
         );
 
         ensure!(
-            pmsms_flags_given == 3
+            pmsms_flags_given == 2
                 || input
                     .mzml_paths
                     .as_ref()
                     .map(|p| p.len())
                     .unwrap_or_default()
                     > 0,
-            "`mzml_paths` must be set, or `--pmsms`/`--tof2mz`/`--precursors` given together. \
+            "`mzml_paths` must be set, or `--pmsms`/`--precursors` given together. \
              For more information try '--help'"
         );
 
@@ -341,16 +337,15 @@ impl Input {
             self.predict_rt = Some(true);
         }
 
-        let pmsms_paths = match (&self.pmsms, &self.tof2mz, &self.precursors) {
-            (Some(pmsms), Some(tof2mz), Some(precursors)) => Some(PmsmsPaths {
+        let pmsms_paths = match (&self.pmsms, &self.precursors) {
+            (Some(pmsms), Some(precursors)) => Some(PmsmsPaths {
                 pmsms: pmsms.into(),
-                tof2mz: tof2mz.into(),
                 precursors: precursors.into(),
             }),
             _ => None,
         };
 
-        // A pmsms triplet still needs exactly one `mzml_paths` entry: the rest of the
+        // A pmsms pair still needs exactly one `mzml_paths` entry: the rest of the
         // runner keys per-file bookkeeping (file_id, output filenames) off that list.
         let mzml_paths = match &pmsms_paths {
             Some(p) => vec![sage_cloudpath::to_url(&p.pmsms.to_string_lossy())?],
