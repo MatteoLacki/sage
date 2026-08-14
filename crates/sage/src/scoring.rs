@@ -438,11 +438,13 @@ impl<'db> Scorer<'db> {
             let charge = precursor.charge.unwrap();
             // Charge state is already annotated for this precusor, only search once
             let precursor_mass = mz * charge as f32;
-            self.matched_peaks(query, precursor_mass, charge, self.precursor_tol)
+            let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
+            self.matched_peaks(query, precursor_mass, charge, precursor_tol)
         } else {
             // Not all selected ion precursors have charge states annotated (or user has set
             // `override_precursor_charge`)
             // assume it could be z=2, z=3, z=4 and search all three
+            let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
             (self.min_precursor_charge..=self.max_precursor_charge).fold(
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
@@ -451,7 +453,7 @@ impl<'db> Scorer<'db> {
                         query,
                         precursor_mass,
                         precursor_charge,
-                        self.precursor_tol,
+                        precursor_tol,
                     );
                     hits
                 },

@@ -79,6 +79,18 @@ pub struct Precursor {
     pub inverse_ion_mobility: Option<f32>,
 }
 
+impl Precursor {
+    /// This precursor's own tolerance if it has one, otherwise `default`.
+    ///
+    /// Lets individual precursors override the run-global precursor
+    /// tolerance (e.g. per-precursor ppm bounds sourced from the pmsms
+    /// precursors table) while falling back to existing behavior when
+    /// `isolation_window` is unset.
+    pub fn effective_precursor_tol(&self, default: Tolerance) -> Tolerance {
+        self.isolation_window.unwrap_or(default)
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct ProcessedSpectrum<T> {
     /// MSn level
@@ -449,6 +461,38 @@ impl SpectrumProcessor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn effective_precursor_tol_uses_own_window_when_set() {
+        let p = Precursor {
+            isolation_window: Some(Tolerance::Ppm(-5.0, 5.0)),
+            ..Default::default()
+        };
+        let default = Tolerance::Ppm(-20.0, 20.0);
+        match p.effective_precursor_tol(default) {
+            Tolerance::Ppm(lo, hi) => {
+                assert_eq!(lo, -5.0);
+                assert_eq!(hi, 5.0);
+            }
+            other => panic!("expected Ppm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_precursor_tol_falls_back_to_default_when_unset() {
+        let p = Precursor {
+            isolation_window: None,
+            ..Default::default()
+        };
+        let default = Tolerance::Ppm(-20.0, 20.0);
+        match p.effective_precursor_tol(default) {
+            Tolerance::Ppm(lo, hi) => {
+                assert_eq!(lo, -20.0);
+                assert_eq!(hi, 20.0);
+            }
+            other => panic!("expected Ppm, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_deisotope() {
