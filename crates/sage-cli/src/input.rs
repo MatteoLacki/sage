@@ -4,6 +4,7 @@ use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
 use sage_core::scoring::ScoreType;
+use sage_core::spline::FragmentTolSpline;
 use sage_core::{
     database::{Builder, Parameters},
     lfq::LfqSettings,
@@ -20,6 +21,7 @@ pub struct Search {
     pub quant: QuantSettings,
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
+    pub fragment_tol_spline: Option<FragmentTolSpline>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -60,6 +62,7 @@ pub struct Input {
     pub database: Builder,
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
+    pub fragment_tol_spline: Option<FragmentTolSpline>,
     pub report_psms: Option<usize>,
     pub chimera: Option<bool>,
     pub wide_window: Option<bool>,
@@ -311,6 +314,19 @@ impl Input {
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
 
+        if let Some(spline) = &self.fragment_tol_spline {
+            spline
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid `fragment_tol_spline`: {e}"))?;
+            log::warn!(
+                "Both `fragment_tol` and `fragment_tol_spline` are set — \
+                 `fragment_tol_spline` takes over fragment matching entirely \
+                 (including outside its grid range, via flat extrapolation); \
+                 `fragment_tol` is only used for its own sanity-check warnings \
+                 above and is otherwise unused."
+            );
+        }
+
         if let Some(isotope_errors) = self.isotope_errors {
             if isotope_errors.0 > isotope_errors.1 {
                 log::error!("Minimum isotope_error value greater than maximum! Typical usage: `isotope_errors: [-1, 3]`");
@@ -397,6 +413,7 @@ impl Input {
             output_directory,
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
+            fragment_tol_spline: self.fragment_tol_spline,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: self.max_peaks.unwrap_or(150),
             min_peaks: self.min_peaks.unwrap_or(15),
@@ -424,6 +441,7 @@ impl Input {
 #[cfg(test)]
 mod test {
 
+    use super::Input;
     use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters};
 
     #[test]
@@ -453,5 +471,96 @@ mod test {
         assert_eq!(c.enzyme.map(|e| e.skip_suffix), Some([false; 26]));
 
         Ok(())
+    }
+
+    /// Minimal `log::Log` implementor that captures messages into a `Vec`,
+    /// so tests can assert on a specific `log::warn!` without depending on
+    /// a log-capturing crate. `log::set_logger` only succeeds once per
+    /// process; safe here since no other test in this binary installs one.
+    struct CapturingLogger {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    fn install_capturing_logger() -> &'static CapturingLogger {
+        static LOGGER: std::sync::OnceLock<CapturingLogger> = std::sync::OnceLock::new();
+        let logger = LOGGER.get_or_init(|| CapturingLogger {
+            messages: std::sync::Mutex::new(Vec::new()),
+        });
+        let _ = log::set_logger(logger);
+        log::set_max_level(log::LevelFilter::Warn);
+        logger
+    }
+
+    fn mk_input_json(fragment_tol_spline: Option<serde_json::Value>) -> serde_json::Value {
+        // `Input::build` resolves `mzml_paths`/`database.fasta` to real
+        // filesystem paths (canonicalize), so both must exist — reuse the
+        // fixtures already committed for `sage-cli`'s other tests.
+        let mut json = serde_json::json!({
+            "database": {"fasta": "../../tests/Q99536.fasta"},
+            "precursor_tol": {"ppm": [-10.0, 10.0]},
+            "fragment_tol": {"ppm": [-10.0, 10.0]},
+            "mzml_paths": ["../../tests/LQSRPAAPPAPGPGQLTLR.mzML"],
+        });
+        if let Some(spline) = fragment_tol_spline {
+            json["fragment_tol_spline"] = spline;
+        }
+        json
+    }
+
+    fn flat_spline_json() -> serde_json::Value {
+        serde_json::json!({
+            "ppm_lo": {"grid_start": 0.0, "grid_step": 100.0, "values": [-10.0, -10.0]},
+            "ppm_hi": {"grid_start": 0.0, "grid_step": 100.0, "values": [10.0, 10.0]},
+        })
+    }
+
+    // Both scenarios live in one #[test] (rather than two) because they
+    // share one process-global logger — cargo runs tests in the same
+    // binary in parallel by default, and two tests independently
+    // clear()-ing/reading that shared buffer would race.
+    #[test]
+    fn fragment_tol_spline_warning_only_fires_when_spline_is_set() {
+        let logger = install_capturing_logger();
+
+        logger.messages.lock().unwrap().clear();
+        let input: Input = serde_json::from_value(mk_input_json(None)).unwrap();
+        input.build().expect("valid config should build");
+        assert!(
+            !logger
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("fragment_tol_spline")),
+            "expected no fragment_tol_spline warning when spline is unset"
+        );
+
+        logger.messages.lock().unwrap().clear();
+        let input: Input =
+            serde_json::from_value(mk_input_json(Some(flat_spline_json()))).unwrap();
+        input
+            .build()
+            .expect("both set is a warning, not a build error");
+        let messages = logger.messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("fragment_tol") && m.contains("fragment_tol_spline")),
+            "expected a warning naming both `fragment_tol` and `fragment_tol_spline`, got: {:?}",
+            *messages
+        );
     }
 }

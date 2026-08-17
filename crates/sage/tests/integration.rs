@@ -6,6 +6,7 @@ use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
 use sage_core::scoring::{ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
+use sage_core::spline::{FragmentTolSpline, LinearSpline};
 
 const FASTA: &'static str = r#"
 >sp|Q99536|VAT1_HUMAN Synaptic vesicle membrane protein VAT-1 homolog OS=Homo sapiens OX=9606 GN=VAT1 PE=1 SV=2
@@ -61,9 +62,9 @@ fn check_all_ions_visited(target_fragment_mz: f32, bucket_size: usize) {
 
     // Hit all peptides in database, track how many of the 500-700 fragment m/z's
     // are returned to us by searching the database.
-    let query = database.query(1000.0, Tolerance::Da(-5000.0, 5000.0), fragment_tol);
+    let query = database.query(1000.0, Tolerance::Da(-5000.0, 5000.0));
 
-    for fragment in query.page_search(target_fragment_mz) {
+    for fragment in query.page_search(target_fragment_mz, fragment_tol) {
         visited[fragment.peptide_index.0 as usize] += 1;
     }
 
@@ -114,11 +115,25 @@ fn target_peaks(db: &IndexedDatabase) -> (PeptideIx, Vec<Peak>) {
     (target_idx, peaks)
 }
 
-fn mk_scorer(db: &IndexedDatabase, precursor_tol: Tolerance) -> Scorer<'_> {
+fn mk_scorer(
+    db: &IndexedDatabase,
+    precursor_tol: Tolerance,
+    fragment_tol_spline: Option<FragmentTolSpline>,
+) -> Scorer<'_> {
+    mk_scorer_with_fragment_tol(db, precursor_tol, Tolerance::Da(-0.01, 0.01), fragment_tol_spline)
+}
+
+fn mk_scorer_with_fragment_tol(
+    db: &IndexedDatabase,
+    precursor_tol: Tolerance,
+    fragment_tol: Tolerance,
+    fragment_tol_spline: Option<FragmentTolSpline>,
+) -> Scorer<'_> {
     Scorer {
         db,
         precursor_tol,
-        fragment_tol: Tolerance::Da(-0.01, 0.01),
+        fragment_tol,
+        fragment_tol_spline,
         min_matched_peaks: 1,
         min_isotope_err: 0,
         max_isotope_err: 0,
@@ -167,7 +182,7 @@ fn candidate_unreachable_without_custom_window() {
         ..Default::default()
     };
 
-    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0), None);
     let features = scorer.score_standard(&query);
     assert!(
         features.is_empty(),
@@ -203,12 +218,128 @@ fn candidate_reachable_with_wide_custom_window() {
     };
 
     // Same narrow global tol as the "unreachable" test above.
-    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0), None);
     let features = scorer.score_standard(&query);
     assert_eq!(
         features.len(),
         1,
         "wide per-precursor window should reach the 30 ppm-off candidate"
+    );
+    assert_eq!(features[0].peptide_idx, target_idx);
+}
+
+/// Shift every fragment peak's mass by `offset_ppm`, simulating a spectrum
+/// whose fragments are all systematically off by a constant relative error
+/// (what a mass-dependent calibration spline is meant to correct for).
+fn shift_peaks(peaks: &[Peak], offset_ppm: f32) -> Vec<Peak> {
+    peaks
+        .iter()
+        .map(|p| Peak {
+            mass: p.mass * (1.0 + offset_ppm / 1_000_000.0),
+            intensity: p.intensity,
+        })
+        .collect()
+}
+
+/// A flat (constant-valued) spline covering any plausible fragment mass in
+/// these tests, ±`ppm` on both edges.
+fn flat_fragment_tol_spline(ppm: f32) -> FragmentTolSpline {
+    let flat = |sign: f32| LinearSpline {
+        grid_start: 0.0,
+        grid_step: 2000.0,
+        values: vec![sign * ppm, sign * ppm],
+    };
+    FragmentTolSpline {
+        ppm_lo: flat(-1.0),
+        ppm_hi: flat(1.0),
+    }
+}
+
+/// All fragment peaks shifted 100 ppm off their theoretical masses are
+/// unreachable under a narrow flat `fragment_tol` (±5 ppm) with no spline —
+/// this is the pre-existing, unchanged behavior.
+#[test]
+fn candidate_unreachable_without_fragment_tol_spline() {
+    let db = mk_ppm_window_database();
+    let (target_idx, real_peaks) = target_peaks(&db);
+    assert!(
+        !real_peaks.is_empty(),
+        "expected real fragment peaks for target"
+    );
+    let peaks = shift_peaks(&real_peaks, 100.0);
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "no-spline".into(),
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let scorer = mk_scorer_with_fragment_tol(
+        &db,
+        Tolerance::Ppm(-50.0, 50.0),
+        Tolerance::Ppm(-5.0, 5.0),
+        None,
+    );
+    let features = scorer.score_standard(&query);
+    assert!(
+        features.is_empty(),
+        "narrow flat fragment_tol should not reach fragments 100 ppm away"
+    );
+}
+
+/// The same 100 ppm-shifted fragments ARE reachable once a
+/// `fragment_tol_spline` wide enough to cover the shift is configured, even
+/// though the flat `fragment_tol` is unchanged (and still too narrow on its
+/// own) — this exercises `Scorer::fragment_tol_spline` overriding the flat
+/// tolerance per observed peak.
+#[test]
+fn candidate_reachable_with_fragment_tol_spline() {
+    let db = mk_ppm_window_database();
+    let (target_idx, real_peaks) = target_peaks(&db);
+    assert!(
+        !real_peaks.is_empty(),
+        "expected real fragment peaks for target"
+    );
+    let peaks = shift_peaks(&real_peaks, 100.0);
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "with-spline".into(),
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    // Same narrow flat fragment_tol as the "unreachable" test above.
+    let scorer = mk_scorer_with_fragment_tol(
+        &db,
+        Tolerance::Ppm(-50.0, 50.0),
+        Tolerance::Ppm(-5.0, 5.0),
+        Some(flat_fragment_tol_spline(150.0)),
+    );
+    let features = scorer.score_standard(&query);
+    assert_eq!(
+        features.len(),
+        1,
+        "fragment_tol_spline covering the 100 ppm shift should reach the candidate"
     );
     assert_eq!(features[0].peptide_idx, target_idx);
 }

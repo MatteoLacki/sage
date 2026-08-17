@@ -13,4 +13,5 @@ pub mod peptide;
 pub mod protein_grouping;
 pub mod scoring;
 pub mod spectrum;
+pub mod spline;
 pub mod tmt;

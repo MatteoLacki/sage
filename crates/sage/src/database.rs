@@ -399,12 +399,7 @@ impl IndexedDatabase {
     ///
     /// All matches returned by the query will be within the specified tolerance
     /// parameters
-    pub fn query(
-        &self,
-        precursor_mass: f32,
-        precursor_tol: Tolerance,
-        fragment_tol: Tolerance,
-    ) -> IndexedQuery<'_> {
+    pub fn query(&self, precursor_mass: f32, precursor_tol: Tolerance) -> IndexedQuery<'_> {
         let (precursor_lo, precursor_hi) = precursor_tol.bounds(precursor_mass);
 
         let (pre_idx_lo, pre_idx_hi) = binary_search_slice(
@@ -418,7 +413,6 @@ impl IndexedDatabase {
             db: self,
             precursor_mass,
             precursor_tol,
-            fragment_tol,
             pre_idx_lo,
             pre_idx_hi,
         }
@@ -470,15 +464,21 @@ pub struct IndexedQuery<'d> {
     db: &'d IndexedDatabase,
     precursor_mass: f32,
     precursor_tol: Tolerance,
-    fragment_tol: Tolerance,
     pub pre_idx_lo: usize,
     pub pre_idx_hi: usize,
 }
 
 impl IndexedQuery<'_> {
-    /// Search for a specified `fragment_mz` within the database
-    pub fn page_search(&self, mass: f32) -> impl Iterator<Item = &Theoretical> {
-        let (fragment_lo, fragment_hi) = self.fragment_tol.bounds(mass);
+    /// Search for a specified `fragment_mz` within the database, using an
+    /// explicit `fragment_tol` (rather than a fixed one baked into the
+    /// query) so callers can vary it per fragment/peak — e.g. a mass-
+    /// dependent tolerance from [`crate::spline::FragmentTolSpline`].
+    pub fn page_search(
+        &self,
+        mass: f32,
+        fragment_tol: Tolerance,
+    ) -> impl Iterator<Item = &Theoretical> {
+        let (fragment_lo, fragment_hi) = fragment_tol.bounds(mass);
         let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
 
         // Locate the left and right page indices that contain matching fragments

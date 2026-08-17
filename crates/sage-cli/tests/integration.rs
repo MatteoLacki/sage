@@ -21,6 +21,7 @@ fn integration() -> anyhow::Result<()> {
         db: &database,
         precursor_tol: Tolerance::Ppm(-50.0, 50.0),
         fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+        fragment_tol_spline: None,
         min_matched_peaks: 4,
         min_isotope_err: -1,
         max_isotope_err: 3,

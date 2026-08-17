@@ -55,6 +55,63 @@ Two ways to pass these two paths to the `sage` CLI:
 (`git/ionmaidentools/src/ionmaidentools/pipelines.py`) uses option 1 — no
 staging directory, no symlinks, no mmappet→parquet conversion needed anymore.
 
+## Per-precursor ppm tolerance
+
+The precursors table accepts two further **optional** columns: `ppm_tol_lo`,
+`ppm_tol_hi` (f64, signed — lo negative, hi positive). When both are present
+for a row, that precursor is searched with `Tolerance::Ppm(ppm_tol_lo,
+ppm_tol_hi)` instead of the run's global `--precursor_tol`; when either is
+missing (the common case — no upstream writer populates them yet), behavior
+is unchanged from before this existed. Design/history:
+`necromerge2`'s `plans/per_precursor_ppm_tolerance.md`.
+
+This rides on `Precursor::isolation_window: Option<Tolerance>`
+(`crates/sage/src/spectrum.rs`), which pre-existing wide-window/DIA search
+already used per-spectrum; `Precursor::effective_precursor_tol` is the
+`unwrap_or`-onto-global-tol helper, used by both the wide-window and
+standard search branches in `crates/sage/src/scoring.rs::initial_hits`.
+Column reading lives in `crates/sage-cloudpath/src/pmsms.rs` (parquet and
+mmappet paths both use an *optional* column lookup — missing column is
+`None`, not an error, unlike the 7 required columns).
+
+## Per-fragment ppm tolerance (mass-dependent, spline-based)
+
+`Scorer::fragment_tol_spline: Option<FragmentTolSpline>`
+(`crates/sage/src/spline.rs`) lets the fragment ppm window vary with
+fragment mass instead of being one flat `fragment_tol` for the whole run —
+given as two independent `LinearSpline`s (`ppm_lo`, `ppm_hi`), each a
+piecewise-linear function sampled on an equally spaced grid (flat/clamped
+extrapolation outside the grid range). `None` (the default — no JSON config
+key) behaves exactly as before this existed. Design/history: `necromerge2`'s
+`plans/per_fragment_ppm_tolerance.md`.
+
+Configured via `Input`/`Search`'s `fragment_tol_spline` JSON field
+(`crates/sage-cli/src/input.rs`), validated once in `Input::build()`
+(non-empty grid, positive `grid_step`).
+
+Evaluated **per observed peak**, at the peak's own mass, in
+`crates/sage/src/scoring.rs`, at all three places fragment matching happens
+against `self.fragment_tol`:
+- `Scorer::matched_peaks_with_isotope` (the preliminary candidate search —
+  observed peak known, spline evaluated at `peak.mass`),
+- `Scorer::score_candidate` (the final per-candidate hyperscore pass, which
+  walks *theoretical* ions and searches for a matching peak — spline
+  evaluated at the theoretical `mz` instead, since the observed peak isn't
+  known yet; a genuine match differs from theoretical by less than the
+  tolerance width itself, so this is equivalent in practice),
+- `Scorer::remove_matched_peaks` (chimera-mode peak stripping between
+  passes).
+
+**All three must stay in sync** — the preliminary pass alone finding a
+candidate isn't sufficient; `score_candidate`'s independent re-match (using
+a stale flat `self.fragment_tol`) will silently zero out `matched_b`/`matched_y`
+and drop the candidate even though the preliminary pass found it. (This bit
+us during implementation — the reachability integration test caught it.)
+
+`IndexedQuery::page_search` (`crates/sage/src/database.rs`) takes the
+tolerance as an explicit argument rather than reading a fixed one baked into
+the query, specifically so callers can vary it per call.
+
 ## Test fixture
 
 `crates/sage-cloudpath/tests/data/pmsms_fixture/` is a small (~400K, 10-row)
