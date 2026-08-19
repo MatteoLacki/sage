@@ -2622,6 +2622,7 @@ dependencies = [
  "log",
  "maud",
  "num_cpus",
+ "parquet 50.0.0",
  "rayon",
  "regex",
  "report-builder",

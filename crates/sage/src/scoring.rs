@@ -1,4 +1,4 @@
-use crate::database::{IndexedDatabase, PeptideIx};
+use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
@@ -234,6 +234,17 @@ pub struct Scorer<'db> {
     pub wide_window: bool,
     pub annotate_matches: bool,
     pub score_type: ScoreType,
+
+    /// Externally-predicted `(sequence, charge) -> (rt, iim)`, used to evict
+    /// candidates whose predicted RT/IIM falls outside `rt_tol`/`mobility_tol`
+    /// of the observed spectrum's values. `rt_tol`/`mobility_tol` are
+    /// required (validated at config-load time) whenever this is `Some`. See
+    /// `plans/better_sage_filtering.md`.
+    pub predicted_properties: Option<&'db std::collections::HashMap<(String, u8), (f32, f32)>>,
+    /// RT tolerance, already in minutes (converted from the config's
+    /// `rt_tol_sec` at load time) to match `ProcessedSpectrum::scan_start_time`.
+    pub rt_tol: Option<Tolerance>,
+    pub mobility_tol: Option<Tolerance>,
 }
 
 #[inline(always)]
@@ -389,8 +400,59 @@ impl<'db> Scorer<'db> {
             return hits;
         }
 
+        if let Some(map) = self.predicted_properties {
+            self.evict_rt_iim_mismatches(query, &candidates, &mut hits, map);
+        }
+
         self.trim_hits(&mut hits);
         hits
+    }
+
+    /// Evict candidates (in place) whose predicted RT/IIM falls outside
+    /// `rt_tol`/`mobility_tol` of `query`'s observed values. Candidates with
+    /// no entry in `map` for their `(sequence, charge)` are left alone
+    /// (permissive — avoids rejecting due to prediction-coverage gaps).
+    /// Missing observed `inverse_ion_mobility` (non-PASEF data) skips the
+    /// IIM check only; the RT check still applies.
+    fn evict_rt_iim_mismatches(
+        &self,
+        query: &ProcessedSpectrum<crate::spectrum::Peak>,
+        candidates: &IndexedQuery,
+        hits: &mut InitialHits,
+        map: &std::collections::HashMap<(String, u8), (f32, f32)>,
+    ) {
+        let (rt_lo, rt_hi) = self
+            .rt_tol
+            .expect("validated at config-load time: rt_tol required with predicted_properties")
+            .bounds(query.scan_start_time);
+        let iim_bounds = query
+            .precursors
+            .first()
+            .and_then(|p| p.inverse_ion_mobility)
+            .map(|observed| {
+                self.mobility_tol
+                    .expect(
+                        "validated at config-load time: mobility_tol required with predicted_properties",
+                    )
+                    .bounds(observed)
+            });
+
+        for (i, sc) in hits.preliminary.iter_mut().enumerate() {
+            if sc.matched == 0 {
+                continue;
+            }
+            let peptide = &self.db.peptides[candidates.pre_idx_lo + i];
+            let Some(&(rt, iim)) = map.get(&(peptide.to_string(), sc.precursor_charge)) else {
+                continue;
+            };
+            let rt_ok = rt >= rt_lo && rt <= rt_hi;
+            let iim_ok = iim_bounds.map_or(true, |(lo, hi)| iim >= lo && iim <= hi);
+            if !rt_ok || !iim_ok {
+                hits.matched_peaks -= sc.matched as usize;
+                hits.scored_candidates -= 1;
+                *sc = PreScore::default();
+            }
+        }
     }
 
     fn matched_peaks(

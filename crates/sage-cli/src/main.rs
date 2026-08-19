@@ -51,6 +51,17 @@ fn main() -> anyhow::Result<()> {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
+            Arg::new("predicted-properties")
+                .long("predicted-properties")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to a parquet file of externally-predicted peptide RT/IIM \
+                     (columns: sequence, charge, rt, iim). Requires `rt_tol_sec` and \
+                     `mobility_tol` to also be configured.",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
             Arg::new("fasta")
                 .short('f')
                 .long("fasta")

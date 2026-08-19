@@ -22,6 +22,7 @@ use parquet::{
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
+use sage_core::peptide::Peptide;
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
@@ -562,5 +563,70 @@ pub fn serialize_lfq<H: BuildHasher>(
     }
 
     rg.close()?;
+    writer.into_inner()
+}
+
+pub fn build_peptides_schema() -> parquet::errors::Result<Type> {
+    let msg = r#"
+        message schema {
+            required byte_array peptide (utf8);
+            required byte_array proteins (utf8);
+            required float monoisotopic;
+            required boolean decoy;
+        }
+    "#;
+    parquet::schema::parser::parse_message_type(msg)
+}
+
+/// Dump digested target/decoy peptides (see `dump_peptides` binary) — `peptide`
+/// in `Peptide::Display` inline-mod format, `proteins` semicolon-joined with
+/// `decoy_tag` prefixed for decoys iff `generate_decoys`.
+pub fn serialize_peptides(
+    peptides: &[Peptide],
+    decoy_tag: &str,
+    generate_decoys: bool,
+) -> Result<Vec<u8>, parquet::errors::ParquetError> {
+    let schema = build_peptides_schema()?;
+
+    let options = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
+
+    let buf = Vec::new();
+    let mut writer = SerializedFileWriter::new(buf, schema.into(), options.into())?;
+
+    for chunk in peptides.chunks(65536) {
+        let mut rg = writer.next_row_group()?;
+
+        if let Some(mut col) = rg.next_column()? {
+            let values: Vec<ByteArray> =
+                chunk.iter().map(|p| p.to_string().as_bytes().into()).collect();
+            col.typed::<ByteArrayType>().write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let values: Vec<ByteArray> = chunk
+                .iter()
+                .map(|p| p.proteins(decoy_tag, generate_decoys).as_bytes().into())
+                .collect();
+            col.typed::<ByteArrayType>().write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let values: Vec<f32> = chunk.iter().map(|p| p.monoisotopic).collect();
+            col.typed::<FloatType>().write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let values: Vec<bool> = chunk.iter().map(|p| p.decoy).collect();
+            col.typed::<BoolType>().write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        rg.close()?;
+    }
     writer.into_inner()
 }

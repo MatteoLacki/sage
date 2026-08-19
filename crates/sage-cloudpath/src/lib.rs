@@ -18,6 +18,9 @@ pub mod parquet;
 #[cfg(feature = "parquet")]
 pub mod pmsms;
 
+#[cfg(feature = "parquet")]
+pub mod predicted_properties;
+
 /// Convert a path string (local path or cloud URL) into a [`Url`].
 pub fn to_url(s: &str) -> Result<Url, Error> {
     if let Ok(url) = Url::parse(s) {

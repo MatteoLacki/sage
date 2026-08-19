@@ -32,6 +32,9 @@ fn integration() -> anyhow::Result<()> {
         chimera: false,
         report_psms: 1,
         wide_window: false,
+        predicted_properties: None,
+        rt_tol: None,
+        mobility_tol: None,
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
     };

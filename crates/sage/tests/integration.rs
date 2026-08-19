@@ -144,6 +144,9 @@ fn mk_scorer_with_fragment_tol(
         chimera: false,
         report_psms: 5,
         wide_window: false,
+        predicted_properties: None,
+        rt_tol: None,
+        mobility_tol: None,
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
     }
@@ -340,6 +343,98 @@ fn candidate_reachable_with_fragment_tol_spline() {
         features.len(),
         1,
         "fragment_tol_spline covering the 100 ppm shift should reach the candidate"
+    );
+    assert_eq!(features[0].peptide_idx, target_idx);
+}
+
+/// A candidate whose entry in `predicted_properties` gives it a predicted RT
+/// far outside `rt_tol` of the observed spectrum's `scan_start_time` is
+/// unreachable, even though precursor/fragment tolerances alone would have
+/// matched it fine (same query as the RT-mismatch test below, minus the
+/// `predicted_properties` map, does find it — see that test).
+#[test]
+fn candidate_unreachable_outside_rt_tol() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-mismatch".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let key = (db[target_idx].to_string(), 1u8);
+    let mut predicted = std::collections::HashMap::new();
+    predicted.insert(key, (15.0f32, 0.0f32)); // rt=15.0, far outside [9.8, 10.2]
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_properties = Some(&predicted);
+    scorer.rt_tol = Some(Tolerance::Da(-0.2, 0.2));
+    scorer.mobility_tol = None;
+
+    let features = scorer.score_standard(&query);
+    assert!(
+        features.is_empty(),
+        "predicted RT 5 minutes outside rt_tol should reject the candidate"
+    );
+}
+
+/// Same query, target, and `predicted_properties` map shape as above, but
+/// with a predicted RT inside `rt_tol` — confirms the candidate is reachable
+/// (i.e. the rejection above is really coming from the RT mismatch, not
+/// some other difference), and that a `None` observed `inverse_ion_mobility`
+/// skips the IIM check entirely (no `mobility_tol` needed).
+#[test]
+fn candidate_reachable_within_rt_tol() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-match".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let key = (db[target_idx].to_string(), 1u8);
+    let mut predicted = std::collections::HashMap::new();
+    predicted.insert(key, (10.05f32, 0.0f32)); // rt=10.05, inside [9.8, 10.2]
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_properties = Some(&predicted);
+    scorer.rt_tol = Some(Tolerance::Da(-0.2, 0.2));
+    scorer.mobility_tol = None;
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(
+        features.len(),
+        1,
+        "predicted RT inside rt_tol should reach the candidate"
     );
     assert_eq!(features[0].peptide_idx, target_idx);
 }

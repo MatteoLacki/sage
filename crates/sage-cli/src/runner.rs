@@ -28,6 +28,12 @@ use report_builder::{
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
+    /// Externally-predicted `(sequence, charge) -> (rt, iim)`, loaded once
+    /// from `parameters.predicted_properties` if set — see
+    /// `plans/better_sage_filtering.md`. Read-only, shared across the
+    /// parallel spectra search via `&self`/`Scorer` borrows, same as
+    /// `database`.
+    pub predicted_properties: Option<HashMap<(String, u8), (f32, f32)>>,
     start: Instant,
 }
 
@@ -100,6 +106,18 @@ impl Runner {
             )
         })?;
 
+        let predicted_properties = match &parameters.predicted_properties {
+            Some(path) => {
+                let map = sage_cloudpath::predicted_properties::read_predicted_properties(
+                    std::path::Path::new(path),
+                )
+                .with_context(|| format!("Failed to read predicted properties from `{path}`"))?;
+                info!("loaded {} predicted (sequence, charge) -> (rt, iim) entries", map.len());
+                Some(map)
+            }
+            None => None,
+        };
+
         let database = match parameters.database.prefilter {
             false => parameters.database.clone().build(fasta),
             true => {
@@ -118,6 +136,7 @@ impl Runner {
                     let mini_runner = Self {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
+                        predicted_properties: predicted_properties.clone(),
                         start,
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
@@ -135,6 +154,7 @@ impl Runner {
         Ok(Self {
             database,
             parameters,
+            predicted_properties,
             start,
         })
     }
@@ -187,6 +207,9 @@ impl Runner {
                     chimera: self.parameters.chimera,
                     report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
                     wide_window: self.parameters.wide_window,
+                    predicted_properties: self.predicted_properties.as_ref(),
+                    rt_tol: self.parameters.rt_tol,
+                    mobility_tol: self.parameters.mobility_tol,
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
                 };
@@ -519,6 +542,9 @@ impl Runner {
             chimera: self.parameters.chimera,
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
+            predicted_properties: self.predicted_properties.as_ref(),
+            rt_tol: self.parameters.rt_tol,
+            mobility_tol: self.parameters.mobility_tol,
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
         };

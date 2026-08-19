@@ -22,6 +22,11 @@ pub struct Search {
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
     pub fragment_tol_spline: Option<FragmentTolSpline>,
+    /// Predicted-RT/IIM candidate filtering — see `predicted_properties` doc
+    /// on [`Input`]. `rt_tol` here is already converted to minutes.
+    pub predicted_properties: Option<String>,
+    pub rt_tol: Option<Tolerance>,
+    pub mobility_tol: Option<Tolerance>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -80,6 +85,17 @@ pub struct Input {
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
     pub precursors: Option<String>,
+    /// Path to a parquet file of externally-predicted peptide RT/IIM
+    /// (columns: sequence, charge, rt, iim), used to reject candidates
+    /// whose predicted RT/IIM falls outside `rt_tol_sec`/`mobility_tol` of
+    /// the observed spectrum's values. Requires both to be set.
+    pub predicted_properties: Option<String>,
+    /// RT tolerance, in **seconds** (converted to minutes internally to
+    /// match `ProcessedSpectrum::scan_start_time`) — unit spelled out in
+    /// the name since it differs from SAGE's internal minutes.
+    pub rt_tol_sec: Option<Tolerance>,
+    /// IIM tolerance, in 1/K0 — unambiguous, no unit suffix needed.
+    pub mobility_tol: Option<Tolerance>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -226,6 +242,9 @@ impl Input {
         if let Some(precursors) = matches.get_one::<String>("precursors") {
             input.precursors = Some(precursors.into());
         }
+        if let Some(predicted_properties) = matches.get_one::<String>("predicted-properties") {
+            input.predicted_properties = Some(predicted_properties.into());
+        }
 
         if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
             input.write_pin = Some(write_pin);
@@ -308,11 +327,36 @@ impl Input {
         }
     }
 
+    /// `rt_tol_sec` is user-facing in seconds; `ProcessedSpectrum::scan_start_time`
+    /// (the internal RT representation, see `spectrum.rs`) is in minutes. Only
+    /// `Tolerance::Da` (an absolute window) makes sense for an RT/IIM offset —
+    /// `Ppm`/`Pct` are relative and dividing their values by 60 would be
+    /// meaningless, so those are rejected here.
+    fn rt_tol_sec_to_minutes(tolerance: Tolerance) -> anyhow::Result<Tolerance> {
+        match tolerance {
+            Tolerance::Da(lo, hi) => Ok(Tolerance::Da(lo / 60.0, hi / 60.0)),
+            _ => anyhow::bail!(
+                "`rt_tol_sec` must be a `da` tolerance (an absolute window in seconds), \
+                 e.g. {{\"da\": [-30.0, 30.0]}}"
+            ),
+        }
+    }
+
     pub fn build(mut self) -> anyhow::Result<Search> {
         let database = self.database.make_parameters();
 
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
+
+        if self.predicted_properties.is_some()
+            && (self.rt_tol_sec.is_none() || self.mobility_tol.is_none())
+        {
+            anyhow::bail!(
+                "`predicted_properties` file supplied but `rt_tol_sec`/`mobility_tol` are not \
+                 both configured — RT/IIM candidate filtering requires all three together. \
+                 Either set both tolerances, or remove `predicted_properties`."
+            );
+        }
 
         if let Some(spline) = &self.fragment_tol_spline {
             spline
@@ -414,6 +458,12 @@ impl Input {
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
             fragment_tol_spline: self.fragment_tol_spline,
+            predicted_properties: self.predicted_properties,
+            rt_tol: self
+                .rt_tol_sec
+                .map(Self::rt_tol_sec_to_minutes)
+                .transpose()?,
+            mobility_tol: self.mobility_tol,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: self.max_peaks.unwrap_or(150),
             min_peaks: self.min_peaks.unwrap_or(15),
@@ -442,7 +492,7 @@ impl Input {
 mod test {
 
     use super::Input;
-    use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters};
+    use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters, mass::Tolerance};
 
     #[test]
     fn deserialize_enzyme_builder() -> Result<(), serde_json::Error> {
@@ -562,5 +612,95 @@ mod test {
             "expected a warning naming both `fragment_tol` and `fragment_tol_spline`, got: {:?}",
             *messages
         );
+    }
+
+    fn mk_predicted_properties_json(
+        predicted_properties: Option<&str>,
+        rt_tol_sec: Option<serde_json::Value>,
+        mobility_tol: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut json = mk_input_json(None);
+        if let Some(path) = predicted_properties {
+            json["predicted_properties"] = serde_json::json!(path);
+        }
+        if let Some(rt) = rt_tol_sec {
+            json["rt_tol_sec"] = rt;
+        }
+        if let Some(im) = mobility_tol {
+            json["mobility_tol"] = im;
+        }
+        json
+    }
+
+    #[test]
+    fn predicted_properties_without_tolerances_errors() {
+        let json = mk_predicted_properties_json(Some("predictions.parquet"), None, None);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("missing tolerances should error"),
+        };
+        assert!(
+            err.to_string().contains("rt_tol_sec") && err.to_string().contains("mobility_tol"),
+            "expected error naming both `rt_tol_sec` and `mobility_tol`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn predicted_properties_with_only_rt_tol_errors() {
+        let json = mk_predicted_properties_json(
+            Some("predictions.parquet"),
+            Some(serde_json::json!({"da": [-30.0, 30.0]})),
+            None,
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        assert!(
+            input.build().is_err(),
+            "partial predicted-properties config (rt_tol_sec set, mobility_tol unset) should error"
+        );
+    }
+
+    #[test]
+    fn predicted_properties_with_both_tolerances_converts_seconds_to_minutes() {
+        let json = mk_predicted_properties_json(
+            Some("predictions.parquet"),
+            Some(serde_json::json!({"da": [-30.0, 30.0]})),
+            Some(serde_json::json!({"da": [-0.01, 0.01]})),
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("fully configured should build");
+        assert_eq!(search.rt_tol, Some(Tolerance::Da(-0.5, 0.5)));
+        assert_eq!(search.mobility_tol, Some(Tolerance::Da(-0.01, 0.01)));
+        assert_eq!(
+            search.predicted_properties.as_deref(),
+            Some("predictions.parquet")
+        );
+    }
+
+    #[test]
+    fn rt_tol_sec_rejects_non_da_tolerance() {
+        let json = mk_predicted_properties_json(
+            Some("predictions.parquet"),
+            Some(serde_json::json!({"ppm": [-30.0, 30.0]})),
+            Some(serde_json::json!({"da": [-0.01, 0.01]})),
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("non-Da rt_tol_sec should be rejected"),
+        };
+        assert!(
+            err.to_string().contains("da"),
+            "expected error mentioning the required `da` shape, got: {err}"
+        );
+    }
+
+    #[test]
+    fn no_predicted_properties_no_tolerance_error() {
+        let json = mk_input_json(None);
+        let input: Input = serde_json::from_value(json).unwrap();
+        input
+            .build()
+            .expect("no predicted_properties, no tolerances required, should build fine");
     }
 }
