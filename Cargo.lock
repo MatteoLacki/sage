@@ -2674,6 +2674,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

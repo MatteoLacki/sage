@@ -6,7 +6,7 @@ use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
 use sage_core::scoring::{ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
-use sage_core::spline::{FragmentTolSpline, LinearSpline};
+use sage_core::spline::{Extrapolation, FragmentTolSpline, LinearSpline};
 
 const FASTA: &'static str = r#"
 >sp|Q99536|VAT1_HUMAN Synaptic vesicle membrane protein VAT-1 homolog OS=Homo sapiens OX=9606 GN=VAT1 PE=1 SV=2
@@ -251,6 +251,7 @@ fn flat_fragment_tol_spline(ppm: f32) -> FragmentTolSpline {
         grid_start: 0.0,
         grid_step: 2000.0,
         values: vec![sign * ppm, sign * ppm],
+        extrapolation: Extrapolation::Flat,
     };
     FragmentTolSpline {
         ppm_lo: flat(-1.0),

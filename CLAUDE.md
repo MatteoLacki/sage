@@ -80,10 +80,16 @@ mmappet paths both use an *optional* column lookup — missing column is
 (`crates/sage/src/spline.rs`) lets the fragment ppm window vary with
 fragment mass instead of being one flat `fragment_tol` for the whole run —
 given as two independent `LinearSpline`s (`ppm_lo`, `ppm_hi`), each a
-piecewise-linear function sampled on an equally spaced grid (flat/clamped
-extrapolation outside the grid range). `None` (the default — no JSON config
-key) behaves exactly as before this existed. Design/history: `necromerge2`'s
-`plans/per_fragment_ppm_tolerance.md`.
+piecewise-linear function sampled on an equally spaced grid. Extrapolation
+outside the grid range is controlled by `LinearSpline::extrapolation`
+(`Extrapolation::Flat` — the default, and `FragmentTolSpline`'s own current
+usage — clamps to the nearest edge value; `Extrapolation::Linear` continues
+the boundary segment's slope instead, added for `git/featureprediction`'s
+Python `LinearSpline` port — see that repo's `AI.md` — which needed the
+opposite default). Missing `extrapolation` in a JSON config deserializes to
+`Flat`, so existing configs are unaffected. `None` fragment_tol_spline (the
+default — no JSON config key at all) behaves exactly as before this existed.
+Design/history: `necromerge2`'s `plans/per_fragment_ppm_tolerance.md`.
 
 Configured via `Input`/`Search`'s `fragment_tol_spline` JSON field
 (`crates/sage-cli/src/input.rs`), validated once in `Input::build()`
@@ -111,6 +117,29 @@ us during implementation — the reachability integration test caught it.)
 `IndexedQuery::page_search` (`crates/sage/src/database.rs`) takes the
 tolerance as an explicit argument rather than reading a fixed one baked into
 the query, specifically so callers can vary it per call.
+
+## Predicted RT/IIM candidate filtering
+
+`--predicted-properties <path.parquet>` (columns `sequence, charge, rt, iim`)
+loads a read-only `HashMap<(String, u8), (f32, f32)>` once at startup
+(`Runner::predicted_properties`, `crates/sage-cli/src/runner.rs`), shared
+across the parallel search same as `database`. Requires config fields
+`rt_tol_sec` (seconds — converted to minutes at load time, since
+`ProcessedSpectrum::scan_start_time` is in minutes) and `mobility_tol`
+(1/K0, no unit conversion needed) to both be set; `Input::build()` rejects
+`--predicted-properties` given without both. `Scorer::evict_rt_iim_mismatches`
+(`crates/sage/src/scoring.rs`) evicts fragment-matched candidates whose
+predicted RT/IIM falls outside the observed spectrum's window, right before
+`trim_hits`. A candidate with no `(sequence, charge)` entry in the map is
+left alone (permissive — avoids rejecting due to prediction-coverage gaps).
+Design/history: `necromerge2`'s `plans/better_sage_filtering.md`.
+
+The standalone `dump_peptides` binary (`crates/sage-cli/src/bin/dump_peptides.rs`)
+digests a FASTA into a `peptide,proteins,monoisotopic,decoy` parquet without
+needing spectra input or the full search config — only `--fasta` plus an
+optional `database`-shaped JSON (enzyme/mods/mass bounds/decoy_tag) — for
+`git/featureprediction` (a separate repo/pipeline stage) to generate
+RT/IIM predictions from.
 
 ## Test fixture
 
