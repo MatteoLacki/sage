@@ -107,6 +107,34 @@ impl FragmentTolSpline {
     }
 }
 
+/// An absolute-unit tolerance window (`Tolerance::Da`) as a function of one
+/// observed value, given as two independent linear splines for the
+/// lower/upper edges — same shape as [`FragmentTolSpline`], deliberately
+/// generic (not `RtTolSpline`/`MobilityTolSpline` as separate near-duplicate
+/// types) since RT and IIM tolerance are structurally and behaviorally
+/// identical: evaluated against one observed `f32` (`ProcessedSpectrum::
+/// scan_start_time` for RT, `Precursor::inverse_ion_mobility` for IIM),
+/// producing a `Tolerance::Da`. A flat (value-independent) window is simply
+/// a 2-node spline with identical values at both nodes — there is no
+/// separate flat-tolerance type for `rt_tol_sec`/`mobility_tol`, by design.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValueTolSpline {
+    pub lo: LinearSpline,
+    pub hi: LinearSpline,
+}
+
+impl ValueTolSpline {
+    pub fn validate(&self) -> Result<(), String> {
+        self.lo.validate()?;
+        self.hi.validate()?;
+        Ok(())
+    }
+
+    pub fn tolerance_at(&self, x: f32) -> Tolerance {
+        Tolerance::Da(self.lo.eval(x), self.hi.eval(x))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -244,5 +272,78 @@ mod test {
             }
             other => panic!("expected Ppm, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn value_tol_spline_tolerance_at() {
+        let vts = ValueTolSpline {
+            lo: LinearSpline {
+                grid_start: 0.0,
+                grid_step: 10.0,
+                values: vec![-5.0, -10.0],
+                extrapolation: Extrapolation::Flat,
+            },
+            hi: LinearSpline {
+                grid_start: 0.0,
+                grid_step: 10.0,
+                values: vec![5.0, 20.0],
+                extrapolation: Extrapolation::Flat,
+            },
+        };
+        match vts.tolerance_at(5.0) {
+            Tolerance::Da(lo, hi) => {
+                assert_eq!(lo, -7.5);
+                assert_eq!(hi, 12.5);
+            }
+            other => panic!("expected Da, got {other:?}"),
+        }
+    }
+
+    /// The actual planned usage: a "robust flat window" (no real value
+    /// dependence) represented as a 2-node spline with identical values at
+    /// both nodes, rather than a separate flat-tolerance type.
+    #[test]
+    fn value_tol_spline_two_node_flat_window_is_constant_everywhere() {
+        let vts = ValueTolSpline {
+            lo: LinearSpline {
+                grid_start: 2.0,
+                grid_step: 6.0, // nodes at x=2 and x=8 (observed anchor range)
+                values: vec![-5.0, -5.0],
+                extrapolation: Extrapolation::Flat,
+            },
+            hi: LinearSpline {
+                grid_start: 2.0,
+                grid_step: 6.0,
+                values: vec![5.0, 5.0],
+                extrapolation: Extrapolation::Flat,
+            },
+        };
+        for x in [-100.0, 0.0, 2.0, 5.0, 8.0, 1000.0] {
+            match vts.tolerance_at(x) {
+                Tolerance::Da(lo, hi) => {
+                    assert_eq!(lo, -5.0, "at x={x}");
+                    assert_eq!(hi, 5.0, "at x={x}");
+                }
+                other => panic!("expected Da, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn value_tol_spline_validate_propagates_from_either_side() {
+        let bad = LinearSpline {
+            grid_start: 0.0,
+            grid_step: 0.0,
+            values: vec![1.0],
+            extrapolation: Extrapolation::Flat,
+        };
+        let ok = LinearSpline {
+            grid_start: 0.0,
+            grid_step: 1.0,
+            values: vec![1.0],
+            extrapolation: Extrapolation::Flat,
+        };
+        assert!(ValueTolSpline { lo: bad.clone(), hi: ok.clone() }.validate().is_err());
+        assert!(ValueTolSpline { lo: ok, hi: bad }.validate().is_err());
     }
 }

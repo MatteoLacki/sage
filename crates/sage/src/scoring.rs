@@ -241,10 +241,15 @@ pub struct Scorer<'db> {
     /// required (validated at config-load time) whenever this is `Some`. See
     /// `plans/better_sage_filtering.md`.
     pub predicted_properties: Option<&'db std::collections::HashMap<(String, u8), (f32, f32)>>,
-    /// RT tolerance, already in minutes (converted from the config's
-    /// `rt_tol_sec` at load time) to match `ProcessedSpectrum::scan_start_time`.
-    pub rt_tol: Option<Tolerance>,
-    pub mobility_tol: Option<Tolerance>,
+    /// RT tolerance window as a function of observed `scan_start_time`,
+    /// already in minutes (converted from the config's `rt_tol_sec` at load
+    /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
+    /// flat window is just a 2-node spline with identical values at both
+    /// nodes — there is no separate flat-tolerance representation.
+    pub rt_tol: Option<crate::spline::ValueTolSpline>,
+    /// IIM tolerance window as a function of observed
+    /// `Precursor::inverse_ion_mobility`.
+    pub mobility_tol: Option<crate::spline::ValueTolSpline>,
 }
 
 #[inline(always)]
@@ -423,7 +428,9 @@ impl<'db> Scorer<'db> {
     ) {
         let (rt_lo, rt_hi) = self
             .rt_tol
+            .as_ref()
             .expect("validated at config-load time: rt_tol required with predicted_properties")
+            .tolerance_at(query.scan_start_time)
             .bounds(query.scan_start_time);
         let iim_bounds = query
             .precursors
@@ -431,9 +438,11 @@ impl<'db> Scorer<'db> {
             .and_then(|p| p.inverse_ion_mobility)
             .map(|observed| {
                 self.mobility_tol
+                    .as_ref()
                     .expect(
                         "validated at config-load time: mobility_tol required with predicted_properties",
                     )
+                    .tolerance_at(observed)
                     .bounds(observed)
             });
 

@@ -124,15 +124,29 @@ the query, specifically so callers can vary it per call.
 loads a read-only `HashMap<(String, u8), (f32, f32)>` once at startup
 (`Runner::predicted_properties`, `crates/sage-cli/src/runner.rs`), shared
 across the parallel search same as `database`. Requires config fields
-`rt_tol_sec` (seconds — converted to minutes at load time, since
-`ProcessedSpectrum::scan_start_time` is in minutes) and `mobility_tol`
-(1/K0, no unit conversion needed) to both be set; `Input::build()` rejects
+`rt_tol_sec` and `mobility_tol` to both be set; `Input::build()` rejects
 `--predicted-properties` given without both. `Scorer::evict_rt_iim_mismatches`
 (`crates/sage/src/scoring.rs`) evicts fragment-matched candidates whose
 predicted RT/IIM falls outside the observed spectrum's window, right before
 `trim_hits`. A candidate with no `(sequence, charge)` entry in the map is
 left alone (permissive — avoids rejecting due to prediction-coverage gaps).
 Design/history: `necromerge2`'s `plans/better_sage_filtering.md`.
+
+Both fields are `ValueTolSpline` (`crates/sage/src/spline.rs`) — the same
+two-independent-`LinearSpline` (`lo`/`hi`) shape as `FragmentTolSpline`,
+evaluated against one observed value (`ProcessedSpectrum::scan_start_time`
+for RT, `Precursor::inverse_ion_mobility` for IIM) rather than a flat
+`Tolerance::Da`. Deliberately generic (not `RtTolSpline`/`MobilityTolSpline`)
+since RT and IIM tolerance are structurally identical. A value-independent
+("robust flat window") tolerance is just a 2-node spline with identical
+values at both nodes — there is no separate flat-tolerance type; empirically
+this is currently the only shape actually fit (see
+`git/featureprediction`'s `AI.md`), value-dependence is supported but unused
+so far. `rt_tol_sec`'s spline **values** are in seconds (converted to minutes
+once at `Search` build time, `/60.0` — `scan_start_time` is in minutes); its
+grid **x-axis** stays in whatever units the anchor points were fit on
+(minutes, matching `scan_start_time` directly). `mobility_tol` needs no unit
+conversion (1/K0 throughout).
 
 The standalone `dump_peptides` binary (`crates/sage-cli/src/bin/dump_peptides.rs`)
 digests a FASTA into a `peptide,proteins,monoisotopic,decoy` parquet without

@@ -4,7 +4,7 @@ use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
 use sage_core::scoring::ScoreType;
-use sage_core::spline::FragmentTolSpline;
+use sage_core::spline::{FragmentTolSpline, ValueTolSpline};
 use sage_core::{
     database::{Builder, Parameters},
     lfq::LfqSettings,
@@ -23,10 +23,11 @@ pub struct Search {
     pub fragment_tol: Tolerance,
     pub fragment_tol_spline: Option<FragmentTolSpline>,
     /// Predicted-RT/IIM candidate filtering — see `predicted_properties` doc
-    /// on [`Input`]. `rt_tol` here is already converted to minutes.
+    /// on [`Input`]. `rt_tol`'s spline *values* here are already converted
+    /// to minutes; its grid stays in `scan_start_time`'s native minutes too.
     pub predicted_properties: Option<String>,
-    pub rt_tol: Option<Tolerance>,
-    pub mobility_tol: Option<Tolerance>,
+    pub rt_tol: Option<ValueTolSpline>,
+    pub mobility_tol: Option<ValueTolSpline>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -90,12 +91,18 @@ pub struct Input {
     /// whose predicted RT/IIM falls outside `rt_tol_sec`/`mobility_tol` of
     /// the observed spectrum's values. Requires both to be set.
     pub predicted_properties: Option<String>,
-    /// RT tolerance, in **seconds** (converted to minutes internally to
-    /// match `ProcessedSpectrum::scan_start_time`) — unit spelled out in
-    /// the name since it differs from SAGE's internal minutes.
-    pub rt_tol_sec: Option<Tolerance>,
-    /// IIM tolerance, in 1/K0 — unambiguous, no unit suffix needed.
-    pub mobility_tol: Option<Tolerance>,
+    /// RT tolerance window as a function of observed `scan_start_time`
+    /// (minutes — the spline's own grid is in that same unit, no
+    /// conversion). Spline *values* (the window width) are in **seconds**
+    /// (converted to minutes internally at load time) — unit spelled out
+    /// in the name since it differs from SAGE's internal minutes. A flat
+    /// (value-independent) window is just a 2-node spline with identical
+    /// values at both nodes — there is no separate flat-tolerance type.
+    pub rt_tol_sec: Option<ValueTolSpline>,
+    /// IIM tolerance window as a function of observed
+    /// `Precursor::inverse_ion_mobility` (1/K0 — unambiguous, no unit
+    /// suffix needed, same unit for both the spline's grid and its values).
+    pub mobility_tol: Option<ValueTolSpline>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -327,18 +334,22 @@ impl Input {
         }
     }
 
-    /// `rt_tol_sec` is user-facing in seconds; `ProcessedSpectrum::scan_start_time`
-    /// (the internal RT representation, see `spectrum.rs`) is in minutes. Only
-    /// `Tolerance::Da` (an absolute window) makes sense for an RT/IIM offset —
-    /// `Ppm`/`Pct` are relative and dividing their values by 60 would be
-    /// meaningless, so those are rejected here.
-    fn rt_tol_sec_to_minutes(tolerance: Tolerance) -> anyhow::Result<Tolerance> {
-        match tolerance {
-            Tolerance::Da(lo, hi) => Ok(Tolerance::Da(lo / 60.0, hi / 60.0)),
-            _ => anyhow::bail!(
-                "`rt_tol_sec` must be a `da` tolerance (an absolute window in seconds), \
-                 e.g. {{\"da\": [-30.0, 30.0]}}"
-            ),
+    /// `rt_tol_sec`'s spline *values* are user-facing in seconds;
+    /// `ProcessedSpectrum::scan_start_time` (the internal RT representation,
+    /// see `spectrum.rs`) is in minutes. Only the values need conversion —
+    /// the spline's own grid is already in `scan_start_time`'s native
+    /// minutes (it's evaluated against observed RT directly, no unit
+    /// mismatch there).
+    fn rt_tol_sec_to_minutes(tolerance: ValueTolSpline) -> ValueTolSpline {
+        let to_minutes = |mut spline: sage_core::spline::LinearSpline| {
+            for v in spline.values.iter_mut() {
+                *v /= 60.0;
+            }
+            spline
+        };
+        ValueTolSpline {
+            lo: to_minutes(tolerance.lo),
+            hi: to_minutes(tolerance.hi),
         }
     }
 
@@ -356,6 +367,16 @@ impl Input {
                  both configured — RT/IIM candidate filtering requires all three together. \
                  Either set both tolerances, or remove `predicted_properties`."
             );
+        }
+        if let Some(spline) = &self.rt_tol_sec {
+            spline
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid `rt_tol_sec`: {e}"))?;
+        }
+        if let Some(spline) = &self.mobility_tol {
+            spline
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid `mobility_tol`: {e}"))?;
         }
 
         if let Some(spline) = &self.fragment_tol_spline {
@@ -459,10 +480,7 @@ impl Input {
             fragment_tol: self.fragment_tol,
             fragment_tol_spline: self.fragment_tol_spline,
             predicted_properties: self.predicted_properties,
-            rt_tol: self
-                .rt_tol_sec
-                .map(Self::rt_tol_sec_to_minutes)
-                .transpose()?,
+            rt_tol: self.rt_tol_sec.map(Self::rt_tol_sec_to_minutes),
             mobility_tol: self.mobility_tol,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: self.max_peaks.unwrap_or(150),
@@ -632,6 +650,16 @@ mod test {
         json
     }
 
+    /// A flat (value-independent) `ValueTolSpline` JSON blob, `[lo, hi]`
+    /// everywhere -- 2 nodes with identical values, same shape used by the
+    /// real `rt_tol_sec`/`mobility_tol` robust-flat-window fits.
+    fn flat_value_tol_spline_json(lo: f64, hi: f64) -> serde_json::Value {
+        serde_json::json!({
+            "lo": {"grid_start": 0.0, "grid_step": 1.0, "values": [lo, lo]},
+            "hi": {"grid_start": 0.0, "grid_step": 1.0, "values": [hi, hi]},
+        })
+    }
+
     #[test]
     fn predicted_properties_without_tolerances_errors() {
         let json = mk_predicted_properties_json(Some("predictions.parquet"), None, None);
@@ -650,7 +678,7 @@ mod test {
     fn predicted_properties_with_only_rt_tol_errors() {
         let json = mk_predicted_properties_json(
             Some("predictions.parquet"),
-            Some(serde_json::json!({"da": [-30.0, 30.0]})),
+            Some(flat_value_tol_spline_json(-30.0, 30.0)),
             None,
         );
         let input: Input = serde_json::from_value(json).unwrap();
@@ -664,13 +692,21 @@ mod test {
     fn predicted_properties_with_both_tolerances_converts_seconds_to_minutes() {
         let json = mk_predicted_properties_json(
             Some("predictions.parquet"),
-            Some(serde_json::json!({"da": [-30.0, 30.0]})),
-            Some(serde_json::json!({"da": [-0.01, 0.01]})),
+            Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            Some(flat_value_tol_spline_json(-0.01, 0.01)),
         );
         let input: Input = serde_json::from_value(json).unwrap();
         let search = input.build().expect("fully configured should build");
-        assert_eq!(search.rt_tol, Some(Tolerance::Da(-0.5, 0.5)));
-        assert_eq!(search.mobility_tol, Some(Tolerance::Da(-0.01, 0.01)));
+        assert_eq!(
+            search.rt_tol.as_ref().unwrap().tolerance_at(0.0),
+            Tolerance::Da(-0.5, 0.5),
+            "rt_tol_sec values are in seconds, scan_start_time in minutes -- /60 at build time"
+        );
+        assert_eq!(
+            search.mobility_tol.as_ref().unwrap().tolerance_at(0.0),
+            Tolerance::Da(-0.01, 0.01),
+            "mobility_tol is unitless (1/K0), no conversion"
+        );
         assert_eq!(
             search.predicted_properties.as_deref(),
             Some("predictions.parquet")
@@ -678,20 +714,22 @@ mod test {
     }
 
     #[test]
-    fn rt_tol_sec_rejects_non_da_tolerance() {
+    fn predicted_properties_with_invalid_rt_tol_spline_errors() {
+        let mut bad_spline = flat_value_tol_spline_json(-30.0, 30.0);
+        bad_spline["lo"]["grid_step"] = serde_json::json!(0.0);
         let json = mk_predicted_properties_json(
             Some("predictions.parquet"),
-            Some(serde_json::json!({"ppm": [-30.0, 30.0]})),
-            Some(serde_json::json!({"da": [-0.01, 0.01]})),
+            Some(bad_spline),
+            Some(flat_value_tol_spline_json(-0.01, 0.01)),
         );
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
-            Ok(_) => panic!("non-Da rt_tol_sec should be rejected"),
+            Ok(_) => panic!("non-positive grid_step in rt_tol_sec should be rejected"),
         };
         assert!(
-            err.to_string().contains("da"),
-            "expected error mentioning the required `da` shape, got: {err}"
+            err.to_string().contains("rt_tol_sec"),
+            "expected error naming `rt_tol_sec`, got: {err}"
         );
     }
 

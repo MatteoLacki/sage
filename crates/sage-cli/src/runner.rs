@@ -208,8 +208,8 @@ impl Runner {
                     report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
                     wide_window: self.parameters.wide_window,
                     predicted_properties: self.predicted_properties.as_ref(),
-                    rt_tol: self.parameters.rt_tol,
-                    mobility_tol: self.parameters.mobility_tol,
+                    rt_tol: self.parameters.rt_tol.clone(),
+                    mobility_tol: self.parameters.mobility_tol.clone(),
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
                 };
@@ -543,8 +543,8 @@ impl Runner {
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
             predicted_properties: self.predicted_properties.as_ref(),
-            rt_tol: self.parameters.rt_tol,
-            mobility_tol: self.parameters.mobility_tol,
+            rt_tol: self.parameters.rt_tol.clone(),
+            mobility_tol: self.parameters.mobility_tol.clone(),
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
         };

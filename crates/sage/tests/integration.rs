@@ -6,7 +6,7 @@ use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
 use sage_core::scoring::{ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
-use sage_core::spline::{Extrapolation, FragmentTolSpline, LinearSpline};
+use sage_core::spline::{Extrapolation, FragmentTolSpline, LinearSpline, ValueTolSpline};
 
 const FASTA: &'static str = r#"
 >sp|Q99536|VAT1_HUMAN Synaptic vesicle membrane protein VAT-1 homolog OS=Homo sapiens OX=9606 GN=VAT1 PE=1 SV=2
@@ -259,6 +259,23 @@ fn flat_fragment_tol_spline(ppm: f32) -> FragmentTolSpline {
     }
 }
 
+/// A flat (value-independent) `ValueTolSpline`, `[lo, hi]` everywhere --
+/// the "robust flat window" shape actually used for `rt_tol_sec`/
+/// `mobility_tol` (a 2-node spline with identical values at both nodes,
+/// not a separate flat-tolerance type).
+fn flat_value_tol_spline(lo: f32, hi: f32) -> ValueTolSpline {
+    let flat = |value: f32| LinearSpline {
+        grid_start: 0.0,
+        grid_step: 1000.0,
+        values: vec![value, value],
+        extrapolation: Extrapolation::Flat,
+    };
+    ValueTolSpline {
+        lo: flat(lo),
+        hi: flat(hi),
+    }
+}
+
 /// All fragment peaks shifted 100 ppm off their theoretical masses are
 /// unreachable under a narrow flat `fragment_tol` (±5 ppm) with no spline —
 /// this is the pre-existing, unchanged behavior.
@@ -383,7 +400,7 @@ fn candidate_unreachable_outside_rt_tol() {
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_properties = Some(&predicted);
-    scorer.rt_tol = Some(Tolerance::Da(-0.2, 0.2));
+    scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     scorer.mobility_tol = None;
 
     let features = scorer.score_standard(&query);
@@ -428,7 +445,7 @@ fn candidate_reachable_within_rt_tol() {
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_properties = Some(&predicted);
-    scorer.rt_tol = Some(Tolerance::Da(-0.2, 0.2));
+    scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     scorer.mobility_tol = None;
 
     let features = scorer.score_standard(&query);
