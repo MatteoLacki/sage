@@ -120,17 +120,36 @@ the query, specifically so callers can vary it per call.
 
 ## Predicted RT/IIM candidate filtering
 
-`--predicted-properties <path.parquet>` (columns `sequence, charge, rt, iim`)
-loads a read-only `HashMap<(String, u8), (f32, f32)>` once at startup
-(`Runner::predicted_properties`, `crates/sage-cli/src/runner.rs`), shared
-across the parallel search same as `database`. Requires config fields
-`rt_tol_sec` and `mobility_tol` to both be set; `Input::build()` rejects
-`--predicted-properties` given without both. `Scorer::evict_rt_iim_mismatches`
-(`crates/sage/src/scoring.rs`) evicts fragment-matched candidates whose
-predicted RT/IIM falls outside the observed spectrum's window, right before
-`trim_hits`. A candidate with no `(sequence, charge)` entry in the map is
-left alone (permissive — avoids rejecting due to prediction-coverage gaps).
-Design/history: `necromerge2`'s `plans/better_sage_filtering.md`.
+RT and IIM are two fully independent, separately-optional filtering
+dimensions — either, both, or neither may be configured. `--predicted-rt
+<path.parquet>` (columns `sequence, rt`) loads a read-only
+`HashMap<String, f32>`; `--predicted-iim <path.parquet>` (columns `sequence,
+charge, iim`) loads a read-only `HashMap<(String, u8), f32>` — both once at
+startup (`Runner::predicted_rt`/`predicted_iim`,
+`crates/sage-cli/src/runner.rs`), shared across the parallel search same as
+`database`. `rt_tol_sec` is required exactly when `--predicted-rt` is given
+(and vice versa); same independent pairing for `mobility_tol`/
+`--predicted-iim` — `Input::build()` rejects either half being set without
+its partner, with no cross-coupling between the two pairs.
+`Scorer::evict_rt_iim_mismatches` (`crates/sage/src/scoring.rs`) evicts
+fragment-matched candidates whose predicted RT and/or IIM falls outside the
+observed spectrum's window, right before `trim_hits` — each dimension
+checked only if its map is configured at all; a candidate with no
+`sequence`/`(sequence, charge)` entry in a configured map is left alone on
+that dimension (permissive — avoids rejecting due to prediction-coverage
+gaps). Design/history: `necromerge2`'s `plans/better_sage_filtering.md`
+(original combined design) and `plans/rt_iim_independent_dimensions.md`
+(the independent-dimension split, 2026-08-21 — replaced the single
+`--predicted-properties`/`(rt, iim)`-tuple design outright, no back-compat
+shim, since this fork has no external users).
+
+Motivation for the split: a real F9477 comparison found RT and IIM filtering
+don't contribute equally (Chronologer_RT beats SAGE's own internal RT model
+by ~2.5x on robust residual error, while IM2Deep and SAGE's own IIM model
+are much closer) — independent dimensions let that be measured directly at
+the FDR level, and let RT-only filtering skip IM2Deep's Koina call entirely
+(a real ~57-minute-per-run cost on a full human proteome, not just an
+ablation nicety).
 
 Both fields are `ValueTolSpline` (`crates/sage/src/spline.rs`) — the same
 two-independent-`LinearSpline` (`lo`/`hi`) shape as `FragmentTolSpline`,

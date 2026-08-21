@@ -235,12 +235,18 @@ pub struct Scorer<'db> {
     pub annotate_matches: bool,
     pub score_type: ScoreType,
 
-    /// Externally-predicted `(sequence, charge) -> (rt, iim)`, used to evict
-    /// candidates whose predicted RT/IIM falls outside `rt_tol`/`mobility_tol`
-    /// of the observed spectrum's values. `rt_tol`/`mobility_tol` are
-    /// required (validated at config-load time) whenever this is `Some`. See
-    /// `plans/better_sage_filtering.md`.
-    pub predicted_properties: Option<&'db std::collections::HashMap<(String, u8), (f32, f32)>>,
+    /// Externally-predicted `sequence -> rt`, used to evict candidates whose
+    /// predicted RT falls outside `rt_tol` of the observed spectrum's RT.
+    /// `rt_tol` is required (validated at config-load time) whenever this is
+    /// `Some`. Independent of `predicted_iim` — either, both, or neither may
+    /// be set. See `plans/rt_iim_independent_dimensions.md`.
+    pub predicted_rt: Option<&'db std::collections::HashMap<String, f32>>,
+    /// Externally-predicted `(sequence, charge) -> iim`, used to evict
+    /// candidates whose predicted IIM falls outside `mobility_tol` of the
+    /// observed spectrum's IIM. `mobility_tol` is required (validated at
+    /// config-load time) whenever this is `Some`. Independent of
+    /// `predicted_rt`.
+    pub predicted_iim: Option<&'db std::collections::HashMap<(String, u8), f32>>,
     /// RT tolerance window as a function of observed `scan_start_time`,
     /// already in minutes (converted from the config's `rt_tol_sec` at load
     /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
@@ -405,57 +411,70 @@ impl<'db> Scorer<'db> {
             return hits;
         }
 
-        if let Some(map) = self.predicted_properties {
-            self.evict_rt_iim_mismatches(query, &candidates, &mut hits, map);
+        if self.predicted_rt.is_some() || self.predicted_iim.is_some() {
+            self.evict_rt_iim_mismatches(query, &candidates, &mut hits);
         }
 
         self.trim_hits(&mut hits);
         hits
     }
 
-    /// Evict candidates (in place) whose predicted RT/IIM falls outside
-    /// `rt_tol`/`mobility_tol` of `query`'s observed values. Candidates with
-    /// no entry in `map` for their `(sequence, charge)` are left alone
-    /// (permissive — avoids rejecting due to prediction-coverage gaps).
-    /// Missing observed `inverse_ion_mobility` (non-PASEF data) skips the
-    /// IIM check only; the RT check still applies.
+    /// Evict candidates (in place) whose predicted RT and/or IIM falls
+    /// outside `rt_tol`/`mobility_tol` of `query`'s observed values. Each
+    /// dimension is checked independently and only if its map
+    /// (`self.predicted_rt`/`self.predicted_iim`) is configured at all — an
+    /// unconfigured dimension never evicts anything. Candidates with no
+    /// entry in a configured map for their `sequence`/`(sequence, charge)`
+    /// are left alone on that dimension (permissive — avoids rejecting due
+    /// to prediction-coverage gaps). Missing observed
+    /// `inverse_ion_mobility` (non-PASEF data) skips the IIM check only;
+    /// the RT check still applies.
     fn evict_rt_iim_mismatches(
         &self,
         query: &ProcessedSpectrum<crate::spectrum::Peak>,
         candidates: &IndexedQuery,
         hits: &mut InitialHits,
-        map: &std::collections::HashMap<(String, u8), (f32, f32)>,
     ) {
-        let (rt_lo, rt_hi) = self
-            .rt_tol
-            .as_ref()
-            .expect("validated at config-load time: rt_tol required with predicted_properties")
-            .tolerance_at(query.scan_start_time)
-            .bounds(query.scan_start_time);
-        let iim_bounds = query
-            .precursors
-            .first()
-            .and_then(|p| p.inverse_ion_mobility)
-            .map(|observed| {
-                self.mobility_tol
-                    .as_ref()
-                    .expect(
-                        "validated at config-load time: mobility_tol required with predicted_properties",
-                    )
-                    .tolerance_at(observed)
-                    .bounds(observed)
-            });
+        let rt_bounds = self.predicted_rt.map(|_| {
+            self.rt_tol
+                .as_ref()
+                .expect("validated at config-load time: rt_tol required with predicted_rt")
+                .tolerance_at(query.scan_start_time)
+                .bounds(query.scan_start_time)
+        });
+        let iim_bounds = self.predicted_iim.and_then(|_| {
+            query
+                .precursors
+                .first()
+                .and_then(|p| p.inverse_ion_mobility)
+                .map(|observed| {
+                    self.mobility_tol
+                        .as_ref()
+                        .expect(
+                            "validated at config-load time: mobility_tol required with predicted_iim",
+                        )
+                        .tolerance_at(observed)
+                        .bounds(observed)
+                })
+        });
 
         for (i, sc) in hits.preliminary.iter_mut().enumerate() {
             if sc.matched == 0 {
                 continue;
             }
             let peptide = &self.db.peptides[candidates.pre_idx_lo + i];
-            let Some(&(rt, iim)) = map.get(&(peptide.to_string(), sc.precursor_charge)) else {
-                continue;
-            };
-            let rt_ok = rt >= rt_lo && rt <= rt_hi;
-            let iim_ok = iim_bounds.map_or(true, |(lo, hi)| iim >= lo && iim <= hi);
+
+            let rt_ok = rt_bounds.map_or(true, |(lo, hi)| {
+                self.predicted_rt
+                    .and_then(|map| map.get(&peptide.to_string()))
+                    .map_or(true, |&rt| rt >= lo && rt <= hi)
+            });
+            let iim_ok = iim_bounds.map_or(true, |(lo, hi)| {
+                self.predicted_iim
+                    .and_then(|map| map.get(&(peptide.to_string(), sc.precursor_charge)))
+                    .map_or(true, |&iim| iim >= lo && iim <= hi)
+            });
+
             if !rt_ok || !iim_ok {
                 hits.matched_peaks -= sc.matched as usize;
                 hits.scored_candidates -= 1;

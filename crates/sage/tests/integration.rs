@@ -144,7 +144,8 @@ fn mk_scorer_with_fragment_tol(
         chimera: false,
         report_psms: 5,
         wide_window: false,
-        predicted_properties: None,
+        predicted_rt: None,
+        predicted_iim: None,
         rt_tol: None,
         mobility_tol: None,
         annotate_matches: false,
@@ -365,11 +366,13 @@ fn candidate_reachable_with_fragment_tol_spline() {
     assert_eq!(features[0].peptide_idx, target_idx);
 }
 
-/// A candidate whose entry in `predicted_properties` gives it a predicted RT
-/// far outside `rt_tol` of the observed spectrum's `scan_start_time` is
+/// A candidate whose entry in `predicted_rt` gives it a predicted RT far
+/// outside `rt_tol` of the observed spectrum's `scan_start_time` is
 /// unreachable, even though precursor/fragment tolerances alone would have
 /// matched it fine (same query as the RT-mismatch test below, minus the
-/// `predicted_properties` map, does find it — see that test).
+/// `predicted_rt` map, does find it — see that test). `predicted_iim` is
+/// left unconfigured entirely, confirming RT filtering works independently
+/// of IIM — see plans/rt_iim_independent_dimensions.md.
 #[test]
 fn candidate_unreachable_outside_rt_tol() {
     let db = mk_ppm_window_database();
@@ -394,13 +397,13 @@ fn candidate_unreachable_outside_rt_tol() {
         ..Default::default()
     };
 
-    let key = (db[target_idx].to_string(), 1u8);
-    let mut predicted = std::collections::HashMap::new();
-    predicted.insert(key, (15.0f32, 0.0f32)); // rt=15.0, far outside [9.8, 10.2]
+    let mut predicted_rt = std::collections::HashMap::new();
+    predicted_rt.insert(db[target_idx].to_string(), 15.0f32); // far outside [9.8, 10.2]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
-    scorer.predicted_properties = Some(&predicted);
+    scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
+    scorer.predicted_iim = None;
     scorer.mobility_tol = None;
 
     let features = scorer.score_standard(&query);
@@ -410,11 +413,12 @@ fn candidate_unreachable_outside_rt_tol() {
     );
 }
 
-/// Same query, target, and `predicted_properties` map shape as above, but
-/// with a predicted RT inside `rt_tol` — confirms the candidate is reachable
-/// (i.e. the rejection above is really coming from the RT mismatch, not
-/// some other difference), and that a `None` observed `inverse_ion_mobility`
-/// skips the IIM check entirely (no `mobility_tol` needed).
+/// Same query, target, and `predicted_rt` map shape as above, but with a
+/// predicted RT inside `rt_tol` — confirms the candidate is reachable (i.e.
+/// the rejection above is really coming from the RT mismatch, not some
+/// other difference), and that no `predicted_iim`/`mobility_tol` at all
+/// (not even a `None` observed `inverse_ion_mobility`, the dimension is
+/// simply not configured) never touches eviction.
 #[test]
 fn candidate_reachable_within_rt_tol() {
     let db = mk_ppm_window_database();
@@ -439,13 +443,13 @@ fn candidate_reachable_within_rt_tol() {
         ..Default::default()
     };
 
-    let key = (db[target_idx].to_string(), 1u8);
-    let mut predicted = std::collections::HashMap::new();
-    predicted.insert(key, (10.05f32, 0.0f32)); // rt=10.05, inside [9.8, 10.2]
+    let mut predicted_rt = std::collections::HashMap::new();
+    predicted_rt.insert(db[target_idx].to_string(), 10.05f32); // inside [9.8, 10.2]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
-    scorer.predicted_properties = Some(&predicted);
+    scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
+    scorer.predicted_iim = None;
     scorer.mobility_tol = None;
 
     let features = scorer.score_standard(&query);
@@ -453,6 +457,90 @@ fn candidate_reachable_within_rt_tol() {
         features.len(),
         1,
         "predicted RT inside rt_tol should reach the candidate"
+    );
+    assert_eq!(features[0].peptide_idx, target_idx);
+}
+
+/// IIM-only filtering, the symmetric counterpart of the RT tests above —
+/// `predicted_rt`/`rt_tol` are left entirely unconfigured, confirming IIM
+/// filtering also works independently.
+#[test]
+fn candidate_unreachable_outside_iim_tol() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: Some(1.0),
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "iim-mismatch".into(),
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_iim = std::collections::HashMap::new();
+    predicted_iim.insert((db[target_idx].to_string(), 1u8), 1.5f32); // far outside [0.9, 1.1]
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_iim = Some(&predicted_iim);
+    scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
+    scorer.predicted_rt = None;
+    scorer.rt_tol = None;
+
+    let features = scorer.score_standard(&query);
+    assert!(
+        features.is_empty(),
+        "predicted IIM far outside mobility_tol should reject the candidate"
+    );
+}
+
+/// Same as above but with a predicted IIM inside `mobility_tol`.
+#[test]
+fn candidate_reachable_within_iim_tol() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: Some(1.0),
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "iim-match".into(),
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_iim = std::collections::HashMap::new();
+    predicted_iim.insert((db[target_idx].to_string(), 1u8), 1.05f32); // inside [0.9, 1.1]
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_iim = Some(&predicted_iim);
+    scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
+    scorer.predicted_rt = None;
+    scorer.rt_tol = None;
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(
+        features.len(),
+        1,
+        "predicted IIM inside mobility_tol should reach the candidate"
     );
     assert_eq!(features[0].peptide_idx, target_idx);
 }

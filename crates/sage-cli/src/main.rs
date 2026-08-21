@@ -51,13 +51,24 @@ fn main() -> anyhow::Result<()> {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
-            Arg::new("predicted-properties")
-                .long("predicted-properties")
+            Arg::new("predicted-rt")
+                .long("predicted-rt")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Path to a parquet file of externally-predicted peptide RT/IIM \
-                     (columns: sequence, charge, rt, iim). Requires `rt_tol_sec` and \
-                     `mobility_tol` to also be configured.",
+                    "Path to a parquet file of externally-predicted peptide RT \
+                     (columns: sequence, rt). Requires `rt_tol_sec` to also be \
+                     configured. Independent of --predicted-iim.",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("predicted-iim")
+                .long("predicted-iim")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to a parquet file of externally-predicted peptide IIM \
+                     (columns: sequence, charge, iim). Requires `mobility_tol` to \
+                     also be configured. Independent of --predicted-rt.",
                 )
                 .value_hint(ValueHint::FilePath),
         )

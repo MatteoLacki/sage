@@ -22,10 +22,13 @@ pub struct Search {
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
     pub fragment_tol_spline: Option<FragmentTolSpline>,
-    /// Predicted-RT/IIM candidate filtering — see `predicted_properties` doc
-    /// on [`Input`]. `rt_tol`'s spline *values* here are already converted
-    /// to minutes; its grid stays in `scan_start_time`'s native minutes too.
-    pub predicted_properties: Option<String>,
+    /// Predicted-RT/IIM candidate filtering — see `predicted_rt`/
+    /// `predicted_iim` docs on [`Input`]. Independent of `predicted_iim`.
+    /// `rt_tol`'s spline *values* here are already converted to minutes;
+    /// its grid stays in `scan_start_time`'s native minutes too.
+    pub predicted_rt: Option<String>,
+    /// Independent of `predicted_rt` — see `predicted_iim` doc on [`Input`].
+    pub predicted_iim: Option<String>,
     pub rt_tol: Option<ValueTolSpline>,
     pub mobility_tol: Option<ValueTolSpline>,
     pub precursor_charge: (u8, u8),
@@ -86,11 +89,17 @@ pub struct Input {
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
     pub precursors: Option<String>,
-    /// Path to a parquet file of externally-predicted peptide RT/IIM
-    /// (columns: sequence, charge, rt, iim), used to reject candidates
-    /// whose predicted RT/IIM falls outside `rt_tol_sec`/`mobility_tol` of
-    /// the observed spectrum's values. Requires both to be set.
-    pub predicted_properties: Option<String>,
+    /// Path to a parquet file of externally-predicted peptide RT (columns:
+    /// sequence, rt), used to reject candidates whose predicted RT falls
+    /// outside `rt_tol_sec` of the observed spectrum's RT. Requires
+    /// `rt_tol_sec` to be set. Independent of `predicted_iim` — either,
+    /// both, or neither may be given.
+    pub predicted_rt: Option<String>,
+    /// Path to a parquet file of externally-predicted peptide IIM (columns:
+    /// sequence, charge, iim), used to reject candidates whose predicted
+    /// IIM falls outside `mobility_tol` of the observed spectrum's IIM.
+    /// Requires `mobility_tol` to be set. Independent of `predicted_rt`.
+    pub predicted_iim: Option<String>,
     /// RT tolerance window as a function of observed `scan_start_time`
     /// (minutes — the spline's own grid is in that same unit, no
     /// conversion). Spline *values* (the window width) are in **seconds**
@@ -358,8 +367,11 @@ impl Input {
         if let Some(precursors) = matches.get_one::<String>("precursors") {
             input.precursors = Some(precursors.into());
         }
-        if let Some(predicted_properties) = matches.get_one::<String>("predicted-properties") {
-            input.predicted_properties = Some(predicted_properties.into());
+        if let Some(predicted_rt) = matches.get_one::<String>("predicted-rt") {
+            input.predicted_rt = Some(predicted_rt.into());
+        }
+        if let Some(predicted_iim) = matches.get_one::<String>("predicted-iim") {
+            input.predicted_iim = Some(predicted_iim.into());
         }
 
         if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
@@ -471,13 +483,16 @@ impl Input {
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
 
-        if self.predicted_properties.is_some()
-            && (self.rt_tol_sec.is_none() || self.mobility_tol.is_none())
-        {
+        if self.predicted_rt.is_some() != self.rt_tol_sec.is_some() {
             anyhow::bail!(
-                "`predicted_properties` file supplied but `rt_tol_sec`/`mobility_tol` are not \
-                 both configured — RT/IIM candidate filtering requires all three together. \
-                 Either set both tolerances, or remove `predicted_properties`."
+                "`predicted_rt` and `rt_tol_sec` must be set together (or both omitted) — \
+                 either set both, or remove whichever one is set."
+            );
+        }
+        if self.predicted_iim.is_some() != self.mobility_tol.is_some() {
+            anyhow::bail!(
+                "`predicted_iim` and `mobility_tol` must be set together (or both omitted) — \
+                 either set both, or remove whichever one is set."
             );
         }
         if let Some(spline) = &self.rt_tol_sec {
@@ -591,7 +606,8 @@ impl Input {
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
             fragment_tol_spline: self.fragment_tol_spline,
-            predicted_properties: self.predicted_properties,
+            predicted_rt: self.predicted_rt,
+            predicted_iim: self.predicted_iim,
             rt_tol: self.rt_tol_sec.map(Self::rt_tol_sec_to_minutes),
             mobility_tol: self.mobility_tol,
             report_psms: self.report_psms.unwrap_or(1),
@@ -744,17 +760,21 @@ mod test {
         );
     }
 
-    fn mk_predicted_properties_json(
-        predicted_properties: Option<&str>,
+    fn mk_predicted_json(
+        predicted_rt: Option<&str>,
         rt_tol_sec: Option<serde_json::Value>,
+        predicted_iim: Option<&str>,
         mobility_tol: Option<serde_json::Value>,
     ) -> serde_json::Value {
         let mut json = mk_input_json(None);
-        if let Some(path) = predicted_properties {
-            json["predicted_properties"] = serde_json::json!(path);
+        if let Some(path) = predicted_rt {
+            json["predicted_rt"] = serde_json::json!(path);
         }
         if let Some(rt) = rt_tol_sec {
             json["rt_tol_sec"] = rt;
+        }
+        if let Some(path) = predicted_iim {
+            json["predicted_iim"] = serde_json::json!(path);
         }
         if let Some(im) = mobility_tol {
             json["mobility_tol"] = im;
@@ -773,38 +793,81 @@ mod test {
     }
 
     #[test]
-    fn predicted_properties_without_tolerances_errors() {
-        let json = mk_predicted_properties_json(Some("predictions.parquet"), None, None);
+    fn predicted_rt_without_tolerance_errors() {
+        let json = mk_predicted_json(Some("predicted_rt.parquet"), None, None, None);
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
-            Ok(_) => panic!("missing tolerances should error"),
+            Ok(_) => panic!("predicted_rt without rt_tol_sec should error"),
         };
         assert!(
-            err.to_string().contains("rt_tol_sec") && err.to_string().contains("mobility_tol"),
-            "expected error naming both `rt_tol_sec` and `mobility_tol`, got: {err}"
+            err.to_string().contains("predicted_rt") && err.to_string().contains("rt_tol_sec"),
+            "expected error naming `predicted_rt` and `rt_tol_sec`, got: {err}"
         );
     }
 
     #[test]
-    fn predicted_properties_with_only_rt_tol_errors() {
-        let json = mk_predicted_properties_json(
-            Some("predictions.parquet"),
+    fn predicted_iim_without_tolerance_errors() {
+        let json = mk_predicted_json(None, None, Some("predicted_iim.parquet"), None);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("predicted_iim without mobility_tol should error"),
+        };
+        assert!(
+            err.to_string().contains("predicted_iim") && err.to_string().contains("mobility_tol"),
+            "expected error naming `predicted_iim` and `mobility_tol`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn predicted_rt_only_builds_successfully() {
+        // RT-only filtering is a supported, independent mode -- no mobility_tol
+        // needed at all. See plans/rt_iim_independent_dimensions.md.
+        let json = mk_predicted_json(
+            Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            None,
             None,
         );
         let input: Input = serde_json::from_value(json).unwrap();
-        assert!(
-            input.build().is_err(),
-            "partial predicted-properties config (rt_tol_sec set, mobility_tol unset) should error"
+        let search = input
+            .build()
+            .expect("RT-only predicted-property filtering should be valid");
+        assert_eq!(
+            search.predicted_rt.as_deref(),
+            Some("predicted_rt.parquet")
         );
+        assert!(search.predicted_iim.is_none());
+        assert!(search.mobility_tol.is_none());
     }
 
     #[test]
-    fn predicted_properties_with_both_tolerances_converts_seconds_to_minutes() {
-        let json = mk_predicted_properties_json(
-            Some("predictions.parquet"),
+    fn predicted_iim_only_builds_successfully() {
+        let json = mk_predicted_json(
+            None,
+            None,
+            Some("predicted_iim.parquet"),
+            Some(flat_value_tol_spline_json(-0.01, 0.01)),
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input
+            .build()
+            .expect("IIM-only predicted-property filtering should be valid");
+        assert_eq!(
+            search.predicted_iim.as_deref(),
+            Some("predicted_iim.parquet")
+        );
+        assert!(search.predicted_rt.is_none());
+        assert!(search.rt_tol.is_none());
+    }
+
+    #[test]
+    fn predicted_rt_and_iim_together_converts_seconds_to_minutes() {
+        let json = mk_predicted_json(
+            Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            Some("predicted_iim.parquet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
         );
         let input: Input = serde_json::from_value(json).unwrap();
@@ -820,20 +883,20 @@ mod test {
             "mobility_tol is unitless (1/K0), no conversion"
         );
         assert_eq!(
-            search.predicted_properties.as_deref(),
-            Some("predictions.parquet")
+            search.predicted_rt.as_deref(),
+            Some("predicted_rt.parquet")
+        );
+        assert_eq!(
+            search.predicted_iim.as_deref(),
+            Some("predicted_iim.parquet")
         );
     }
 
     #[test]
-    fn predicted_properties_with_invalid_rt_tol_spline_errors() {
+    fn predicted_rt_with_invalid_rt_tol_spline_errors() {
         let mut bad_spline = flat_value_tol_spline_json(-30.0, 30.0);
         bad_spline["lo"]["grid_step"] = serde_json::json!(0.0);
-        let json = mk_predicted_properties_json(
-            Some("predictions.parquet"),
-            Some(bad_spline),
-            Some(flat_value_tol_spline_json(-0.01, 0.01)),
-        );
+        let json = mk_predicted_json(Some("predicted_rt.parquet"), Some(bad_spline), None, None);
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
@@ -846,12 +909,12 @@ mod test {
     }
 
     #[test]
-    fn no_predicted_properties_no_tolerance_error() {
+    fn no_predicted_rt_iim_no_tolerance_error() {
         let json = mk_input_json(None);
         let input: Input = serde_json::from_value(json).unwrap();
         input
             .build()
-            .expect("no predicted_properties, no tolerances required, should build fine");
+            .expect("no predicted_rt/predicted_iim, no tolerances required, should build fine");
     }
 
     /// Only test in this binary that resolves a `UNIMOD:<id>` reference --

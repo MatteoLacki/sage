@@ -28,12 +28,15 @@ use report_builder::{
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
-    /// Externally-predicted `(sequence, charge) -> (rt, iim)`, loaded once
-    /// from `parameters.predicted_properties` if set — see
-    /// `plans/better_sage_filtering.md`. Read-only, shared across the
-    /// parallel spectra search via `&self`/`Scorer` borrows, same as
-    /// `database`.
-    pub predicted_properties: Option<HashMap<(String, u8), (f32, f32)>>,
+    /// Externally-predicted `sequence -> rt`, loaded once from
+    /// `parameters.predicted_rt` if set — independent of `predicted_iim`,
+    /// see `plans/rt_iim_independent_dimensions.md`. Read-only, shared
+    /// across the parallel spectra search via `&self`/`Scorer` borrows,
+    /// same as `database`.
+    pub predicted_rt: Option<HashMap<String, f32>>,
+    /// Externally-predicted `(sequence, charge) -> iim`, loaded once from
+    /// `parameters.predicted_iim` if set — independent of `predicted_rt`.
+    pub predicted_iim: Option<HashMap<(String, u8), f32>>,
     start: Instant,
 }
 
@@ -106,13 +109,28 @@ impl Runner {
             )
         })?;
 
-        let predicted_properties = match &parameters.predicted_properties {
+        let predicted_rt = match &parameters.predicted_rt {
             Some(path) => {
-                let map = sage_cloudpath::predicted_properties::read_predicted_properties(
+                let map = sage_cloudpath::predicted_properties::read_predicted_rt(
                     std::path::Path::new(path),
                 )
-                .with_context(|| format!("Failed to read predicted properties from `{path}`"))?;
-                info!("loaded {} predicted (sequence, charge) -> (rt, iim) entries", map.len());
+                .with_context(|| format!("Failed to read predicted RT from `{path}`"))?;
+                info!("loaded {} predicted sequence -> rt entries", map.len());
+                Some(map)
+            }
+            None => None,
+        };
+
+        let predicted_iim = match &parameters.predicted_iim {
+            Some(path) => {
+                let map = sage_cloudpath::predicted_properties::read_predicted_iim(
+                    std::path::Path::new(path),
+                )
+                .with_context(|| format!("Failed to read predicted IIM from `{path}`"))?;
+                info!(
+                    "loaded {} predicted (sequence, charge) -> iim entries",
+                    map.len()
+                );
                 Some(map)
             }
             None => None,
@@ -136,7 +154,8 @@ impl Runner {
                     let mini_runner = Self {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
-                        predicted_properties: predicted_properties.clone(),
+                        predicted_rt: predicted_rt.clone(),
+                        predicted_iim: predicted_iim.clone(),
                         start,
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
@@ -154,7 +173,8 @@ impl Runner {
         Ok(Self {
             database,
             parameters,
-            predicted_properties,
+            predicted_rt,
+            predicted_iim,
             start,
         })
     }
@@ -207,7 +227,8 @@ impl Runner {
                     chimera: self.parameters.chimera,
                     report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
                     wide_window: self.parameters.wide_window,
-                    predicted_properties: self.predicted_properties.as_ref(),
+                    predicted_rt: self.predicted_rt.as_ref(),
+                    predicted_iim: self.predicted_iim.as_ref(),
                     rt_tol: self.parameters.rt_tol.clone(),
                     mobility_tol: self.parameters.mobility_tol.clone(),
                     annotate_matches: self.parameters.annotate_matches,
@@ -542,7 +563,8 @@ impl Runner {
             chimera: self.parameters.chimera,
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
-            predicted_properties: self.predicted_properties.as_ref(),
+            predicted_rt: self.predicted_rt.as_ref(),
+            predicted_iim: self.predicted_iim.as_ref(),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
             annotate_matches: self.parameters.annotate_matches,
