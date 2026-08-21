@@ -25,6 +25,43 @@ use report_builder::{
     Report, ReportSection,
 };
 
+/// Resolves a `sequence -> rt` map into an index-keyed `Vec<Option<f32>>`
+/// (one entry per `db.peptides`), calling `Peptide::to_string()` exactly
+/// once per peptide -- not once per (candidate, spectrum) as
+/// `Scorer::evict_rt_iim_mismatches` used to. See `Runner::run`'s call
+/// site and plans/rt_iim_independent_dimensions.md.
+fn resolve_predicted_rt(db: &IndexedDatabase, map: &HashMap<String, f32>) -> Vec<Option<f32>> {
+    db.peptides
+        .iter()
+        .map(|peptide| map.get(&peptide.to_string()).copied())
+        .collect()
+}
+
+/// Same as `resolve_predicted_rt`, for `(sequence, charge) -> iim`. Charge
+/// isn't known ahead of time per peptide, so every configured charge in
+/// `[min_charge, max_charge]` (the run's own `precursor_charge` range,
+/// matching what `evict_rt_iim_mismatches` will ever see as
+/// `sc.precursor_charge`) is checked against the source map for each
+/// peptide -- still only one `to_string()` call per peptide, reused across
+/// that small charge range.
+fn resolve_predicted_iim(
+    db: &IndexedDatabase,
+    map: &HashMap<(String, u8), f32>,
+    min_charge: u8,
+    max_charge: u8,
+) -> HashMap<(usize, u8), f32> {
+    let mut resolved = HashMap::new();
+    for (idx, peptide) in db.peptides.iter().enumerate() {
+        let sequence = peptide.to_string();
+        for charge in min_charge..=max_charge {
+            if let Some(&iim) = map.get(&(sequence.clone(), charge)) {
+                resolved.insert((idx, charge), iim);
+            }
+        }
+    }
+    resolved
+}
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
@@ -212,6 +249,19 @@ impl Runner {
                     (Instant::now() - start).as_millis()
                 );
 
+                let predicted_rt_by_idx = self
+                    .predicted_rt
+                    .as_ref()
+                    .map(|map| resolve_predicted_rt(&db, map));
+                let predicted_iim_by_idx = self.predicted_iim.as_ref().map(|map| {
+                    resolve_predicted_iim(
+                        &db,
+                        map,
+                        self.parameters.precursor_charge.0,
+                        self.parameters.precursor_charge.1,
+                    )
+                });
+
                 let scorer = Scorer {
                     db: &db,
                     precursor_tol: self.parameters.precursor_tol,
@@ -227,8 +277,8 @@ impl Runner {
                     chimera: self.parameters.chimera,
                     report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
                     wide_window: self.parameters.wide_window,
-                    predicted_rt: self.predicted_rt.as_ref(),
-                    predicted_iim: self.predicted_iim.as_ref(),
+                    predicted_rt: predicted_rt_by_idx.as_deref(),
+                    predicted_iim: predicted_iim_by_idx.as_ref(),
                     rt_tol: self.parameters.rt_tol.clone(),
                     mobility_tol: self.parameters.mobility_tol.clone(),
                     annotate_matches: self.parameters.annotate_matches,
@@ -548,6 +598,26 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        // Resolved once here, against the final `database` -- `Peptide::to_string()`
+        // (which itself does a `unimod::lookup_reverse` per modified residue)
+        // is real, measurable overhead when done per (candidate, spectrum)
+        // instead of once per peptide: a real F9477 comparison found combined
+        // RT+IIM eviction added +37% (152s) to `run_sage`'s wall time before
+        // this change. See `evict_rt_iim_mismatches` (`scoring.rs`) and
+        // plans/rt_iim_independent_dimensions.md.
+        let predicted_rt_by_idx = self
+            .predicted_rt
+            .as_ref()
+            .map(|map| resolve_predicted_rt(&self.database, map));
+        let predicted_iim_by_idx = self.predicted_iim.as_ref().map(|map| {
+            resolve_predicted_iim(
+                &self.database,
+                map,
+                self.parameters.precursor_charge.0,
+                self.parameters.precursor_charge.1,
+            )
+        });
+
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
@@ -563,8 +633,8 @@ impl Runner {
             chimera: self.parameters.chimera,
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
-            predicted_rt: self.predicted_rt.as_ref(),
-            predicted_iim: self.predicted_iim.as_ref(),
+            predicted_rt: predicted_rt_by_idx.as_deref(),
+            predicted_iim: predicted_iim_by_idx.as_ref(),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
             annotate_matches: self.parameters.annotate_matches,

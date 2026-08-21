@@ -397,8 +397,8 @@ fn candidate_unreachable_outside_rt_tol() {
         ..Default::default()
     };
 
-    let mut predicted_rt = std::collections::HashMap::new();
-    predicted_rt.insert(db[target_idx].to_string(), 15.0f32); // far outside [9.8, 10.2]
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[target_idx.0 as usize] = Some(15.0f32); // far outside [9.8, 10.2]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_rt = Some(&predicted_rt);
@@ -443,8 +443,8 @@ fn candidate_reachable_within_rt_tol() {
         ..Default::default()
     };
 
-    let mut predicted_rt = std::collections::HashMap::new();
-    predicted_rt.insert(db[target_idx].to_string(), 10.05f32); // inside [9.8, 10.2]
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[target_idx.0 as usize] = Some(10.05f32); // inside [9.8, 10.2]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_rt = Some(&predicted_rt);
@@ -488,7 +488,7 @@ fn candidate_unreachable_outside_iim_tol() {
     };
 
     let mut predicted_iim = std::collections::HashMap::new();
-    predicted_iim.insert((db[target_idx].to_string(), 1u8), 1.5f32); // far outside [0.9, 1.1]
+    predicted_iim.insert((target_idx.0 as usize, 1u8), 1.5f32); // far outside [0.9, 1.1]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_iim = Some(&predicted_iim);
@@ -528,7 +528,7 @@ fn candidate_reachable_within_iim_tol() {
     };
 
     let mut predicted_iim = std::collections::HashMap::new();
-    predicted_iim.insert((db[target_idx].to_string(), 1u8), 1.05f32); // inside [0.9, 1.1]
+    predicted_iim.insert((target_idx.0 as usize, 1u8), 1.05f32); // inside [0.9, 1.1]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_iim = Some(&predicted_iim);

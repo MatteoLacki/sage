@@ -235,18 +235,24 @@ pub struct Scorer<'db> {
     pub annotate_matches: bool,
     pub score_type: ScoreType,
 
-    /// Externally-predicted `sequence -> rt`, used to evict candidates whose
-    /// predicted RT falls outside `rt_tol` of the observed spectrum's RT.
-    /// `rt_tol` is required (validated at config-load time) whenever this is
-    /// `Some`. Independent of `predicted_iim` — either, both, or neither may
-    /// be set. See `plans/rt_iim_independent_dimensions.md`.
-    pub predicted_rt: Option<&'db std::collections::HashMap<String, f32>>,
-    /// Externally-predicted `(sequence, charge) -> iim`, used to evict
-    /// candidates whose predicted IIM falls outside `mobility_tol` of the
-    /// observed spectrum's IIM. `mobility_tol` is required (validated at
+    /// Externally-predicted RT, indexed by peptide index (`db.peptides`),
+    /// used to evict candidates whose predicted RT falls outside `rt_tol`
+    /// of the observed spectrum's RT. `rt_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
-    /// `predicted_rt`.
-    pub predicted_iim: Option<&'db std::collections::HashMap<(String, u8), f32>>,
+    /// `predicted_iim` — either, both, or neither may be set. Resolved
+    /// once from a `sequence -> rt` map by `Runner::resolve_predicted_rt`
+    /// (not read directly by `Scorer`) — the index form avoids calling
+    /// `Peptide::to_string()` per (candidate, spectrum) during search, a
+    /// real measured ~37% `run_sage` overhead before this. See
+    /// `plans/rt_iim_independent_dimensions.md`.
+    pub predicted_rt: Option<&'db [Option<f32>]>,
+    /// Externally-predicted IIM, keyed by `(peptide index, charge)`, used
+    /// to evict candidates whose predicted IIM falls outside `mobility_tol`
+    /// of the observed spectrum's IIM. `mobility_tol` is required
+    /// (validated at config-load time) whenever this is `Some`.
+    /// Independent of `predicted_rt`. Resolved once by
+    /// `Runner::resolve_predicted_iim`, same reasoning as `predicted_rt`.
+    pub predicted_iim: Option<&'db std::collections::HashMap<(usize, u8), f32>>,
     /// RT tolerance window as a function of observed `scan_start_time`,
     /// already in minutes (converted from the config's `rt_tol_sec` at load
     /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
@@ -462,16 +468,16 @@ impl<'db> Scorer<'db> {
             if sc.matched == 0 {
                 continue;
             }
-            let peptide = &self.db.peptides[candidates.pre_idx_lo + i];
+            let peptide_idx = candidates.pre_idx_lo + i;
 
             let rt_ok = rt_bounds.map_or(true, |(lo, hi)| {
                 self.predicted_rt
-                    .and_then(|map| map.get(&peptide.to_string()))
-                    .map_or(true, |&rt| rt >= lo && rt <= hi)
+                    .and_then(|by_idx| by_idx[peptide_idx])
+                    .map_or(true, |rt| rt >= lo && rt <= hi)
             });
             let iim_ok = iim_bounds.map_or(true, |(lo, hi)| {
                 self.predicted_iim
-                    .and_then(|map| map.get(&(peptide.to_string(), sc.precursor_charge)))
+                    .and_then(|map| map.get(&(peptide_idx, sc.precursor_charge)))
                     .map_or(true, |&iim| iim >= lo && iim <= hi)
             });
 
