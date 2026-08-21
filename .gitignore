@@ -15,3 +15,8 @@ data/
 # small committed test fixture, exempted from the blanket data/*.txt ignores above
 !crates/sage-cloudpath/tests/data/
 !crates/sage-cloudpath/tests/data/**
+
+# embedded Unimod reference table (crates/sage/src/unimod.rs's include_str!),
+# same reasoning: exempted from the blanket data/*.csv ignores above
+!crates/sage/data/
+!crates/sage/data/**

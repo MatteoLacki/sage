@@ -62,6 +62,17 @@ fn main() -> anyhow::Result<()> {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
+            Arg::new("unimod-db-path")
+                .long("unimod-db-path")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to a Unimod modifications CSV (id,name,mono_mass), overriding the \
+                     table embedded in the binary. Lets `static_mods`/`variable_mods` reference \
+                     a modification as `\"UNIMOD:<id>\"` instead of a raw mass delta.",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
             Arg::new("fasta")
                 .short('f')
                 .long("fasta")

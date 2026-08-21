@@ -387,20 +387,35 @@ impl TryFrom<Digest> for Peptide {
     }
 }
 
+/// Prints `[UNIMOD:<id>]` instead of `[+mass]` when `mass` is bit-identical
+/// to a modification resolved via `UNIMOD:<id>` this run (see
+/// `crate::unimod`) -- so a config that named a mod by Unimod accession
+/// gets that accession back on output, not a re-derived mass string.
+/// Falls back to `[+mass]` for anything not resolved that way (including
+/// every mod when no `UNIMOD:<id>` references were used at all, matching
+/// today's output exactly).
+fn write_mod(f: &mut std::fmt::Formatter<'_>, m: f32) -> std::fmt::Result {
+    match crate::unimod::lookup_reverse(m) {
+        Some(id) => write!(f, "[UNIMOD:{id}]"),
+        None => write!(f, "[{:+}]", m),
+    }
+}
+
 impl std::fmt::Display for Peptide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(m) = self.nterm {
-            write!(f, "[{:+}]-", m)?;
+            write_mod(f, m)?;
+            write!(f, "-")?;
         }
         for (c, m) in self.sequence.iter().zip(self.modifications.iter()) {
+            write!(f, "{}", *c as char)?;
             if *m != 0.0 {
-                write!(f, "{}[{:+}]", *c as char, m)?;
-            } else {
-                write!(f, "{}", *c as char)?;
+                write_mod(f, *m)?;
             }
         }
         if let Some(m) = self.cterm {
-            write!(f, "-[{:+}]", m)?;
+            write!(f, "-")?;
+            write_mod(f, m)?;
         }
         Ok(())
     }
@@ -716,6 +731,50 @@ mod test {
                 (Sequence(6), 43.0),
                 (Sequence(7), 43.0),
             ]
+        );
+    }
+
+    /// Only test in this crate's `--lib` binary that calls
+    /// `unimod::set_reverse_table` -- it's a process-global `OnceLock`,
+    /// settable once; a second test doing the same would race/conflict
+    /// with cargo's default parallel-in-one-process test execution (same
+    /// reason `sage-cli`'s `fragment_tol_spline_warning_only_fires_when_spline_is_set`
+    /// combines two scenarios sharing a global into one test).
+    #[test]
+    fn display_round_trips_unimod_reference_but_not_plain_float() {
+        use ModificationSpecificity::*;
+
+        crate::unimod::set_reverse_table(HashMap::from([(57.021464f32.to_bits(), 4)]))
+            .expect("first and only test in this binary to set the unimod reverse table");
+
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 57.021464 was "resolved via UNIMOD:4" (per the reverse table set
+        // above) -- prints the accession, not the raw mass.
+        let unimod_sourced = [(Residue(b'C'), 57.021464f32)];
+        let printed = var_mod_sequence(&peptide, &unimod_sourced, 1);
+        assert!(
+            printed.iter().any(|s| s.contains("[UNIMOD:4]")),
+            "expected a [UNIMOD:4]-printed variant, got: {printed:?}"
+        );
+        assert!(
+            !printed.iter().any(|s| s.contains("[+57")),
+            "a UNIMOD-sourced mass must not also print as [+mass], got: {printed:?}"
+        );
+
+        // 16.0 (oxidation-ish, but not actually resolved via any UNIMOD:i
+        // reference this run) must still print as a plain mass delta --
+        // the reverse table only round-trips masses it was actually told
+        // about, never an incidental/unrelated value.
+        let plain_float = [(Residue(b'M'), 16.0f32)];
+        let printed = var_mod_sequence(&peptide, &plain_float, 1);
+        assert!(
+            printed.iter().any(|s| s.contains("[+16]")),
+            "expected a plain [+16] variant, got: {printed:?}"
         );
     }
 }

@@ -54,13 +54,36 @@ fn main() -> anyhow::Result<()> {
                 .help("Output parquet path")
                 .value_hint(ValueHint::FilePath),
         )
+        .arg(
+            Arg::new("unimod-db-path")
+                .long("unimod-db-path")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to a Unimod modifications CSV (id,name,mono_mass), overriding the \
+                     table embedded in the binary. Lets `static_mods`/`variable_mods` reference \
+                     a modification as `\"UNIMOD:<id>\"` instead of a raw mass delta.",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
         .get_matches();
 
     let fasta_path = matches.get_one::<String>("fasta").unwrap();
     let output = matches.get_one::<String>("output").unwrap();
 
+    // Must happen before parsing --config below: overrides the embedded
+    // default table `static_mods`/`variable_mods`'s `UNIMOD:<id>`
+    // references get resolved against.
+    if let Some(unimod_db_path) = matches.get_one::<String>("unimod-db-path") {
+        sage_core::unimod::set_active_table_from_path(std::path::Path::new(unimod_db_path))
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
     let mut builder: Builder = match matches.get_one::<String>("config") {
-        Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+        Some(path) => {
+            let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            sage_cli::input::resolve_unimod_refs_in_database(&mut value)?;
+            serde_json::from_value(value)?
+        }
         None => Builder::default(),
     };
     builder.fasta = Some(fasta_path.clone());

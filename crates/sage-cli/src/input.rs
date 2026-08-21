@@ -225,8 +225,117 @@ impl From<QuantOptions> for QuantSettings {
     }
 }
 
+/// Resolve one `database.static_mods`/`variable_mods` leaf value in place.
+/// A `"UNIMOD:<id>"` string is replaced with the active table's exact
+/// float, and `id` is recorded into `reverse` for `Peptide::Display`'s
+/// output round-trip. A plain number is checked against the active table
+/// too, but only to *reject* it if it coincides with a real entry --
+/// silently letting a rounded/imprecise float through would mean a
+/// modification that plainly *is* e.g. Carbamidomethyl never round-trips
+/// as `[UNIMOD:4]` on output, an inconsistency the caller should fix by
+/// writing `"UNIMOD:4"` explicitly instead.
+fn resolve_mod_leaf(
+    v: &mut serde_json::Value,
+    reverse: &mut std::collections::HashMap<u32, u32>,
+) -> anyhow::Result<()> {
+    if let Some(s) = v.as_str() {
+        let id_str = s.strip_prefix("UNIMOD:").ok_or_else(|| {
+            anyhow::anyhow!(
+                "modification `{s}` is a string but not `UNIMOD:<id>` -- \
+                 mods must be a plain number or a `UNIMOD:<id>` reference"
+            )
+        })?;
+        let id: u32 = id_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid UNIMOD id in `{s}`"))?;
+        let mass = sage_core::unimod::resolve(id).ok_or_else(|| {
+            anyhow::anyhow!("UNIMOD:{id} not found in the active unimod table")
+        })?;
+        reverse.insert(mass.to_bits(), id);
+        *v = serde_json::Value::from(mass);
+        return Ok(());
+    }
+
+    if let Some(mass) = v.as_f64() {
+        let mass = mass as f32;
+        if let Some((id, canonical)) = sage_core::unimod::find_coincidental_match(mass) {
+            anyhow::bail!(
+                "modification value {mass} coincides with UNIMOD:{id} (mono_mass={canonical}) -- \
+                 use \"UNIMOD:{id}\" instead of a raw float, so this modification round-trips \
+                 correctly on output and matches what predictors that read UNIMOD notation expect"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Walks `static_mods`/`variable_mods` in a `database`-shaped raw config
+/// JSON value (before it's deserialized into `Builder`), resolving
+/// `"UNIMOD:<id>"` references and validating plain floats against the
+/// active unimod table (embedded default, or `--unimod-db-path`'s
+/// override -- callers must set that override, if any, before calling
+/// this). `Builder.static_mods`/`variable_mods` keep their existing
+/// `HashMap<String, f32>`/`HashMap<String, Vec<f32>>` shape unchanged --
+/// this only ever produces a plain float for serde to deserialize into
+/// them, same as if the config had been written that way directly.
+///
+/// `pub`, not `pub(crate)`: the `dump_peptides` binary (`sage-cli/src/
+/// bin/dump_peptides.rs`) deserializes a `database`-shaped config
+/// directly into `Builder` with no enclosing `Input`, and needs this same
+/// resolution -- a separate `[[bin]]` target depends on `sage_cli` as an
+/// external crate, so `pub(crate)` wouldn't be visible to it.
+pub fn resolve_unimod_refs_in_database(database: &mut serde_json::Value) -> anyhow::Result<()> {
+    let mut reverse = std::collections::HashMap::new();
+
+    if let Some(static_mods) = database
+        .get_mut("static_mods")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_residue, v) in static_mods.iter_mut() {
+            resolve_mod_leaf(v, &mut reverse)?;
+        }
+    }
+
+    if let Some(variable_mods) = database
+        .get_mut("variable_mods")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_residue, v) in variable_mods.iter_mut() {
+            if let Some(arr) = v.as_array_mut() {
+                for entry in arr.iter_mut() {
+                    resolve_mod_leaf(entry, &mut reverse)?;
+                }
+            }
+        }
+    }
+
+    if !reverse.is_empty() {
+        sage_core::unimod::set_reverse_table(reverse).map_err(|e| anyhow::anyhow!(e))?;
+    }
+
+    Ok(())
+}
+
+/// Same, for a full `Input`-shaped config value (`database` nested under
+/// its own key) -- used by `Input::load`.
+fn resolve_unimod_refs(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    if let Some(database) = value.get_mut("database") {
+        resolve_unimod_refs_in_database(database)?;
+    }
+    Ok(())
+}
+
 impl Input {
     pub fn from_arguments(matches: ArgMatches) -> anyhow::Result<Self> {
+        // Must happen before `Input::load` below: `--unimod-db-path`
+        // overrides the embedded default table `static_mods`/
+        // `variable_mods`'s `UNIMOD:<id>` references get resolved against.
+        if let Some(unimod_db_path) = matches.get_one::<String>("unimod-db-path") {
+            sage_core::unimod::set_active_table_from_path(std::path::Path::new(unimod_db_path))
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+
         let path = matches
             .get_one::<String>("parameters")
             .expect("required parameters");
@@ -297,7 +406,10 @@ impl Input {
     }
 
     pub fn load<S: AsRef<str>>(path: S) -> anyhow::Result<Self> {
-        sage_cloudpath::util::read_json(path).map_err(anyhow::Error::from)
+        let mut value: serde_json::Value =
+            sage_cloudpath::util::read_json(path).map_err(anyhow::Error::from)?;
+        resolve_unimod_refs(&mut value)?;
+        Ok(serde_json::from_value(value)?)
     }
 
     fn check_mass_tolerances(tolerance: &Tolerance) {
@@ -509,7 +621,7 @@ impl Input {
 #[cfg(test)]
 mod test {
 
-    use super::Input;
+    use super::{resolve_unimod_refs, Input};
     use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters, mass::Tolerance};
 
     #[test]
@@ -740,5 +852,83 @@ mod test {
         input
             .build()
             .expect("no predicted_properties, no tolerances required, should build fine");
+    }
+
+    /// Only test in this binary that resolves a `UNIMOD:<id>` reference --
+    /// `sage_core::unimod`'s reverse table is a process-global `OnceLock`,
+    /// settable once; a second test doing the same would race/conflict
+    /// with cargo's default parallel-in-one-process test execution (same
+    /// reason `fragment_tol_spline_warning_only_fires_when_spline_is_set`
+    /// above combines two scenarios into one test).
+    #[test]
+    fn unimod_reference_resolves_to_embedded_table_mass() {
+        let mut json = mk_input_json(None);
+        json["database"]["static_mods"] = serde_json::json!({"C": "UNIMOD:4"});
+        resolve_unimod_refs(&mut json).expect("UNIMOD:4 should resolve against the embedded table");
+
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("valid config should build");
+        assert!(
+            search
+                .database
+                .static_mods
+                .values()
+                .any(|&m| (m - 57.021464).abs() < 1e-4),
+            "expected static_mods to contain Carbamidomethyl's exact mass, got: {:?}",
+            search.database.static_mods
+        );
+    }
+
+    #[test]
+    fn unknown_unimod_id_errors() {
+        let mut json = mk_input_json(None);
+        json["database"]["static_mods"] = serde_json::json!({"C": "UNIMOD:999999999"});
+        let err = resolve_unimod_refs(&mut json).expect_err("unknown UNIMOD id should error");
+        assert!(
+            err.to_string().contains("999999999"),
+            "expected error naming the missing id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_unimod_string_mod_errors_clearly() {
+        let mut json = mk_input_json(None);
+        json["database"]["static_mods"] = serde_json::json!({"C": "not-a-unimod-ref"});
+        let err = resolve_unimod_refs(&mut json).expect_err("non-UNIMOD string should error");
+        assert!(
+            err.to_string().contains("UNIMOD"),
+            "expected error mentioning the `UNIMOD:<id>` requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_float_coinciding_with_known_mod_errors() {
+        // Same value real job configs actually write for Carbamidomethyl
+        // (see plans/) -- close to, but not bit-identical to, the
+        // canonical 57.021464.
+        let mut json = mk_input_json(None);
+        json["database"]["static_mods"] = serde_json::json!({"C": 57.0216});
+        let err = resolve_unimod_refs(&mut json)
+            .expect_err("a float coinciding with a real Unimod entry should error");
+        assert!(
+            err.to_string().contains("UNIMOD:4"),
+            "expected error naming UNIMOD:4 (Carbamidomethyl), got: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_float_not_coinciding_with_anything_is_unaffected() {
+        let mut json = mk_input_json(None);
+        // Not close to any real Unimod entry.
+        json["database"]["static_mods"] = serde_json::json!({"C": 12345.6789});
+        resolve_unimod_refs(&mut json).expect("a genuinely novel mass should pass through");
+
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("valid config should build");
+        assert!(search
+            .database
+            .static_mods
+            .values()
+            .any(|&m| (m - 12345.6789).abs() < 1e-2));
     }
 }
