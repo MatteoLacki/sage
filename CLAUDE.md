@@ -174,6 +174,71 @@ optional `database`-shaped JSON (enzyme/mods/mass bounds/decoy_tag) — for
 `git/featureprediction` (a separate repo/pipeline stage) to generate
 RT/IIM predictions from.
 
+### Eviction lookup: dense peptide-index arrays, not string-keyed maps
+
+`--predicted-rt`/`--predicted-iim` load `HashMap<String, f32>`/
+`HashMap<(String, u8), f32>` from parquet (`Runner::predicted_rt`/
+`predicted_iim`), but `Scorer` never reads those directly — `Runner::run`
+resolves each into a dense, peptide-index-keyed `Vec<Option<f32>>` exactly
+once, before the per-file search loop starts (`resolve_predicted_rt`/
+`resolve_predicted_iim`, `crates/sage-cli/src/runner.rs`). This exists
+because `evict_rt_iim_mismatches` originally called `Peptide::to_string()`
+(itself doing a `unimod::lookup_reverse` per modified residue) twice per
+fragment-matched candidate, on every spectrum — measured on a real F9477
+run, combined RT+IIM eviction this way added +37% (152s) to `run_sage`'s
+wall time versus no eviction at all. Resolving once, by peptide index
+instead of by re-deriving each peptide's display string on every
+(candidate, spectrum) pair, cuts that to a plain array read
+(`self.predicted_rt.and_then(|by_idx| by_idx[peptide_idx])`) — real F9477
+RT-only measurement: 473.4s (unoptimized) → 386.1s (optimized), ~18-20%
+faster, within ~20s of the 406.6s no-eviction baseline.
+
+IIM needs one extra step since it has a charge dimension `predicted_rt`
+doesn't (Chronologer_RT has no charge input at all; IM2Deep requires one)
+— `Scorer::iim_dense_slot` (`crates/sage/src/scoring.rs`) maps
+`(peptide_idx, charge)` to a slot in a flat array of length
+`n_peptides * (max_charge - min_charge + 1)`, shared between the build
+side (`resolve_predicted_iim`) and the read side
+(`evict_rt_iim_mismatches`) so the indexing arithmetic can't drift apart
+between the two. This was **not** the first design tried — `predicted_iim`
+was originally `HashMap<(usize, u8), f32>` (index-keyed, but still a hash
+map). A standalone benchmark outside this crate (fixed-seed xorshift64*
+PRNG for reproducibility, real F9477 scale — 18,902,646 entries, 20M
+random-access queries, 80/20 hit/miss mix) measured:
+
+| structure | ns/query | vs `std::HashMap` |
+|---|---|---|
+| `std::HashMap` (SipHash) | 239.1 | 1x |
+| `FnvHashMap` (already a `sage` dependency, used elsewhere for the same reason) | 89.9-99.9 | ~2.4-2.7x |
+| `FxHashMap` (rustc-hash) | 45.5-46.3 | ~5.2x |
+| dense `Vec<Option<f32>>` | 10.4-10.8 | ~22-23x |
+
+Dense wins outright — no hashing at all, and smaller (no per-entry key
+storage or hashmap load-factor overhead: ~151MB vs the HashMap's
+real-measured heavier footprint at this scale). A same-benchmark follow-up
+comparing `Vec<Option<f32>>` against `Vec<f32>` with a negative sentinel
+(both RT and IIM are always >= 0 physically) found **no query-latency
+difference at all** (10.84ns both ways) — random access at this scale is
+memory-*latency*-bound (one cache-line fetch per lookup, ~64 bytes,
+regardless of the 4-vs-8-byte payload), not bandwidth-bound, so halving
+the per-slot size doesn't remove any round-trips. `Vec<f32>`+sentinel
+would still halve memory and build ~40% faster, but `Option<f32>` was kept
+for the self-documenting safety (no sentinel-value convention to remember
+or get wrong at a call site) since RAM headroom was never the actual
+constraint on real hardware (~4-5GB peak for this whole feature on a
+62GB/47GB-available machine).
+
+`Runner::run` (which owns `self`) takes the raw string-keyed maps via
+`.take()`, not `.as_ref()`, when resolving — the owned map moves into the
+resolution closure and is dropped there, freeing it before the long
+per-file search loop runs, rather than keeping both the raw and resolved
+forms alive for the rest of the run. `prefilter_peptides` (the
+`database.prefilter` path, off by default, no real job in this project
+enables it) still uses `.as_ref()` since it re-resolves fresh per fasta
+chunk and must keep borrowing across iterations — its own resolved arrays
+are scoped to each chunk's short-lived mini database, never promoted to
+`Runner` fields.
+
 ## Unimod modification support (`crates/sage/src/unimod.rs`)
 
 Found (2026-08-21) empirically against the live Koina server: both

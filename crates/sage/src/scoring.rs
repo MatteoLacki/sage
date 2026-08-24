@@ -246,13 +246,21 @@ pub struct Scorer<'db> {
     /// real measured ~37% `run_sage` overhead before this. See
     /// `plans/rt_iim_independent_dimensions.md`.
     pub predicted_rt: Option<&'db [Option<f32>]>,
-    /// Externally-predicted IIM, keyed by `(peptide index, charge)`, used
-    /// to evict candidates whose predicted IIM falls outside `mobility_tol`
-    /// of the observed spectrum's IIM. `mobility_tol` is required
-    /// (validated at config-load time) whenever this is `Some`.
-    /// Independent of `predicted_rt`. Resolved once by
-    /// `Runner::resolve_predicted_iim`, same reasoning as `predicted_rt`.
-    pub predicted_iim: Option<&'db std::collections::HashMap<(usize, u8), f32>>,
+    /// Externally-predicted IIM, dense-indexed via [`iim_dense_slot`] (one
+    /// slot per `(peptide index, charge)` combination in
+    /// `[min_precursor_charge, max_precursor_charge]`), used to evict
+    /// candidates whose predicted IIM falls outside `mobility_tol` of the
+    /// observed spectrum's IIM. `mobility_tol` is required (validated at
+    /// config-load time) whenever this is `Some`. Independent of
+    /// `predicted_rt`. Resolved once by `Runner::resolve_predicted_iim`,
+    /// same reasoning as `predicted_rt`. A dense array beats a
+    /// `HashMap<(usize, u8), f32>` here: a standalone benchmark at real
+    /// F9477 scale (18.9M entries, 20M random-access queries, fixed seed)
+    /// measured 239ns/query for `std::HashMap` vs 10.4ns/query for a dense
+    /// array — 23x, and smaller too (no per-entry key storage or
+    /// hashmap load-factor overhead). See
+    /// `plans/rt_iim_independent_dimensions.md`.
+    pub predicted_iim: Option<&'db [Option<f32>]>,
     /// RT tolerance window as a function of observed `scan_start_time`,
     /// already in minutes (converted from the config's `rt_tol_sec` at load
     /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
@@ -425,6 +433,28 @@ impl<'db> Scorer<'db> {
         hits
     }
 
+    /// Maps `(peptide_idx, charge)` to a slot in a dense
+    /// `predicted_iim`-shaped array of length `n_peptides *
+    /// (max_charge - min_charge + 1)`, or `None` if `charge` falls outside
+    /// `[min_charge, max_charge]` entirely (can't have an entry — same
+    /// permissive treatment as a missing key would get from a map). Shared
+    /// between `Runner::resolve_predicted_iim` (which builds the array)
+    /// and `evict_rt_iim_mismatches` (which reads it) so the indexing
+    /// arithmetic can't drift between the two call sites. See
+    /// `plans/rt_iim_independent_dimensions.md`.
+    pub fn iim_dense_slot(
+        peptide_idx: usize,
+        charge: u8,
+        min_charge: u8,
+        max_charge: u8,
+    ) -> Option<usize> {
+        if charge < min_charge || charge > max_charge {
+            return None;
+        }
+        let charge_span = (max_charge - min_charge + 1) as usize;
+        Some(peptide_idx * charge_span + (charge - min_charge) as usize)
+    }
+
     /// Evict candidates (in place) whose predicted RT and/or IIM falls
     /// outside `rt_tol`/`mobility_tol` of `query`'s observed values. Each
     /// dimension is checked independently and only if its map
@@ -476,9 +506,14 @@ impl<'db> Scorer<'db> {
                     .map_or(true, |rt| rt >= lo && rt <= hi)
             });
             let iim_ok = iim_bounds.map_or(true, |(lo, hi)| {
-                self.predicted_iim
-                    .and_then(|map| map.get(&(peptide_idx, sc.precursor_charge)))
-                    .map_or(true, |&iim| iim >= lo && iim <= hi)
+                Self::iim_dense_slot(
+                    peptide_idx,
+                    sc.precursor_charge,
+                    self.min_precursor_charge,
+                    self.max_precursor_charge,
+                )
+                .and_then(|slot| self.predicted_iim.and_then(|dense| dense[slot]))
+                .map_or(true, |iim| iim >= lo && iim <= hi)
             });
 
             if !rt_ok || !iim_ok {
@@ -904,6 +939,32 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iim_dense_slot_in_range() {
+        // charges 2..=4, charge_span 3 -- peptide 0's slots are 0,1,2 for
+        // charge 2,3,4; peptide 1's are 3,4,5; etc.
+        assert_eq!(Scorer::iim_dense_slot(0, 2, 2, 4), Some(0));
+        assert_eq!(Scorer::iim_dense_slot(0, 3, 2, 4), Some(1));
+        assert_eq!(Scorer::iim_dense_slot(0, 4, 2, 4), Some(2));
+        assert_eq!(Scorer::iim_dense_slot(1, 2, 2, 4), Some(3));
+        assert_eq!(Scorer::iim_dense_slot(5, 4, 2, 4), Some(17));
+    }
+
+    #[test]
+    fn iim_dense_slot_out_of_range() {
+        assert_eq!(Scorer::iim_dense_slot(0, 1, 2, 4), None);
+        assert_eq!(Scorer::iim_dense_slot(0, 5, 2, 4), None);
+    }
+
+    #[test]
+    fn iim_dense_slot_single_charge_span() {
+        // charge_span 1 -- exactly the mk_scorer test fixture shape used
+        // in crates/sage/tests/integration.rs's IIM eviction tests.
+        assert_eq!(Scorer::iim_dense_slot(0, 1, 1, 1), Some(0));
+        assert_eq!(Scorer::iim_dense_slot(7, 1, 1, 1), Some(7));
+        assert_eq!(Scorer::iim_dense_slot(0, 2, 1, 1), None);
+    }
 
     #[test]
     fn longest_series() {

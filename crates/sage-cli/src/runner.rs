@@ -37,25 +37,35 @@ fn resolve_predicted_rt(db: &IndexedDatabase, map: &HashMap<String, f32>) -> Vec
         .collect()
 }
 
-/// Same as `resolve_predicted_rt`, for `(sequence, charge) -> iim`. Charge
-/// isn't known ahead of time per peptide, so every configured charge in
-/// `[min_charge, max_charge]` (the run's own `precursor_charge` range,
-/// matching what `evict_rt_iim_mismatches` will ever see as
-/// `sc.precursor_charge`) is checked against the source map for each
+/// Same as `resolve_predicted_rt`, for `(sequence, charge) -> iim`, into a
+/// dense `Vec<Option<f32>>` (one slot per `(peptide, charge)` combination,
+/// see `sage_core::scoring::Scorer::iim_dense_slot` for the indexing, also
+/// used to read this array back during eviction so the two sides can't
+/// drift apart). Charge isn't known ahead of time per peptide, so every
+/// configured charge in `[min_charge, max_charge]` (the run's own
+/// `precursor_charge` range) is checked against the source map for each
 /// peptide -- still only one `to_string()` call per peptide, reused across
-/// that small charge range.
+/// that small charge range. A dense array beats a `HashMap<(usize, u8),
+/// f32>` here: a standalone benchmark at real F9477 scale (18.9M entries,
+/// 20M random-access queries, fixed seed) measured 239ns/query for
+/// `std::HashMap` vs 10.4ns/query for a dense array -- 23x, and the dense
+/// array is also smaller (no per-entry key storage or hashmap load-factor
+/// overhead). See plans/rt_iim_independent_dimensions.md.
 fn resolve_predicted_iim(
     db: &IndexedDatabase,
     map: &HashMap<(String, u8), f32>,
     min_charge: u8,
     max_charge: u8,
-) -> HashMap<(usize, u8), f32> {
-    let mut resolved = HashMap::new();
+) -> Vec<Option<f32>> {
+    let charge_span = (max_charge - min_charge + 1) as usize;
+    let mut resolved = vec![None; db.peptides.len() * charge_span];
     for (idx, peptide) in db.peptides.iter().enumerate() {
         let sequence = peptide.to_string();
         for charge in min_charge..=max_charge {
             if let Some(&iim) = map.get(&(sequence.clone(), charge)) {
-                resolved.insert((idx, charge), iim);
+                if let Some(slot) = Scorer::iim_dense_slot(idx, charge, min_charge, max_charge) {
+                    resolved[slot] = Some(iim);
+                }
             }
         }
     }
@@ -278,7 +288,7 @@ impl Runner {
                     report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
                     wide_window: self.parameters.wide_window,
                     predicted_rt: predicted_rt_by_idx.as_deref(),
-                    predicted_iim: predicted_iim_by_idx.as_ref(),
+                    predicted_iim: predicted_iim_by_idx.as_deref(),
                     rt_tol: self.parameters.rt_tol.clone(),
                     mobility_tol: self.parameters.mobility_tol.clone(),
                     annotate_matches: self.parameters.annotate_matches,
@@ -605,14 +615,24 @@ impl Runner {
         // RT+IIM eviction added +37% (152s) to `run_sage`'s wall time before
         // this change. See `evict_rt_iim_mismatches` (`scoring.rs`) and
         // plans/rt_iim_independent_dimensions.md.
+        //
+        // `.take()`, not `.as_ref()` -- `run()` owns `self` and this is the
+        // only remaining use of the raw string-keyed maps in this call
+        // path (unlike `prefilter_peptides`, which re-reads them once per
+        // fasta chunk and must keep borrowing instead). Taking them here
+        // moves the (String-keyed, real per-entry heap allocations) source
+        // maps into these closures, where they're dropped as soon as
+        // resolution finishes -- freeing them before the long per-file
+        // search loop below runs, rather than keeping both the raw and
+        // resolved forms alive for the rest of the run.
         let predicted_rt_by_idx = self
             .predicted_rt
-            .as_ref()
-            .map(|map| resolve_predicted_rt(&self.database, map));
-        let predicted_iim_by_idx = self.predicted_iim.as_ref().map(|map| {
+            .take()
+            .map(|map| resolve_predicted_rt(&self.database, &map));
+        let predicted_iim_by_idx = self.predicted_iim.take().map(|map| {
             resolve_predicted_iim(
                 &self.database,
-                map,
+                &map,
                 self.parameters.precursor_charge.0,
                 self.parameters.precursor_charge.1,
             )
@@ -634,7 +654,7 @@ impl Runner {
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
             predicted_rt: predicted_rt_by_idx.as_deref(),
-            predicted_iim: predicted_iim_by_idx.as_ref(),
+            predicted_iim: predicted_iim_by_idx.as_deref(),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
             annotate_matches: self.parameters.annotate_matches,
