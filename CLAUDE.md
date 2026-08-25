@@ -239,6 +239,57 @@ chunk and must keep borrowing across iterations — its own resolved arrays
 are scoped to each chunk's short-lived mini database, never promoted to
 `Runner` fields.
 
+### External RT/IIM as LDA features, alongside the internal model (2026-08-24)
+
+`--predicted-rt`/`--predicted-iim` above only ever fed a **hard** pre-hyperscore
+eviction filter (`evict_rt_iim_mismatches`) — never SAGE's own `discriminant_score`
+(the semi-supervised Fisher LDA in `crates/sage/src/ml/linear_discriminant.rs`,
+used for FDR/q-values, not raw hyperscore). That LDA already had `sqrt(delta_rt_model)`/
+`sqrt(delta_ims_model)` features, but those come from SAGE's own separate, much
+weaker, in-run-only composition-regression model (`ml/retention_model.rs`/
+`ml/mobility_model.rs`, fit on that run's own confident hits, called unconditionally
+in `runner.rs` after search) — the external, per-run-calibrated predictions never
+reached the LDA. Design/history: `necromerge2`'s `plans/lda_external_rt_iim_features.md`.
+
+Closed by adding **two more** LDA features (`z2_rt_external`/`z2_ims_external`,
+`((observed - predicted_external) / sigma) ** 2`) computed in `build_features`
+from the same dense arrays `evict_rt_iim_mismatches` already reads, plus a new
+`rt_sigma_sec`/`iim_sigma` config pair (robust MAD-based scale, from
+`git/featureprediction`'s `tolerance.py::robust_sigma`, required alongside
+`predicted_rt`+`rt_tol_sec` / `predicted_iim`+`mobility_tol` — three-way all-or-none
+validation in `Input::build`). The internal model's own features are **kept**, not
+replaced — this is additive, not a swap.
+
+**Dynamic LDA column count, not a fixed-size slot with a `0.0` default.** SAGE's
+LDA feature array was a `const FEATURES: usize = 20` fixed array
+(`BASE_FEATURES`/`BASE_FEATURE_NAMES` now); a constant-valued extra column on any
+run without external predictions configured would have zero within-class variance,
+risking a singular covariance matrix in `LinearDiscriminantAnalysis::train` (`Gauss::solve`
+returning `None`) — i.e. `discriminant_score` silently going uncomputed for the
+*entire* run, not just a degraded feature. `score_psms` now takes `has_external_rt`/
+`has_external_iim: bool` (from `Search.predicted_rt.is_some()`/`predicted_iim.is_some()`
+in `runner.rs`) and builds a `Vec<f64>` per PSM instead of a fixed array, appending
+the z² columns only when configured.
+
+**z², not `sqrt(delta)` like the internal model's features.** The external
+(Chronologer/IM2Deep) residual is already close to Gaussian after
+`spectrum_q`-filtering (see `git/featureprediction`'s `confident_hits.py`), so z² is
+already chi-square(1)-shaped — a reasonable LDA input as-is, unlike the internal
+model's more skewed raw abs-residual (hence its `sqrt()` transform).
+
+New `Feature` fields (`predicted_rt_external`, `delta_rt_z2_external`,
+`predicted_ims_external`, `delta_ims_z2_external`) are output in both
+`results.sage.tsv` and `results.sage.pin` (`runner.rs`) and the parquet schema
+(`sage-cloudpath/src/parquet.rs`) — available for `sagepy-rescore`/mokapot to pick
+up later, though nothing downstream consumes them yet (deliberately deferred, see
+the plan doc).
+
+**Explicitly deferred, not done here:** k-fold train/validation splitting of SAGE's
+own LDA (mokapot-style) — `LinearDiscriminantAnalysis::train`/`score_psms` still
+fit and score the same PSM set with no CV, same as before this change. Acceptable
+for now given the LDA's low parameter count (20-22 coefficients) relative to typical
+PSM counts; revisit separately if it becomes a concern.
+
 ## Unimod modification support (`crates/sage/src/unimod.rs`)
 
 Found (2026-08-21) empirically against the live Koina server: both

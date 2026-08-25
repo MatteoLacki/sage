@@ -36,6 +36,8 @@ fn integration() -> anyhow::Result<()> {
         predicted_iim: None,
         rt_tol: None,
         mobility_tol: None,
+        rt_sigma: None,
+        iim_sigma: None,
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
     };

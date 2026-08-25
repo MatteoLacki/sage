@@ -291,6 +291,8 @@ impl Runner {
                     predicted_iim: predicted_iim_by_idx.as_deref(),
                     rt_tol: self.parameters.rt_tol.clone(),
                     mobility_tol: self.parameters.mobility_tol.clone(),
+                    rt_sigma: self.parameters.rt_sigma,
+                    iim_sigma: self.parameters.iim_sigma,
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
                 };
@@ -382,8 +384,13 @@ impl Runner {
     }
 
     fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
-        if sage_core::ml::linear_discriminant::score_psms(features, self.parameters.precursor_tol)
-            .is_none()
+        if sage_core::ml::linear_discriminant::score_psms(
+            features,
+            self.parameters.precursor_tol,
+            self.parameters.predicted_rt.is_some(),
+            self.parameters.predicted_iim.is_some(),
+        )
+        .is_none()
         {
             log::warn!("linear model fitting failed, falling back to heuristic discriminant score");
             features.par_iter_mut().for_each(|feat| {
@@ -657,6 +664,8 @@ impl Runner {
             predicted_iim: predicted_iim_by_idx.as_deref(),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
+            rt_sigma: self.parameters.rt_sigma,
+            iim_sigma: self.parameters.iim_sigma,
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
         };
@@ -889,11 +898,31 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(feature.aligned_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.delta_rt_model).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.predicted_rt_external)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.delta_rt_z2_external)
+                .as_bytes(),
+        );
         record.push_field(ryu::Buffer::new().format(feature.ims).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
         record.push_field(
             ryu::Buffer::new()
                 .format(feature.delta_ims_model)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.predicted_ims_external)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.delta_ims_z2_external)
                 .as_bytes(),
         );
         record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());
@@ -1019,9 +1048,13 @@ impl Runner {
             "aligned_rt",
             "predicted_rt",
             "delta_rt_model",
+            "predicted_rt_external",
+            "delta_rt_z2_external",
             "ion_mobility",
             "predicted_mobility",
             "delta_mobility",
+            "predicted_mobility_external",
+            "delta_mobility_z2_external",
             "matched_peaks",
             "longest_b",
             "longest_y",
@@ -1186,10 +1219,30 @@ impl Runner {
                 .format(feature.delta_rt_model.clamp(0.001, 1.0).sqrt())
                 .as_bytes(),
         );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.predicted_rt_external)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.delta_rt_z2_external)
+                .as_bytes(),
+        );
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
         record.push_field(
             ryu::Buffer::new()
                 .format(feature.delta_ims_model)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.predicted_ims_external)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.delta_ims_z2_external)
                 .as_bytes(),
         );
         record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());
@@ -1260,8 +1313,12 @@ impl Runner {
             "aligned_rt",
             "predicted_rt",
             "sqrt(delta_rt_model)",
+            "predicted_rt_external",
+            "z2_rt_external",
             "predicted_mobility",
             "sqrt(delta_mobility)",
+            "predicted_mobility_external",
+            "z2_mobility_external",
             "matched_peaks",
             "longest_b",
             "longest_y",

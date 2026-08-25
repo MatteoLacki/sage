@@ -148,6 +148,8 @@ fn mk_scorer_with_fragment_tol(
         predicted_iim: None,
         rt_tol: None,
         mobility_tol: None,
+        rt_sigma: None,
+        iim_sigma: None,
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
     }
@@ -461,6 +463,99 @@ fn candidate_reachable_within_rt_tol() {
     assert_eq!(features[0].peptide_idx, target_idx);
 }
 
+/// External-prediction z² feature (`plans/lda_external_rt_iim_features.md`):
+/// same reachable-candidate setup as `candidate_reachable_within_rt_tol`,
+/// plus `rt_sigma` — confirms `Feature::predicted_rt_external`/
+/// `delta_rt_z2_external` are populated from the same dense array
+/// `evict_rt_iim_mismatches` reads, independent of SAGE's own internal
+/// `predicted_rt`/`delta_rt_model` (which `score_standard` alone, without
+/// the `retention_model`/`mobility_model` post-processing pass runner.rs
+/// applies, never touches — left at their `Default` `0.0`/stub here).
+#[test]
+fn delta_rt_z2_external_computed_from_sigma() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-z2".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[target_idx.0 as usize] = Some(10.05f32);
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_rt = Some(&predicted_rt);
+    scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
+    scorer.rt_sigma = Some(0.1); // minutes, same unit as rt_tol's converted values
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].predicted_rt_external, 10.05);
+    // z = (10.0 - 10.05) / 0.1 = -0.5, z^2 = 0.25
+    assert!(
+        (features[0].delta_rt_z2_external - 0.25).abs() < 1e-5,
+        "expected z^2 ~= 0.25, got {}",
+        features[0].delta_rt_z2_external
+    );
+}
+
+/// `rt_sigma` left unset even though `predicted_rt`/`rt_tol` are configured
+/// (shouldn't happen via `Input::build`'s validation, but `Scorer` itself
+/// doesn't enforce the pairing) — the external z² feature stays at its
+/// `Default` `0.0` rather than dividing by a missing/zero sigma.
+#[test]
+fn delta_rt_z2_external_zero_without_sigma() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-z2-no-sigma".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[target_idx.0 as usize] = Some(10.05f32);
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_rt = Some(&predicted_rt);
+    scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
+    // scorer.rt_sigma left None
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].predicted_rt_external, 0.0);
+    assert_eq!(features[0].delta_rt_z2_external, 0.0);
+}
+
 /// IIM-only filtering, the symmetric counterpart of the RT tests above —
 /// `predicted_rt`/`rt_tol` are left entirely unconfigured, confirming IIM
 /// filtering also works independently.
@@ -545,4 +640,50 @@ fn candidate_reachable_within_iim_tol() {
         "predicted IIM inside mobility_tol should reach the candidate"
     );
     assert_eq!(features[0].peptide_idx, target_idx);
+}
+
+/// IIM counterpart of `delta_rt_z2_external_computed_from_sigma` — same
+/// shape, `Scorer::iim_dense_slot` indexing instead of a flat per-peptide
+/// array.
+#[test]
+fn delta_ims_z2_external_computed_from_sigma() {
+    let db = mk_ppm_window_database();
+    let (target_idx, peaks) = target_peaks(&db);
+    assert!(!peaks.is_empty(), "expected real fragment peaks for target");
+
+    let target_mass = db[target_idx].monoisotopic;
+    let mz = shifted_precursor_mz(target_mass, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: Some(1.0),
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "iim-z2".into(),
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_iim = vec![None; db.peptides.len()];
+    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    predicted_iim[slot] = Some(1.05f32);
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.predicted_iim = Some(&predicted_iim);
+    scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
+    scorer.iim_sigma = Some(0.02); // unitless (1/K0), no conversion
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].predicted_ims_external, 1.05);
+    // z = (1.0 - 1.05) / 0.02 = -2.5, z^2 = 6.25
+    assert!(
+        (features[0].delta_ims_z2_external - 6.25).abs() < 1e-4,
+        "expected z^2 ~= 6.25, got {}",
+        features[0].delta_ims_z2_external
+    );
 }

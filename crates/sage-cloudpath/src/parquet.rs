@@ -57,9 +57,13 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             required float aligned_rt;
             required float predicted_rt;
             required float delta_rt_model;
+            required float predicted_rt_external;
+            required float delta_rt_z2_external;
             required float ion_mobility;
             required float predicted_mobility;
             required float delta_mobility;
+            required float predicted_mobility_external;
+            required float delta_mobility_z2_external;
             required int32 matched_peaks;
             required int32 longest_b;
             required int32 longest_y;
@@ -223,9 +227,13 @@ pub fn serialize_features(
         write_col!(aligned_rt, FloatType);
         write_col!(predicted_rt, FloatType);
         write_col!(delta_rt_model, FloatType);
+        write_col!(predicted_rt_external, FloatType);
+        write_col!(delta_rt_z2_external, FloatType);
         write_col!(ims, FloatType);
         write_col!(predicted_ims, FloatType);
         write_col!(delta_ims_model, FloatType);
+        write_col!(predicted_ims_external, FloatType);
+        write_col!(delta_ims_z2_external, FloatType);
         write_col!(matched_peaks, Int32Type);
         write_col!(longest_b, Int32Type);
         write_col!(longest_y, Int32Type);

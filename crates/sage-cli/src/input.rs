@@ -31,6 +31,14 @@ pub struct Search {
     pub predicted_iim: Option<String>,
     pub rt_tol: Option<ValueTolSpline>,
     pub mobility_tol: Option<ValueTolSpline>,
+    /// Robust (MAD-based) scale of the `predicted_rt` residual, for
+    /// normalizing `Feature::delta_rt_z2_external` into a z² LDA feature —
+    /// see `plans/lda_external_rt_iim_features.md`. Already converted to
+    /// minutes at build time, same as `rt_tol`'s spline values.
+    pub rt_sigma: Option<f32>,
+    /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
+    /// conversion needed, same as `mobility_tol`.
+    pub iim_sigma: Option<f32>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -112,6 +120,15 @@ pub struct Input {
     /// `Precursor::inverse_ion_mobility` (1/K0 — unambiguous, no unit
     /// suffix needed, same unit for both the spline's grid and its values).
     pub mobility_tol: Option<ValueTolSpline>,
+    /// Robust (MAD-based) scale of the `predicted_rt` residual (seconds,
+    /// same unit as `rt_tol_sec`'s values — converted to minutes at build
+    /// time). Required alongside `predicted_rt`/`rt_tol_sec` — feeds
+    /// `Feature::delta_rt_z2_external`, see
+    /// `plans/lda_external_rt_iim_features.md`.
+    pub rt_sigma_sec: Option<f32>,
+    /// Same as `rt_sigma_sec`, for `predicted_iim`/`mobility_tol` — unitless
+    /// (1/K0), no conversion needed.
+    pub iim_sigma: Option<f32>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -483,16 +500,20 @@ impl Input {
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
 
-        if self.predicted_rt.is_some() != self.rt_tol_sec.is_some() {
+        if !(self.predicted_rt.is_some() == self.rt_tol_sec.is_some()
+            && self.rt_tol_sec.is_some() == self.rt_sigma_sec.is_some())
+        {
             anyhow::bail!(
-                "`predicted_rt` and `rt_tol_sec` must be set together (or both omitted) — \
-                 either set both, or remove whichever one is set."
+                "`predicted_rt`, `rt_tol_sec`, and `rt_sigma_sec` must all be set together \
+                 (or all omitted) — either set all three, or remove whichever are set."
             );
         }
-        if self.predicted_iim.is_some() != self.mobility_tol.is_some() {
+        if !(self.predicted_iim.is_some() == self.mobility_tol.is_some()
+            && self.mobility_tol.is_some() == self.iim_sigma.is_some())
+        {
             anyhow::bail!(
-                "`predicted_iim` and `mobility_tol` must be set together (or both omitted) — \
-                 either set both, or remove whichever one is set."
+                "`predicted_iim`, `mobility_tol`, and `iim_sigma` must all be set together \
+                 (or all omitted) — either set all three, or remove whichever are set."
             );
         }
         if let Some(spline) = &self.rt_tol_sec {
@@ -610,6 +631,8 @@ impl Input {
             predicted_iim: self.predicted_iim,
             rt_tol: self.rt_tol_sec.map(Self::rt_tol_sec_to_minutes),
             mobility_tol: self.mobility_tol,
+            rt_sigma: self.rt_sigma_sec.map(|s| s / 60.0),
+            iim_sigma: self.iim_sigma,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: self.max_peaks.unwrap_or(150),
             min_peaks: self.min_peaks.unwrap_or(15),
@@ -766,6 +789,23 @@ mod test {
         predicted_iim: Option<&str>,
         mobility_tol: Option<serde_json::Value>,
     ) -> serde_json::Value {
+        mk_predicted_json_with_sigma(predicted_rt, rt_tol_sec, None, predicted_iim, mobility_tol, None)
+    }
+
+    /// Same as `mk_predicted_json`, plus `rt_sigma_sec`/`iim_sigma` — the
+    /// two are now required alongside `rt_tol_sec`/`mobility_tol`
+    /// respectively (`plans/lda_external_rt_iim_features.md`), so tests
+    /// exercising the fully-configured/converts-successfully paths need a
+    /// way to set them; tests exercising the "missing" validation errors
+    /// use `mk_predicted_json` (which leaves them `None`) instead.
+    fn mk_predicted_json_with_sigma(
+        predicted_rt: Option<&str>,
+        rt_tol_sec: Option<serde_json::Value>,
+        rt_sigma_sec: Option<f32>,
+        predicted_iim: Option<&str>,
+        mobility_tol: Option<serde_json::Value>,
+        iim_sigma: Option<f32>,
+    ) -> serde_json::Value {
         let mut json = mk_input_json(None);
         if let Some(path) = predicted_rt {
             json["predicted_rt"] = serde_json::json!(path);
@@ -773,11 +813,17 @@ mod test {
         if let Some(rt) = rt_tol_sec {
             json["rt_tol_sec"] = rt;
         }
+        if let Some(sigma) = rt_sigma_sec {
+            json["rt_sigma_sec"] = serde_json::json!(sigma);
+        }
         if let Some(path) = predicted_iim {
             json["predicted_iim"] = serde_json::json!(path);
         }
         if let Some(im) = mobility_tol {
             json["mobility_tol"] = im;
+        }
+        if let Some(sigma) = iim_sigma {
+            json["iim_sigma"] = serde_json::json!(sigma);
         }
         json
     }
@@ -824,9 +870,11 @@ mod test {
     fn predicted_rt_only_builds_successfully() {
         // RT-only filtering is a supported, independent mode -- no mobility_tol
         // needed at all. See plans/rt_iim_independent_dimensions.md.
-        let json = mk_predicted_json(
+        let json = mk_predicted_json_with_sigma(
             Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            Some(5.0),
+            None,
             None,
             None,
         );
@@ -840,15 +888,18 @@ mod test {
         );
         assert!(search.predicted_iim.is_none());
         assert!(search.mobility_tol.is_none());
+        assert!(search.iim_sigma.is_none());
     }
 
     #[test]
     fn predicted_iim_only_builds_successfully() {
-        let json = mk_predicted_json(
+        let json = mk_predicted_json_with_sigma(
+            None,
             None,
             None,
             Some("predicted_iim.parquet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
+            Some(0.005),
         );
         let input: Input = serde_json::from_value(json).unwrap();
         let search = input
@@ -860,15 +911,18 @@ mod test {
         );
         assert!(search.predicted_rt.is_none());
         assert!(search.rt_tol.is_none());
+        assert!(search.rt_sigma.is_none());
     }
 
     #[test]
     fn predicted_rt_and_iim_together_converts_seconds_to_minutes() {
-        let json = mk_predicted_json(
+        let json = mk_predicted_json_with_sigma(
             Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            Some(6.0),
             Some("predicted_iim.parquet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
+            Some(0.005),
         );
         let input: Input = serde_json::from_value(json).unwrap();
         let search = input.build().expect("fully configured should build");
@@ -881,6 +935,16 @@ mod test {
             search.mobility_tol.as_ref().unwrap().tolerance_at(0.0),
             Tolerance::Da(-0.01, 0.01),
             "mobility_tol is unitless (1/K0), no conversion"
+        );
+        assert_eq!(
+            search.rt_sigma,
+            Some(0.1),
+            "rt_sigma_sec is in seconds, same /60 conversion as rt_tol_sec's values"
+        );
+        assert_eq!(
+            search.iim_sigma,
+            Some(0.005),
+            "iim_sigma is unitless (1/K0), no conversion"
         );
         assert_eq!(
             search.predicted_rt.as_deref(),
@@ -896,7 +960,14 @@ mod test {
     fn predicted_rt_with_invalid_rt_tol_spline_errors() {
         let mut bad_spline = flat_value_tol_spline_json(-30.0, 30.0);
         bad_spline["lo"]["grid_step"] = serde_json::json!(0.0);
-        let json = mk_predicted_json(Some("predicted_rt.parquet"), Some(bad_spline), None, None);
+        let json = mk_predicted_json_with_sigma(
+            Some("predicted_rt.parquet"),
+            Some(bad_spline),
+            Some(5.0),
+            None,
+            None,
+            None,
+        );
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
@@ -905,6 +976,47 @@ mod test {
         assert!(
             err.to_string().contains("rt_tol_sec"),
             "expected error naming `rt_tol_sec`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn predicted_rt_without_sigma_errors() {
+        // rt_tol_sec set, rt_sigma_sec omitted -- the new three-way pairing
+        // requirement (plans/lda_external_rt_iim_features.md) should reject
+        // this the same way it already rejects predicted_rt without rt_tol_sec.
+        let json = mk_predicted_json(
+            Some("predicted_rt.parquet"),
+            Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            None,
+            None,
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("rt_tol_sec without rt_sigma_sec should error"),
+        };
+        assert!(
+            err.to_string().contains("rt_sigma_sec"),
+            "expected error naming `rt_sigma_sec`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn predicted_iim_without_sigma_errors() {
+        let json = mk_predicted_json(
+            None,
+            None,
+            Some("predicted_iim.parquet"),
+            Some(flat_value_tol_spline_json(-0.01, 0.01)),
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("mobility_tol without iim_sigma should error"),
+        };
+        assert!(
+            err.to_string().contains("iim_sigma"),
+            "expected error naming `iim_sigma`, got: {err}"
         );
     }
 

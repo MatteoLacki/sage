@@ -15,9 +15,17 @@ use rayon::prelude::*;
 use crate::mass::Tolerance;
 use crate::scoring::Feature;
 
-// Declare, so that we have compile time checking of matrix dimensions
-const FEATURES: usize = 20;
-const FEATURE_NAMES: [&str; FEATURES] = [
+// Always-present features. Two more (`z2_rt_external`/`z2_ims_external`)
+// are appended dynamically in `score_psms` -- only when that run actually
+// configured `--predicted-rt`/`--predicted-iim` (see
+// `plans/lda_external_rt_iim_features.md`). A fixed-size array with those
+// columns defaulted to a constant (e.g. `0.0`) on runs without external
+// predictions would give the column zero within-class variance, risking a
+// singular covariance matrix in `LinearDiscriminantAnalysis::train` and
+// `discriminant_score` silently going uncomputed for the *entire* run --
+// hence dynamic sizing instead of two more `const FEATURES` slots.
+const BASE_FEATURES: usize = 20;
+const BASE_FEATURE_NAMES: [&str; BASE_FEATURES] = [
     "rank",
     "charge",
     "ln1p(hyperscore)",
@@ -40,13 +48,11 @@ const FEATURE_NAMES: [&str; FEATURES] = [
     "sqrt(delta_ims_model)",
 ];
 
-struct Features<'a>(&'a [f64]);
+struct Features<'a>(&'a [&'static str], &'a [f64]);
 
 impl std::fmt::Debug for Features<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map()
-            .entries(FEATURE_NAMES.iter().zip(self.0))
-            .finish()
+        f.debug_map().entries(self.0.iter().zip(self.1)).finish()
     }
 }
 
@@ -112,8 +118,6 @@ impl LinearDiscriminantAnalysis {
             evec.iter_mut().for_each(|c| *c *= -1.0);
         }
 
-        log::trace!("- linear model fit with {:?}", Features(&evec));
-
         Some(LinearDiscriminantAnalysis { eigenvector: evec })
     }
 
@@ -122,8 +126,22 @@ impl LinearDiscriminantAnalysis {
     }
 }
 
-pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()> {
+pub fn score_psms(
+    scores: &mut [Feature],
+    precursor_tol: Tolerance,
+    has_external_rt: bool,
+    has_external_iim: bool,
+) -> Option<()> {
     log::trace!("fitting linear discriminant model...");
+    let mut feature_names: Vec<&'static str> = BASE_FEATURE_NAMES.to_vec();
+    if has_external_rt {
+        feature_names.push("z2_rt_external");
+    }
+    if has_external_iim {
+        feature_names.push("z2_ims_external");
+    }
+    let n_features = feature_names.len();
+
     let decoys = scores
         .par_iter()
         .map(|sc| sc.label == -1)
@@ -160,7 +178,8 @@ pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()
             // Transform features - LDA requires that each feature is normally
             // distributed. This is not true for all of our inputs, so we log
             // transform many of them to get them closer to a gaussian distr.
-            let x: [f64; FEATURES] = [
+            let mut x: Vec<f64> = Vec::with_capacity(n_features);
+            x.extend_from_slice(&[
                 (perc.rank as f64),
                 (perc.charge as f64),
                 (perc.hyperscore).ln_1p(),
@@ -181,13 +200,29 @@ pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()
                 (perc.ims as f64),
                 (perc.delta_rt_model as f64).clamp(0.001, 0.999).sqrt(),
                 (perc.delta_ims_model as f64).clamp(0.001, 0.999).sqrt(),
-            ];
+            ]);
+            // z² features, not sqrt(delta)-transformed like the internal
+            // model's above -- the external (Chronologer/IM2Deep) residual
+            // is already close to Gaussian after spectrum_q-filtering (see
+            // `featureprediction`'s `confident_hits.py`), so z² is already
+            // chi-square(1)-shaped, a reasonable LDA input as-is. See
+            // `plans/lda_external_rt_iim_features.md`.
+            if has_external_rt {
+                x.push(perc.delta_rt_z2_external as f64);
+            }
+            if has_external_iim {
+                x.push(perc.delta_ims_z2_external as f64);
+            }
             x
         })
         .collect::<Vec<_>>();
 
-    let features = Matrix::new(features, scores.len(), FEATURES);
+    let features = Matrix::new(features, scores.len(), n_features);
     let lda = LinearDiscriminantAnalysis::train(&features, &decoys)?;
+    log::trace!(
+        "- linear model fit with {:?}",
+        Features(&feature_names, &lda.eigenvector)
+    );
     if !lda.eigenvector.iter().all(|f| f.is_finite()) {
         log::error!(
             "linear model eigenvector includes NaN: this likely indicates a bug, please report!"
@@ -280,5 +315,104 @@ mod test {
             scores,
             expected
         );
+    }
+
+    /// Synthetic PSMs with enough spread across all base features (plus a
+    /// real target/decoy separation on `hyperscore`) that
+    /// `LinearDiscriminantAnalysis::train` doesn't hit a singular
+    /// covariance matrix. `with_external` controls whether
+    /// `delta_rt_z2_external`/`delta_ims_z2_external` also get real
+    /// (non-constant) values -- irrelevant when the corresponding
+    /// `has_external_*` flag passed to `score_psms` is `false`, since that
+    /// column isn't included in the LDA at all in that case.
+    fn synthetic_features(n: usize, with_external: bool) -> Vec<Feature> {
+        // Each field gets its own frequency/phase so no two columns are
+        // (near-)exact linear combinations of each other -- a handful of
+        // shared `noise` terms across many fields made an earlier version
+        // of this fixture collinear enough that `train`'s scatter-within
+        // matrix was singular (`Gauss::solve` -> `None` -> `score_psms`
+        // returning `None`), even with `n` well above the column count.
+        (0..n)
+            .map(|i| {
+                let target = i % 2 == 0;
+                let x = i as f64;
+                let n = |freq: f64, phase: f64| (x * freq + phase).sin();
+                Feature {
+                    label: if target { 1 } else { -1 },
+                    rank: 1 + (i % 3) as u32,
+                    charge: 2 + (i % 3) as u8,
+                    hyperscore: 20.0 + if target { 10.0 } else { 0.0 } + n(0.31, 0.0),
+                    delta_next: 1.0 + n(0.53, 0.5).abs(),
+                    delta_best: 0.5 + n(0.71, 1.0).abs(),
+                    expmass: 1000.0 + i as f32,
+                    calcmass: 1000.0 + i as f32 + n(0.11, 1.5) as f32 * 0.001,
+                    // `Tolerance::Ppm` reads `delta_mass` (not `expmass -
+                    // calcmass`) for the LDA's mass-error KDE feature —
+                    // needs real per-row variation too, else that column is
+                    // constant across every row (posterior_error is the
+                    // same for a constant input regardless of label).
+                    delta_mass: n(0.17, 0.2) as f32 * 5.0,
+                    isotope_error: (i % 3) as f32 - 1.0,
+                    average_ppm: n(0.89, 2.0) as f32,
+                    poisson: -1.0 - n(1.07, 2.5).abs(),
+                    matched_intensity_pct: 50.0 + n(1.31, 3.0) as f32 * 10.0,
+                    matched_peaks: 10 + (i % 5) as u32,
+                    longest_b: 3 + (i % 4) as u32,
+                    longest_y: 3 + (i % 3) as u32,
+                    peptide_len: 8 + (i % 6),
+                    missed_cleavages: (i % 2) as u8,
+                    aligned_rt: 10.0 + n(1.53, 3.5) as f32,
+                    ims: 1.0 + n(1.79, 4.0) as f32 * 0.1,
+                    delta_rt_model: 0.1 + n(1.97, 4.5).abs() as f32 * 0.01,
+                    delta_ims_model: 0.1 + n(2.23, 5.0).abs() as f32 * 0.01,
+                    delta_rt_z2_external: if with_external {
+                        let base = n(2.51, 5.5).abs() as f32;
+                        if target { 0.1 + base } else { 2.0 + base }
+                    } else {
+                        0.0
+                    },
+                    delta_ims_z2_external: if with_external {
+                        let base = n(2.79, 6.0).abs() as f32;
+                        if target { 0.1 + base } else { 2.0 + base }
+                    } else {
+                        0.0
+                    },
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn score_psms_without_external_predictions() {
+        let mut features = synthetic_features(200, false);
+        score_psms(&mut features, Tolerance::Ppm(-10.0, 10.0), false, false)
+            .expect("LDA fit should succeed on well-spread synthetic data");
+        assert!(
+            features.iter().all(|f| f.discriminant_score.is_finite()),
+            "every PSM should get a finite discriminant_score"
+        );
+    }
+
+    #[test]
+    fn score_psms_with_external_predictions_extends_feature_matrix() {
+        let mut features = synthetic_features(200, true);
+        score_psms(&mut features, Tolerance::Ppm(-10.0, 10.0), true, true)
+            .expect("LDA fit should succeed with the two extra external z^2 columns");
+        assert!(
+            features.iter().all(|f| f.discriminant_score.is_finite()),
+            "every PSM should get a finite discriminant_score with external columns included"
+        );
+    }
+
+    #[test]
+    fn score_psms_rt_only_external_prediction() {
+        // has_external_rt without has_external_iim -- the two flags are
+        // independent, mirroring predicted_rt/predicted_iim's own
+        // independence (plans/rt_iim_independent_dimensions.md).
+        let mut features = synthetic_features(200, true);
+        score_psms(&mut features, Tolerance::Ppm(-10.0, 10.0), true, false)
+            .expect("LDA fit should succeed with only the RT external column included");
+        assert!(features.iter().all(|f| f.discriminant_score.is_finite()));
     }
 }

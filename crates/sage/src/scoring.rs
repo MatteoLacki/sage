@@ -97,12 +97,30 @@ pub struct Feature {
     pub predicted_rt: f32,
     /// Difference between predicted & observed RT
     pub delta_rt_model: f32,
+    /// Externally-predicted RT (`--predicted-rt`, e.g. Chronologer,
+    /// calibrated per-run), independent of `predicted_rt`/`delta_rt_model`
+    /// above (SAGE's own in-run composition-regression model — kept as a
+    /// separate feature, not replaced). 0.0 when `--predicted-rt` isn't
+    /// configured. See `plans/lda_external_rt_iim_features.md`.
+    pub predicted_rt_external: f32,
+    /// `((aligned_rt - predicted_rt_external) / rt_sigma)²` — a z² "badness"
+    /// feature for SAGE's LDA (`ml/linear_discriminant.rs`). 0.0 when
+    /// `--predicted-rt` isn't configured (and then not included in the LDA
+    /// at all — see `plans/lda_external_rt_iim_features.md`).
+    pub delta_rt_z2_external: f32,
     /// Ion mobility
     pub ims: f32,
     /// Predicted ion mobility, if enabled
     pub predicted_ims: f32,
     /// Difference between predicted & observed ion mobility
     pub delta_ims_model: f32,
+    /// Externally-predicted IIM (`--predicted-iim`, e.g. IM2Deep),
+    /// independent of `predicted_ims`/`delta_ims_model` above (SAGE's own
+    /// in-run model). 0.0 when `--predicted-iim` isn't configured.
+    pub predicted_ims_external: f32,
+    /// `((ims - predicted_ims_external) / iim_sigma)²`, same shape as
+    /// `delta_rt_z2_external`. 0.0 when `--predicted-iim` isn't configured.
+    pub delta_ims_z2_external: f32,
     /// Difference between expmass and calcmass
     pub delta_mass: f32,
     /// C13 isotope error
@@ -261,6 +279,14 @@ pub struct Scorer<'db> {
     /// hashmap load-factor overhead). See
     /// `plans/rt_iim_independent_dimensions.md`.
     pub predicted_iim: Option<&'db [Option<f32>]>,
+    /// Robust (MAD-based) scale of the `predicted_rt` residual, already
+    /// converted to minutes (`sage-cli/src/input.rs`'s `rt_sigma_sec / 60.0`
+    /// at config-load time). Normalizes `Feature::delta_rt_z2_external` into
+    /// a z² LDA feature — see `plans/lda_external_rt_iim_features.md`.
+    pub rt_sigma: Option<f32>,
+    /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
+    /// conversion needed.
+    pub iim_sigma: Option<f32>,
     /// RT tolerance window as a function of observed `scan_start_time`,
     /// already in minutes (converted from the config's `rt_tol_sec` at load
     /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
@@ -675,6 +701,49 @@ impl<'db> Scorer<'db> {
             let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
                 / (precursor_mass - isotope_error + peptide.monoisotopic);
 
+            // External (Chronologer/IM2Deep, per-run-calibrated) RT/IIM,
+            // independent of SAGE's own in-run composition-regression model
+            // (`predicted_rt`/`delta_rt_model`, populated later in
+            // `retention_model::predict`) — see
+            // `plans/lda_external_rt_iim_features.md`. 0.0 when
+            // `--predicted-rt`/`--predicted-iim` aren't configured; the LDA
+            // only includes the z² columns when they are (`ml/linear_discriminant.rs`).
+            let (predicted_rt_external, delta_rt_z2_external) = match (self.predicted_rt, self.rt_sigma)
+            {
+                (Some(by_idx), Some(sigma)) if sigma > 0.0 => {
+                    match by_idx[score.peptide.0 as usize] {
+                        Some(rt) => {
+                            let z = (query.scan_start_time - rt) / sigma;
+                            (rt, z * z)
+                        }
+                        None => (0.0, 0.0),
+                    }
+                }
+                _ => (0.0, 0.0),
+            };
+
+            let observed_ims = query
+                .precursors
+                .first()
+                .and_then(|p| p.inverse_ion_mobility);
+            let (predicted_ims_external, delta_ims_z2_external) =
+                match (self.predicted_iim, self.iim_sigma, observed_ims) {
+                    (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => {
+                        Self::iim_dense_slot(
+                            score.peptide.0 as usize,
+                            score.precursor_charge,
+                            self.min_precursor_charge,
+                            self.max_precursor_charge,
+                        )
+                        .and_then(|slot| dense[slot])
+                        .map_or((0.0, 0.0), |ims| {
+                            let z = (observed - ims) / sigma;
+                            (ims, z * z)
+                        })
+                    }
+                    _ => (0.0, 0.0),
+                };
+
             // let (num_proteins, proteins) = self.db.assign_proteins(peptide);
 
             features.push(Feature {
@@ -728,6 +797,10 @@ impl<'db> Scorer<'db> {
                 aligned_rt: query.scan_start_time,
                 delta_rt_model: 0.999,
                 delta_ims_model: 0.999,
+                predicted_rt_external,
+                delta_rt_z2_external,
+                predicted_ims_external,
+                delta_ims_z2_external,
                 ms2_intensity: score.summed_b + score.summed_y,
 
                 //Fragments
