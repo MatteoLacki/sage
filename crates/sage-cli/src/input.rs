@@ -3,7 +3,7 @@ use clap::ArgMatches;
 use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
-use sage_core::scoring::ScoreType;
+use sage_core::scoring::{RankingScore, ScoreType};
 use sage_core::spline::{FragmentTolSpline, ValueTolSpline};
 use sage_core::{
     database::{Builder, Parameters},
@@ -71,6 +71,7 @@ pub struct Search {
     pub annotate_matches: bool,
 
     pub score_type: ScoreType,
+    pub ranking_score: RankingScore,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +138,7 @@ pub struct Input {
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
     pub score_type: Option<ScoreType>,
+    pub ranking_score: Option<RankingScore>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -616,6 +618,7 @@ impl Input {
         };
 
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
+        let ranking_score = self.ranking_score.unwrap_or(RankingScore::CombinedScore);
 
         Ok(Search {
             version: clap::crate_version!().into(),
@@ -653,6 +656,7 @@ impl Input {
             protein_grouping: self.protein_grouping.unwrap_or(true),
             protein_grouping_peptide_fdr: self.protein_grouping_peptide_fdr.unwrap_or(0.01),
             score_type,
+            ranking_score,
         })
     }
 }

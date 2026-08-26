@@ -4,7 +4,7 @@ use quickcheck_macros::quickcheck;
 use sage_core::database::{Builder, IndexedDatabase, PeptideIx};
 use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
-use sage_core::scoring::{ScoreType, Scorer};
+use sage_core::scoring::{RankingScore, ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use sage_core::spline::{Extrapolation, FragmentTolSpline, LinearSpline, ValueTolSpline};
 
@@ -152,6 +152,7 @@ fn mk_scorer_with_fragment_tol(
         iim_sigma: None,
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
+        ranking_score: RankingScore::CombinedScore,
     }
 }
 
@@ -685,5 +686,183 @@ fn delta_ims_z2_external_computed_from_sigma() {
         (features[0].delta_ims_z2_external - 6.25).abs() < 1e-4,
         "expected z^2 ~= 6.25, got {}",
         features[0].delta_ims_z2_external
+    );
+}
+
+/// Two proteins whose sole tryptic peptides differ only by an I<->L swap —
+/// isomeric (identical monoisotopic residue mass), so both have byte-identical
+/// theoretical fragment masses and therefore tie exactly on hyperscore for any
+/// shared peak list. This isolates the new `combined_score` ranking (`build_features`
+/// in `scoring.rs`) from hyperscore itself: with a real hyperscore tie, RT
+/// closeness is the only thing that can break it.
+const ISOBARIC_FASTA: &'static str = ">iso1\nMPEPTIDEK\n>iso2\nMPEPTLDEK\n";
+
+fn mk_isobaric_database() -> IndexedDatabase {
+    let builder = Builder {
+        bucket_size: Some(64),
+        fasta: Some("static".into()),
+        generate_decoys: Some(false),
+        ..Default::default()
+    };
+    let fasta = Fasta::parse(ISOBARIC_FASTA.into(), "rev_", false);
+    builder.make_parameters().build(fasta)
+}
+
+/// A candidate closer to its predicted RT outranks a hyperscore-tied
+/// candidate that's farther from its predicted RT — the soft `combined_score`
+/// penalty (`hyperscore - 0.5*(z_rt_external^2 + z_iim_external^2)`) reorders
+/// otherwise-equal candidates instead of hard-evicting either one.
+#[test]
+fn combined_score_ranks_rt_tied_hyperscore_candidates() {
+    let db = mk_isobaric_database();
+    let iso1 = PeptideIx(
+        db.peptides
+            .iter()
+            .position(|p| &*p.sequence == b"MPEPTIDEK")
+            .expect("iso1 present in digest") as u32,
+    );
+    let iso2 = PeptideIx(
+        db.peptides
+            .iter()
+            .position(|p| &*p.sequence == b"MPEPTLDEK")
+            .expect("iso2 present in digest") as u32,
+    );
+    assert_eq!(
+        db[iso1].monoisotopic, db[iso2].monoisotopic,
+        "I<->L substitution must be exactly isomeric for this test to isolate RT"
+    );
+
+    let peaks: Vec<Peak> = db
+        .fragments
+        .iter()
+        .filter(|f| f.peptide_index == iso1)
+        .map(|f| Peak {
+            mass: f.fragment_mz,
+            intensity: 100.0,
+        })
+        .collect();
+    assert!(!peaks.is_empty(), "expected real fragment peaks for iso1");
+
+    let mz = shifted_precursor_mz(db[iso1].monoisotopic, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-tiebreak".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    // iso1 predicted far from observed RT (z^2 large), iso2 predicted right
+    // on top of it (z^2 ~= 0) -- both well inside the wide rt_tol, so neither
+    // is evicted; only the ranking should differ.
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[iso1.0 as usize] = Some(11.0f32);
+    predicted_rt[iso2.0 as usize] = Some(10.0f32);
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.report_psms = 2;
+    scorer.predicted_rt = Some(&predicted_rt);
+    scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));
+    scorer.rt_sigma = Some(0.1);
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(features.len(), 2, "both isomeric candidates should survive");
+    assert_eq!(
+        features[0].hyperscore, features[1].hyperscore,
+        "isomeric candidates must tie exactly on raw hyperscore"
+    );
+    assert_eq!(
+        features[0].peptide_idx, iso2,
+        "candidate closer to predicted RT should rank first despite the hyperscore tie"
+    );
+    // z_iso1 = (10.0 - 11.0) / 0.1 = -10, term = -0.5*100 = -50; z_iso2 = 0.
+    // delta_next = combined_best - combined_next = H - (H - 50) = 50, not the
+    // 0.0 a straight hyperscore-tie margin would give.
+    assert!(
+        (features[0].delta_next - 50.0).abs() < 1e-3,
+        "delta_next should reflect the combined_score gap, not a 0.0 hyperscore tie: got {}",
+        features[0].delta_next
+    );
+}
+
+/// Same isomeric-tie setup as `combined_score_ranks_rt_tied_hyperscore_candidates`,
+/// but with `ranking_score: RankingScore::Hyperscore` -- the runtime-selectable
+/// escape hatch back to pre-`combined_score` behavior (config `ranking_score`,
+/// same `Option<T>` + `Input::build()`-default shape as `score_type`). With a
+/// real hyperscore tie and no RT influence on ranking, `build_features` can't
+/// break the tie: `delta_next` stays exactly `0.0` regardless of how far apart
+/// the two candidates' predicted RTs are.
+#[test]
+fn ranking_score_hyperscore_ignores_rt_penalty() {
+    let db = mk_isobaric_database();
+    let iso1 = PeptideIx(
+        db.peptides
+            .iter()
+            .position(|p| &*p.sequence == b"MPEPTIDEK")
+            .expect("iso1 present in digest") as u32,
+    );
+    let iso2 = PeptideIx(
+        db.peptides
+            .iter()
+            .position(|p| &*p.sequence == b"MPEPTLDEK")
+            .expect("iso2 present in digest") as u32,
+    );
+
+    let peaks: Vec<Peak> = db
+        .fragments
+        .iter()
+        .filter(|f| f.peptide_index == iso1)
+        .map(|f| Peak {
+            mass: f.fragment_mz,
+            intensity: 100.0,
+        })
+        .collect();
+    assert!(!peaks.is_empty(), "expected real fragment peaks for iso1");
+
+    let mz = shifted_precursor_mz(db[iso1].monoisotopic, 0.0);
+    let precursor = Precursor {
+        mz,
+        charge: Some(1),
+        isolation_window: None,
+        inverse_ion_mobility: None,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "rt-tiebreak-hyperscore-mode".into(),
+        scan_start_time: 10.0,
+        precursors: vec![precursor],
+        peaks,
+        ..Default::default()
+    };
+
+    let mut predicted_rt = vec![None; db.peptides.len()];
+    predicted_rt[iso1.0 as usize] = Some(11.0f32);
+    predicted_rt[iso2.0 as usize] = Some(10.0f32);
+
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    scorer.report_psms = 2;
+    scorer.predicted_rt = Some(&predicted_rt);
+    scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));
+    scorer.rt_sigma = Some(0.1);
+    scorer.ranking_score = RankingScore::Hyperscore;
+
+    let features = scorer.score_standard(&query);
+    assert_eq!(features.len(), 2, "both isomeric candidates should survive");
+    assert_eq!(
+        features[0].hyperscore, features[1].hyperscore,
+        "isomeric candidates must tie exactly on raw hyperscore"
+    );
+    assert_eq!(
+        features[0].delta_next, 0.0,
+        "Hyperscore mode must ignore the RT penalty entirely -- a real tie stays a tie"
     );
 }

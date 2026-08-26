@@ -290,6 +290,115 @@ fit and score the same PSM set with no CV, same as before this change. Acceptabl
 for now given the LDA's low parameter count (20-22 coefficients) relative to typical
 PSM counts; revisit separately if it becomes a concern.
 
+### External RT/IIM as a soft ranking penalty on hyperscore (2026-08-25)
+
+Before this, `--predicted-rt`/`--predicted-iim` only ever affected candidate
+retention via a **hard** filter (`evict_rt_iim_mismatches`, in/out per
+per-dimension window) — the actual ranking/truncation-to-`report_psms` key
+in `build_features` was always raw `hyperscore`, blind to RT/IIM. A candidate
+just inside the window and one dead-on its prediction ranked identically to
+SAGE if their hyperscores tied.
+
+`Score` (private struct, `crates/sage/src/scoring.rs`) now carries a second
+field, `combined_score: f64`, computed once per candidate right after
+`score_candidate` and used for `build_features`'s sort and for `delta_next`/
+`delta_best`'s margins (raw `hyperscore` stays untouched as its own reported
+`Feature` field, for diagnostics/backward compat):
+
+```
+combined_score = hyperscore - 0.5 * (z_rt_external² + z_iim_external²)
+```
+
+`z_rt_external`/`z_iim_external` are exactly the same z-scores already
+computed for the LDA's `delta_rt_z2_external`/`delta_ims_z2_external`
+features (see the LDA section above) — `0.5 * z²` is `-log(gaussian
+density)` up to an additive constant, so this is a plain log-likelihood
+combination with weight 1, not a free/tunable lambda. Both terms are `0.0`
+whenever their prediction isn't configured or `sigma <= 0.0` (same
+zero-default convention the LDA features already use), so `combined_score ==
+hyperscore` exactly on any run without `--predicted-rt`/`--predicted-iim` —
+one formula covers all four presence combinations, no per-combination
+branching or duplicated functions.
+
+A new private `Scorer::external_z2` helper (peptide_idx/charge -> `(f32,
+f32, f32, f32)`) factors out the z² computation so `build_features`'s
+pre-sort pass and its post-sort `Feature`-populating pass can't drift apart
+— it's called once per candidate in `score_vector` before the sort (cheap:
+dense-array lookups, see the benchmark table above) and again per retained
+candidate for the reported fields, exactly as before this change.
+
+**Kept, not replaced:** `evict_rt_iim_mismatches`'s hard per-window eviction
+is unchanged — this is a second, independent mechanism layered on top, not a
+swap. Hard eviction still runs first (before `trim_hits`, on the full
+preliminary candidate set); the new ranking penalty then only reorders
+whichever candidates survive it. Removing the hard filter in favor of pure
+ranking was considered and deliberately not done here — out of scope for
+this change, revisit separately if the hard filter's outlier-rejection role
+turns out to be redundant with the soft penalty in practice.
+
+Test: `combined_score_ranks_rt_tied_hyperscore_candidates`
+(`crates/sage/tests/integration.rs`) — two proteins whose sole tryptic
+peptides differ only by an I<->L swap (isomeric, so byte-identical
+theoretical fragment masses and therefore an exact hyperscore tie against
+any shared peak list), predicted RT set close for one and far for the
+other. Isolates the new ranking behavior from hyperscore itself: with a real
+tie, RT closeness is the only thing that can break it.
+
+**Runtime-selectable, not compiled in (2026-08-26).** Which key
+`build_features` sorts/truncates on is a new `RankingScore` enum
+(`Hyperscore` | `CombinedScore`, `Scorer::ranking_score`) — same
+`Option<T>` + `Input::build()`-default shape as the pre-existing
+`score_type`/`ScoreType` (config key `ranking_score`, defaults to
+`CombinedScore`). Added because A/B-ing the two rankings originally meant
+`git stash`-ing `scoring.rs` and rebuilding a second binary just to compare
+— real friction for something that should be a one-line config change, and
+exactly the pattern `score_type` already established for picking between
+`SageHyperScore`/`OpenMSHyperScore` at runtime. `combined_score` is still
+always computed regardless of this setting (cheap); `Hyperscore` mode just
+means `rank_key` reads `hyperscore` instead. Test:
+`ranking_score_hyperscore_ignores_rt_penalty` — same isomeric-tie fixture,
+confirms `delta_next` stays exactly `0.0` (real tie, unaffected by a large
+predicted-RT gap) when `ranking_score: Hyperscore`.
+
+**Real F9477 end-to-end comparison (2026-08-25/26, `jobs/f9477_gam_test.toml`-derived,
+mode 3 RT-only, 1% spectrum-level FDR):**
+
+| ranking | hard RT eviction | PSMs | peptides | ions | proteins |
+|---|---|---|---|---|---|
+| `Hyperscore` (old) | on (±0.5-99.5% window) | 104,259 | 21,537 | 25,194 | 4,143 |
+| `CombinedScore` (new, default) | on (±0.5-99.5% window) | **105,125** | **21,707** | **25,409** | **4,177** |
+| `Hyperscore` (old) | off (empiric `[0,100]` window, ≈ no-op) | 94,349 | 18,887 | 22,059 | 3,771 |
+| `CombinedScore` | off (empiric `[0,100]` window, ≈ no-op) | 84,283 | 14,913 | 18,190 | 3,437 |
+
+Full 2x2, and the eviction-off row flips the ranking comparison entirely:
+with hard eviction **on**, `CombinedScore` beats `Hyperscore` by a small,
+consistent margin (+0.8-0.85% at every level). With hard eviction **off**,
+`CombinedScore` is *worse* than `Hyperscore` by a lot (84,283 vs 94,349,
+~10.5% fewer PSMs) — the opposite direction. `CombinedScore` is not a
+general-purpose improvement over hyperscore; it specifically depends on
+hard eviction bounding its own input first. `0.5*z²` is unbounded — with
+the tight window, only candidates already inside a sane RT range ever reach
+the ranking stage, so z² there stays small and acts as a gentle tiebreaker
+(the regime the isomeric-tie test above exercises). With the window thrown
+open, genuine RT outlier candidates enter the ranking pool too, and for
+those `0.5*z²` can be large enough to outweigh a real hyperscore lead and
+flip the winner to whichever candidate happens to sit closer to the
+predicted RT by chance — right or wrong. Using `CombinedScore` *without*
+hard eviction is worse than using neither. Conclusion: **hard eviction is
+not optional if `CombinedScore` is enabled** — `CombinedScore` is a
+complementary refinement layered on an already-bounded candidate pool, not
+a standalone replacement for eviction, and not safe to enable on its own.
+
+Found blocking this comparison, unrelated to this change but fixed
+alongside it: `git/featureprediction`'s `correct_precursors_rt`/
+`correct_precursors_iim` computed `robust_sigma` but never wrote
+`rt_sigma_sec`/`iim_sigma` into the tolerance JSON (only the *first*-pass
+`predict_rt`/`predict_iim` did) — since `ionmaidentools` wires the
+*second*-pass output into SAGE's config, `rt_sigma_sec`/`iim_sigma` never
+actually reached SAGE on any real job, so the entire external-z² LDA
+feature (and this `combined_score` work) were dead on arrival end-to-end
+until that was fixed. See that repo's `AI.md`.
+
 ## Unimod modification support (`crates/sage/src/unimod.rs`)
 
 Found (2026-08-21) empirically against the live Koina server: both

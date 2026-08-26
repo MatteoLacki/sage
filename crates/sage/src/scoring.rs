@@ -14,6 +14,20 @@ pub enum ScoreType {
     OpenMSHyperScore,
 }
 
+/// Which key `build_features` ranks/truncates candidates on. Runtime-selectable
+/// (config `ranking_score`, same `Option<T>` + `Input::build()`-default shape as
+/// `score_type` above) rather than only ever compiled in — `combined_score` is
+/// always computed regardless of this setting (cheap: dense-array z² lookups),
+/// just not always used for ranking.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RankingScore {
+    /// Raw X!Tandem hyperscore — SAGE's ranking behavior before external
+    /// RT/IIM predictions could influence candidate ranking at all.
+    Hyperscore,
+    /// `hyperscore - 0.5 * (z_rt_external² + z_iim_external²)` — see `Score::combined_score`.
+    CombinedScore,
+}
+
 /// Structure to hold temporary scores
 #[derive(Copy, Clone, Default, Debug, PartialEq, PartialOrd)]
 struct Score {
@@ -25,6 +39,12 @@ struct Score {
     longest_b: usize,
     longest_y: usize,
     hyperscore: f64,
+    /// `hyperscore - 0.5 * (z_rt_external² + z_iim_external²)` — the actual
+    /// ranking/retention key (`build_features` sorts and truncates to
+    /// `report_psms` on this, not raw `hyperscore`). Equal to `hyperscore`
+    /// whenever `--predicted-rt`/`--predicted-iim` aren't configured (the
+    /// z² terms are 0.0 in that case) — see `external_z2`.
+    combined_score: f64,
     ppm_difference: f32,
     precursor_charge: u8,
     isotope_error: i8,
@@ -224,6 +244,15 @@ impl Score {
     fn hyperscore(&self, score_type: ScoreType) -> f64 {
         score_type.score(self.matched_b, self.matched_y, self.summed_b, self.summed_y)
     }
+
+    /// The ranking/retention key `build_features` actually sorts and
+    /// truncates candidates on, per `Scorer::ranking_score`.
+    fn rank_key(&self, ranking_score: RankingScore) -> f64 {
+        match ranking_score {
+            RankingScore::Hyperscore => self.hyperscore,
+            RankingScore::CombinedScore => self.combined_score,
+        }
+    }
 }
 
 pub struct Scorer<'db> {
@@ -252,6 +281,7 @@ pub struct Scorer<'db> {
     pub wide_window: bool,
     pub annotate_matches: bool,
     pub score_type: ScoreType,
+    pub ranking_score: RankingScore,
 
     /// Externally-predicted RT, indexed by peptide index (`db.peptides`),
     /// used to evict candidates whose predicted RT falls outside `rt_tol`
@@ -550,6 +580,60 @@ impl<'db> Scorer<'db> {
         }
     }
 
+    /// External (Chronologer/IM2Deep, per-run-calibrated) RT/IIM z² terms for
+    /// one candidate — `((observed - predicted) / sigma)²`, 0.0 when that
+    /// dimension isn't configured (`--predicted-rt`/`--predicted-iim` unset
+    /// or `sigma <= 0.0`) or this peptide/charge has no entry in the dense
+    /// array. Shared by `build_features`'s pre-sort `combined_score` pass and
+    /// its post-sort `Feature`-building pass so the two can't drift apart.
+    fn external_z2(
+        &self,
+        query: &ProcessedSpectrum<Peak>,
+        peptide_idx: usize,
+        charge: u8,
+    ) -> (f32, f32, f32, f32) {
+        let (predicted_rt_external, delta_rt_z2_external) = match (self.predicted_rt, self.rt_sigma)
+        {
+            (Some(by_idx), Some(sigma)) if sigma > 0.0 => match by_idx[peptide_idx] {
+                Some(rt) => {
+                    let z = (query.scan_start_time - rt) / sigma;
+                    (rt, z * z)
+                }
+                None => (0.0, 0.0),
+            },
+            _ => (0.0, 0.0),
+        };
+
+        let observed_ims = query
+            .precursors
+            .first()
+            .and_then(|p| p.inverse_ion_mobility);
+        let (predicted_ims_external, delta_ims_z2_external) =
+            match (self.predicted_iim, self.iim_sigma, observed_ims) {
+                (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => {
+                    Self::iim_dense_slot(
+                        peptide_idx,
+                        charge,
+                        self.min_precursor_charge,
+                        self.max_precursor_charge,
+                    )
+                    .and_then(|slot| dense[slot])
+                    .map_or((0.0, 0.0), |ims| {
+                        let z = (observed - ims) / sigma;
+                        (ims, z * z)
+                    })
+                }
+                _ => (0.0, 0.0),
+            };
+
+        (
+            predicted_rt_external,
+            delta_rt_z2_external,
+            predicted_ims_external,
+            delta_ims_z2_external,
+        )
+    }
+
     fn matched_peaks(
         &self,
         query: &ProcessedSpectrum<Peak>,
@@ -660,10 +744,26 @@ impl<'db> Scorer<'db> {
             .filter(|score| score.peptide != PeptideIx::default())
             .map(|pre| self.score_candidate(query, pre))
             .filter(|s| (s.0.matched_b + s.0.matched_y) >= self.min_matched_peaks)
+            .map(|(mut score, fragments)| {
+                let (_, z_rt2, _, z_iim2) =
+                    self.external_z2(query, score.peptide.0 as usize, score.precursor_charge);
+                score.combined_score =
+                    score.hyperscore - 0.5 * (z_rt2 as f64 + z_iim2 as f64);
+                (score, fragments)
+            })
             .collect::<Vec<_>>();
 
-        // Hyperscore is our primary score function for PSMs
-        score_vector.sort_by(|a, b| b.0.hyperscore.total_cmp(&a.0.hyperscore));
+        // Ranking/retention key -- `Scorer::ranking_score` selects between
+        // raw hyperscore and `combined_score` (hyperscore softly penalized by
+        // external RT/IIM implausibility; 0 penalty, i.e. identical to plain
+        // hyperscore, when `--predicted-rt`/`--predicted-iim` aren't
+        // configured). Under `CombinedScore`, candidates closer to their
+        // predicted RT/IIM rank higher among otherwise similar hyperscores,
+        // rather than being hard-evicted.
+        score_vector.sort_by(|a, b| {
+            b.0.rank_key(self.ranking_score)
+                .total_cmp(&a.0.rank_key(self.ranking_score))
+        });
 
         // Expected value for poisson distribution
         // (average # of matches peaks/peptide candidate)
@@ -680,14 +780,17 @@ impl<'db> Scorer<'db> {
             let peptide = &self.db[score.peptide];
             let precursor_mass = mz * score.precursor_charge as f32;
 
+            // Margins are on `rank_key` (the actual ranking key per
+            // `ranking_score`), not unconditionally raw `hyperscore` —
+            // consistent with the sort above.
             let next = score_vector
                 .get(idx + 1)
-                .map(|score| score.0.hyperscore)
+                .map(|score| score.0.rank_key(self.ranking_score))
                 .unwrap_or_default();
 
             let best = score_vector
                 .first()
-                .map(|score| score.0.hyperscore)
+                .map(|score| score.0.rank_key(self.ranking_score))
                 .expect("we know that index 0 is valid");
 
             // Poisson distribution log10 probability mass function
@@ -708,41 +811,8 @@ impl<'db> Scorer<'db> {
             // `plans/lda_external_rt_iim_features.md`. 0.0 when
             // `--predicted-rt`/`--predicted-iim` aren't configured; the LDA
             // only includes the z² columns when they are (`ml/linear_discriminant.rs`).
-            let (predicted_rt_external, delta_rt_z2_external) = match (self.predicted_rt, self.rt_sigma)
-            {
-                (Some(by_idx), Some(sigma)) if sigma > 0.0 => {
-                    match by_idx[score.peptide.0 as usize] {
-                        Some(rt) => {
-                            let z = (query.scan_start_time - rt) / sigma;
-                            (rt, z * z)
-                        }
-                        None => (0.0, 0.0),
-                    }
-                }
-                _ => (0.0, 0.0),
-            };
-
-            let observed_ims = query
-                .precursors
-                .first()
-                .and_then(|p| p.inverse_ion_mobility);
-            let (predicted_ims_external, delta_ims_z2_external) =
-                match (self.predicted_iim, self.iim_sigma, observed_ims) {
-                    (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => {
-                        Self::iim_dense_slot(
-                            score.peptide.0 as usize,
-                            score.precursor_charge,
-                            self.min_precursor_charge,
-                            self.max_precursor_charge,
-                        )
-                        .and_then(|slot| dense[slot])
-                        .map_or((0.0, 0.0), |ims| {
-                            let z = (observed - ims) / sigma;
-                            (ims, z * z)
-                        })
-                    }
-                    _ => (0.0, 0.0),
-                };
+            let (predicted_rt_external, delta_rt_z2_external, predicted_ims_external, delta_ims_z2_external) =
+                self.external_z2(query, score.peptide.0 as usize, score.precursor_charge);
 
             // let (num_proteins, proteins) = self.db.assign_proteins(peptide);
 
@@ -769,8 +839,8 @@ impl<'db> Scorer<'db> {
                 isotope_error,
                 average_ppm: score.ppm_difference,
                 hyperscore: score.hyperscore,
-                delta_next: score.hyperscore - next,
-                delta_best: best - score.hyperscore,
+                delta_next: score.rank_key(self.ranking_score) - next,
+                delta_best: best - score.rank_key(self.ranking_score),
                 matched_peaks: k as u32,
                 matched_intensity_pct: 100.0 * (score.summed_b + score.summed_y)
                     / query.total_ion_current,

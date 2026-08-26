@@ -295,6 +295,7 @@ impl Runner {
                     iim_sigma: self.parameters.iim_sigma,
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
+                    ranking_score: self.parameters.ranking_score,
                 };
 
                 // Allocate an array of booleans indicating whether a peptide was identified in a
@@ -668,6 +669,7 @@ impl Runner {
             iim_sigma: self.parameters.iim_sigma,
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
+            ranking_score: self.parameters.ranking_score,
         };
 
         //Collect all results into a single container
