@@ -2,8 +2,10 @@ use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
+use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
 use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use crate::spline::FragmentTolSpline;
+use half::f16;
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -48,6 +50,14 @@ struct Score {
     ppm_difference: f32,
     precursor_charge: u8,
     isotope_error: i8,
+    /// Unweighted spectral entropy similarity between predicted and observed
+    /// fragment intensities (`ms2_similarity::entropy_similarity`) -- a
+    /// reported `Feature` field only, never part of `combined_score`/ranking
+    /// (contrast the RT/IIM z² terms). `0.0` when
+    /// `--predicted-fragment-intensity-*` isn't configured, or this
+    /// candidate's `(peptide, charge)` has no cache entry. See
+    /// `docs/ai/predicted_fragment_intensity.md`.
+    ms2_entropy_similarity: f32,
 }
 
 impl Eq for Score {}
@@ -180,6 +190,16 @@ pub struct Feature {
     pub protein_group_q: f32,
 
     pub ms2_intensity: f32,
+
+    /// Unweighted spectral entropy similarity between this candidate's
+    /// predicted (Prosit `compact_trt`, via `git/featureprediction`) and
+    /// observed matched-fragment intensities -- `0.0` when
+    /// `--predicted-fragment-intensity-*` isn't configured, or this
+    /// `(peptide, charge)` has no entry in the cache. Feature-only, no hard
+    /// filtering (contrast `predicted_rt_external`/`delta_rt_z2_external`,
+    /// which also feed `evict_rt_iim_mismatches`/`combined_score`). See
+    /// `docs/ai/predicted_fragment_intensity.md`.
+    pub ms2_entropy_similarity: f32,
 
     pub protein_groups: Option<String>,
     pub num_protein_groups: u32,
@@ -326,6 +346,30 @@ pub struct Scorer<'db> {
     /// IIM tolerance window as a function of observed
     /// `Precursor::inverse_ion_mobility`.
     pub mobility_tol: Option<crate::spline::ValueTolSpline>,
+
+    /// Externally-predicted MS2 fragment intensities
+    /// (`--predicted-fragment-intensity-index`/`-cache`, Prosit `compact_trt`
+    /// via `git/featureprediction`) -- **feature-only, no hard filtering**
+    /// (contrast `predicted_rt`/`predicted_iim` above): used solely to
+    /// compute `Feature::ms2_entropy_similarity`, never to evict or re-rank
+    /// candidates. Dense-indexed by `(peptide index, charge)` via the same
+    /// [`iim_dense_slot`] shape `predicted_iim` uses -- each entry is a
+    /// `(start, end)` half-open row range into
+    /// `predicted_fragment_intensity_annotation_id`/`_intensity` below.
+    /// Resolved once by `Runner::resolve_predicted_fragment_intensity`, same
+    /// reasoning as `predicted_rt`/`predicted_iim` (avoids `Peptide::
+    /// to_string()` per candidate). See
+    /// `docs/ai/predicted_fragment_intensity.md`.
+    pub predicted_fragment_intensity_index: Option<&'db [Option<(u64, u64)>]>,
+    /// The shared, ever-growing `arrays.mmappet` annotation-id column
+    /// (`git/featureprediction`'s SAGE-order fragment-slot numbering, see
+    /// `ms2_similarity::fragment_annotation_id`), sliced per candidate via
+    /// `predicted_fragment_intensity_index`'s `(start, end)`.
+    pub predicted_fragment_intensity_annotation_id: Option<&'db [u8]>,
+    /// The shared `arrays.mmappet` predicted-intensity column (native FP16
+    /// from Prosit `compact_trt`), parallel to
+    /// `predicted_fragment_intensity_annotation_id`.
+    pub predicted_fragment_intensity: Option<&'db [f16]>,
 }
 
 #[inline(always)]
@@ -872,6 +916,7 @@ impl<'db> Scorer<'db> {
                 predicted_ims_external,
                 delta_ims_z2_external,
                 ms2_intensity: score.summed_b + score.summed_y,
+                ms2_entropy_similarity: score.ms2_entropy_similarity,
 
                 //Fragments
                 protein_groups: None,
@@ -978,6 +1023,43 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
+        // Unpack this candidate's sparse predicted MS2 vector (if
+        // configured and this (peptide, charge) has a cache entry) into a
+        // dense, zero-initialized `[f32; N_FRAGMENT_SLOTS]` once, up front
+        // -- same "unpack sparse into a dense per-candidate buffer" shape
+        // as the rest of this fork's dense-array precedent (see
+        // `iim_dense_slot`). `observed_dense` is only allocated at all when
+        // `predicted_dense` is `Some` -- no point tracking observed
+        // intensities for a candidate with nothing to compare them against.
+        // See `docs/ai/predicted_fragment_intensity.md`.
+        let predicted_dense: Option<[f32; N_FRAGMENT_SLOTS]> = self
+            .predicted_fragment_intensity_index
+            .and_then(|by_slot| {
+                let slot = Self::iim_dense_slot(
+                    score.peptide.0 as usize,
+                    score.precursor_charge,
+                    self.min_precursor_charge,
+                    self.max_precursor_charge,
+                )?;
+                by_slot.get(slot).copied().flatten()
+            })
+            .and_then(|(start, end)| {
+                let annotation_id = self.predicted_fragment_intensity_annotation_id?;
+                let intensity = self.predicted_fragment_intensity?;
+                let (start, end) = (start as usize, end as usize);
+                if start > end || end > annotation_id.len() || end > intensity.len() {
+                    return None;
+                }
+                let mut dense = [0f32; N_FRAGMENT_SLOTS];
+                for i in start..end {
+                    if let Some(slot) = dense.get_mut(annotation_id[i] as usize) {
+                        *slot = intensity[i].to_f32();
+                    }
+                }
+                Some(dense)
+            });
+        let mut observed_dense = predicted_dense.map(|_| [0f32; N_FRAGMENT_SLOTS]);
+
         for (idx, frag) in fragments {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
@@ -1022,6 +1104,14 @@ impl<'db> Scorer<'db> {
                         }
                     }
 
+                    if let Some(observed_dense) = observed_dense.as_mut() {
+                        if let Some(slot) = ms2_similarity::fragment_annotation_id(
+                            frag.kind, idx, charge,
+                        ) {
+                            observed_dense[slot] = peak.intensity;
+                        }
+                    }
+
                     if self.annotate_matches {
                         let idx = match frag.kind {
                             Kind::A | Kind::B | Kind::C => idx as i32 + 1,
@@ -1044,6 +1134,12 @@ impl<'db> Scorer<'db> {
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
         score.ppm_difference /= score.summed_b + score.summed_y;
+        score.ms2_entropy_similarity = match (predicted_dense, observed_dense) {
+            (Some(predicted), Some(observed)) => {
+                ms2_similarity::entropy_similarity(&observed, &predicted)
+            }
+            _ => 0.0,
+        };
 
         if self.annotate_matches {
             (score, Some(fragments_details))

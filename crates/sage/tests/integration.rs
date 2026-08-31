@@ -153,6 +153,9 @@ fn mk_scorer_with_fragment_tol(
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
         ranking_score: RankingScore::CombinedScore,
+        predicted_fragment_intensity_index: None,
+        predicted_fragment_intensity_annotation_id: None,
+        predicted_fragment_intensity: None,
     }
 }
 

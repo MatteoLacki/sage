@@ -39,6 +39,18 @@ pub struct Search {
     /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
     /// conversion needed, same as `mobility_tol`.
     pub iim_sigma: Option<f32>,
+    /// Path to the job-scoped `(sequence, charge, start, end)` pointer
+    /// parquet (`git/featureprediction`'s `export_fragment_intensity_for_sage`).
+    /// Feature-only (no hard filtering) — see `predicted_fragment_intensity_cache`
+    /// and `docs/ai/predicted_fragment_intensity.md`. Must be set together
+    /// with `predicted_fragment_intensity_cache`, or neither.
+    pub predicted_fragment_intensity_index: Option<String>,
+    /// Path to the shared `arrays.mmappet` directory (a subdirectory of
+    /// `git/featureprediction`'s fragment-intensity `PredictionCache` —
+    /// this fork never reads that cache's `index.sqlite3`/`write.lock`,
+    /// only its arrays) that `predicted_fragment_intensity_index`'s
+    /// `(start, end)` ranges address.
+    pub predicted_fragment_intensity_cache: Option<String>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -130,6 +142,15 @@ pub struct Input {
     /// Same as `rt_sigma_sec`, for `predicted_iim`/`mobility_tol` — unitless
     /// (1/K0), no conversion needed.
     pub iim_sigma: Option<f32>,
+    /// Path to a job-scoped `(sequence, charge, start, end)` pointer parquet
+    /// (`git/featureprediction`'s `export_fragment_intensity_for_sage`),
+    /// used purely to compute `Feature::ms2_entropy_similarity` -- no hard
+    /// eviction, unlike `predicted_rt`/`predicted_iim` above. Must be given
+    /// together with `predicted_fragment_intensity_cache`, or neither.
+    pub predicted_fragment_intensity_index: Option<String>,
+    /// Path to the shared `arrays.mmappet` directory
+    /// `predicted_fragment_intensity_index`'s `(start, end)` ranges address.
+    pub predicted_fragment_intensity_cache: Option<String>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -392,6 +413,12 @@ impl Input {
         if let Some(predicted_iim) = matches.get_one::<String>("predicted-iim") {
             input.predicted_iim = Some(predicted_iim.into());
         }
+        if let Some(path) = matches.get_one::<String>("predicted-fragment-intensity-index") {
+            input.predicted_fragment_intensity_index = Some(path.into());
+        }
+        if let Some(path) = matches.get_one::<String>("predicted-fragment-intensity-cache") {
+            input.predicted_fragment_intensity_cache = Some(path.into());
+        }
 
         if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
             input.write_pin = Some(write_pin);
@@ -518,6 +545,14 @@ impl Input {
                  (or all omitted) — either set all three, or remove whichever are set."
             );
         }
+        if self.predicted_fragment_intensity_index.is_some()
+            != self.predicted_fragment_intensity_cache.is_some()
+        {
+            anyhow::bail!(
+                "`predicted_fragment_intensity_index` and `predicted_fragment_intensity_cache` \
+                 must both be set together (or both omitted)."
+            );
+        }
         if let Some(spline) = &self.rt_tol_sec {
             spline
                 .validate()
@@ -636,6 +671,8 @@ impl Input {
             mobility_tol: self.mobility_tol,
             rt_sigma: self.rt_sigma_sec.map(|s| s / 60.0),
             iim_sigma: self.iim_sigma,
+            predicted_fragment_intensity_index: self.predicted_fragment_intensity_index,
+            predicted_fragment_intensity_cache: self.predicted_fragment_intensity_cache,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: self.max_peaks.unwrap_or(150),
             min_peaks: self.min_peaks.unwrap_or(15),

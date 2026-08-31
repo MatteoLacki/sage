@@ -9,6 +9,7 @@ pub mod lfq;
 pub mod mass;
 pub mod ml;
 pub mod modification;
+pub mod ms2_similarity;
 pub mod peptide;
 pub mod protein_grouping;
 pub mod scoring;

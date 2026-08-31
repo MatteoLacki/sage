@@ -41,6 +41,9 @@ fn integration() -> anyhow::Result<()> {
         annotate_matches: false,
         score_type: ScoreType::SageHyperScore,
         ranking_score: RankingScore::CombinedScore,
+        predicted_fragment_intensity_index: None,
+        predicted_fragment_intensity_annotation_id: None,
+        predicted_fragment_intensity: None,
     };
 
     let psm = scorer.score(&processed);

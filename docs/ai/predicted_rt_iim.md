@@ -1,0 +1,284 @@
+# Predicted RT/IIM candidate filtering
+
+RT and IIM are two fully independent, separately-optional filtering
+dimensions — either, both, or neither may be configured. `--predicted-rt
+<path.parquet>` (columns `sequence, rt`) loads a read-only
+`HashMap<String, f32>`; `--predicted-iim <path.parquet>` (columns `sequence,
+charge, iim`) loads a read-only `HashMap<(String, u8), f32>` — both once at
+startup (`Runner::predicted_rt`/`predicted_iim`,
+`crates/sage-cli/src/runner.rs`), shared across the parallel search same as
+`database`. `rt_tol_sec` is required exactly when `--predicted-rt` is given
+(and vice versa); same independent pairing for `mobility_tol`/
+`--predicted-iim` — `Input::build()` rejects either half being set without
+its partner, with no cross-coupling between the two pairs.
+`Scorer::evict_rt_iim_mismatches` (`crates/sage/src/scoring.rs`) evicts
+fragment-matched candidates whose predicted RT and/or IIM falls outside the
+observed spectrum's window, right before `trim_hits` — each dimension
+checked only if its map is configured at all; a candidate with no
+`sequence`/`(sequence, charge)` entry in a configured map is left alone on
+that dimension (permissive — avoids rejecting due to prediction-coverage
+gaps). Design/history: `necromerge2`'s `plans/better_sage_filtering.md`
+(original combined design) and `plans/rt_iim_independent_dimensions.md`
+(the independent-dimension split, 2026-08-21 — replaced the single
+`--predicted-properties`/`(rt, iim)`-tuple design outright, no back-compat
+shim, since this fork has no external users).
+
+Motivation for the split: a real F9477 comparison found RT and IIM filtering
+don't contribute equally (Chronologer_RT beats SAGE's own internal RT model
+by ~2.5x on robust residual error, while IM2Deep and SAGE's own IIM model
+are much closer) — independent dimensions let that be measured directly at
+the FDR level, and let RT-only filtering skip IM2Deep's Koina call entirely
+(a real ~57-minute-per-run cost on a full human proteome, not just an
+ablation nicety).
+
+Both fields are `ValueTolSpline` (`crates/sage/src/spline.rs`) — the same
+two-independent-`LinearSpline` (`lo`/`hi`) shape as `FragmentTolSpline`,
+evaluated against one observed value (`ProcessedSpectrum::scan_start_time`
+for RT, `Precursor::inverse_ion_mobility` for IIM) rather than a flat
+`Tolerance::Da`. Deliberately generic (not `RtTolSpline`/`MobilityTolSpline`)
+since RT and IIM tolerance are structurally identical. A value-independent
+("robust flat window") tolerance is just a 2-node spline with identical
+values at both nodes — there is no separate flat-tolerance type; empirically
+this is currently the only shape actually fit (see
+`git/featureprediction`'s `AI.md`), value-dependence is supported but unused
+so far. `rt_tol_sec`'s spline **values** are in seconds (converted to minutes
+once at `Search` build time, `/60.0` — `scan_start_time` is in minutes); its
+grid **x-axis** stays in whatever units the anchor points were fit on
+(minutes, matching `scan_start_time` directly). `mobility_tol` needs no unit
+conversion (1/K0 throughout).
+
+The standalone `dump_peptides` binary (`crates/sage-cli/src/bin/dump_peptides.rs`)
+digests a FASTA into a `peptide,proteins,monoisotopic,decoy` parquet without
+needing spectra input or the full search config — only `--fasta` plus an
+optional `database`-shaped JSON (enzyme/mods/mass bounds/decoy_tag) — for
+`git/featureprediction` (a separate repo/pipeline stage) to generate
+RT/IIM predictions from.
+
+## Eviction lookup: dense peptide-index arrays, not string-keyed maps
+
+`--predicted-rt`/`--predicted-iim` load `HashMap<String, f32>`/
+`HashMap<(String, u8), f32>` from parquet (`Runner::predicted_rt`/
+`predicted_iim`), but `Scorer` never reads those directly — `Runner::run`
+resolves each into a dense, peptide-index-keyed `Vec<Option<f32>>` exactly
+once, before the per-file search loop starts (`resolve_predicted_rt`/
+`resolve_predicted_iim`, `crates/sage-cli/src/runner.rs`). This exists
+because `evict_rt_iim_mismatches` originally called `Peptide::to_string()`
+(itself doing a `unimod::lookup_reverse` per modified residue) twice per
+fragment-matched candidate, on every spectrum — measured on a real F9477
+run, combined RT+IIM eviction this way added +37% (152s) to `run_sage`'s
+wall time versus no eviction at all. Resolving once, by peptide index
+instead of by re-deriving each peptide's display string on every
+(candidate, spectrum) pair, cuts that to a plain array read
+(`self.predicted_rt.and_then(|by_idx| by_idx[peptide_idx])`) — real F9477
+RT-only measurement: 473.4s (unoptimized) → 386.1s (optimized), ~18-20%
+faster, within ~20s of the 406.6s no-eviction baseline.
+
+IIM needs one extra step since it has a charge dimension `predicted_rt`
+doesn't (Chronologer_RT has no charge input at all; IM2Deep requires one)
+— `Scorer::iim_dense_slot` (`crates/sage/src/scoring.rs`) maps
+`(peptide_idx, charge)` to a slot in a flat array of length
+`n_peptides * (max_charge - min_charge + 1)`, shared between the build
+side (`resolve_predicted_iim`) and the read side
+(`evict_rt_iim_mismatches`) so the indexing arithmetic can't drift apart
+between the two. **This same helper is reused, unchanged, by the
+fragment-intensity feature** (see `predicted_fragment_intensity.md`) — the
+`(peptide_idx, charge) -> flat slot` shape is identical for any
+per-`(peptide, charge)` dense array, not IIM-specific despite the name. This
+was **not** the first design tried — `predicted_iim` was originally
+`HashMap<(usize, u8), f32>` (index-keyed, but still a hash map). A
+standalone benchmark outside this crate (fixed-seed xorshift64* PRNG for
+reproducibility, real F9477 scale — 18,902,646 entries, 20M random-access
+queries, 80/20 hit/miss mix) measured:
+
+| structure | ns/query | vs `std::HashMap` |
+|---|---|---|
+| `std::HashMap` (SipHash) | 239.1 | 1x |
+| `FnvHashMap` (already a `sage` dependency, used elsewhere for the same reason) | 89.9-99.9 | ~2.4-2.7x |
+| `FxHashMap` (rustc-hash) | 45.5-46.3 | ~5.2x |
+| dense `Vec<Option<f32>>` | 10.4-10.8 | ~22-23x |
+
+Dense wins outright — no hashing at all, and smaller (no per-entry key
+storage or hashmap load-factor overhead: ~151MB vs the HashMap's
+real-measured heavier footprint at this scale). A same-benchmark follow-up
+comparing `Vec<Option<f32>>` against `Vec<f32>` with a negative sentinel
+(both RT and IIM are always >= 0 physically) found **no query-latency
+difference at all** (10.84ns both ways) — random access at this scale is
+memory-*latency*-bound (one cache-line fetch per lookup, ~64 bytes,
+regardless of the 4-vs-8-byte payload), not bandwidth-bound, so halving
+the per-slot size doesn't remove any round-trips. `Vec<f32>`+sentinel
+would still halve memory and build ~40% faster, but `Option<f32>` was kept
+for the self-documenting safety (no sentinel-value convention to remember
+or get wrong at a call site) since RAM headroom was never the actual
+constraint on real hardware (~4-5GB peak for this whole feature on a
+62GB/47GB-available machine).
+
+`Runner::run` (which owns `self`) takes the raw string-keyed maps via
+`.take()`, not `.as_ref()`, when resolving — the owned map moves into the
+resolution closure and is dropped there, freeing it before the long
+per-file search loop runs, rather than keeping both the raw and resolved
+forms alive for the rest of the run. `prefilter_peptides` (the
+`database.prefilter` path, off by default, no real job in this project
+enables it) still uses `.as_ref()` since it re-resolves fresh per fasta
+chunk and must keep borrowing across iterations — its own resolved arrays
+are scoped to each chunk's short-lived mini database, never promoted to
+`Runner` fields.
+
+## External RT/IIM as LDA features, alongside the internal model (2026-08-24)
+
+`--predicted-rt`/`--predicted-iim` above only ever fed a **hard** pre-hyperscore
+eviction filter (`evict_rt_iim_mismatches`) — never SAGE's own `discriminant_score`
+(the semi-supervised Fisher LDA in `crates/sage/src/ml/linear_discriminant.rs`,
+used for FDR/q-values, not raw hyperscore). That LDA already had `sqrt(delta_rt_model)`/
+`sqrt(delta_ims_model)` features, but those come from SAGE's own separate, much
+weaker, in-run-only composition-regression model (`ml/retention_model.rs`/
+`ml/mobility_model.rs`, fit on that run's own confident hits, called unconditionally
+in `runner.rs` after search) — the external, per-run-calibrated predictions never
+reached the LDA. Design/history: `necromerge2`'s `plans/lda_external_rt_iim_features.md`.
+
+Closed by adding **two more** LDA features (`z2_rt_external`/`z2_ims_external`,
+`((observed - predicted_external) / sigma) ** 2`) computed in `build_features`
+from the same dense arrays `evict_rt_iim_mismatches` already reads, plus a new
+`rt_sigma_sec`/`iim_sigma` config pair (robust MAD-based scale, from
+`git/featureprediction`'s `tolerance.py::robust_sigma`, required alongside
+`predicted_rt`+`rt_tol_sec` / `predicted_iim`+`mobility_tol` — three-way all-or-none
+validation in `Input::build`). The internal model's own features are **kept**, not
+replaced — this is additive, not a swap.
+
+**Dynamic LDA column count, not a fixed-size slot with a `0.0` default.** SAGE's
+LDA feature array was a `const FEATURES: usize = 20` fixed array
+(`BASE_FEATURES`/`BASE_FEATURE_NAMES` now); a constant-valued extra column on any
+run without external predictions configured would have zero within-class variance,
+risking a singular covariance matrix in `LinearDiscriminantAnalysis::train` (`Gauss::solve`
+returning `None`) — i.e. `discriminant_score` silently going uncomputed for the
+*entire* run, not just a degraded feature. `score_psms` now takes `has_external_rt`/
+`has_external_iim: bool` (from `Search.predicted_rt.is_some()`/`predicted_iim.is_some()`
+in `runner.rs`) and builds a `Vec<f64>` per PSM instead of a fixed array, appending
+the z² columns only when configured.
+
+**z², not `sqrt(delta)` like the internal model's features.** The external
+(Chronologer/IM2Deep) residual is already close to Gaussian after
+`spectrum_q`-filtering (see `git/featureprediction`'s `confident_hits.py`), so z² is
+already chi-square(1)-shaped — a reasonable LDA input as-is, unlike the internal
+model's more skewed raw abs-residual (hence its `sqrt()` transform).
+
+New `Feature` fields (`predicted_rt_external`, `delta_rt_z2_external`,
+`predicted_ims_external`, `delta_ims_z2_external`) are output in both
+`results.sage.tsv` and `results.sage.pin` (`runner.rs`) and the parquet schema
+(`sage-cloudpath/src/parquet.rs`) — available for `sagepy-rescore`/mokapot to pick
+up later, though nothing downstream consumes them yet (deliberately deferred, see
+the plan doc).
+
+**Explicitly deferred, not done here:** k-fold train/validation splitting of SAGE's
+own LDA (mokapot-style) — `LinearDiscriminantAnalysis::train`/`score_psms` still
+fit and score the same PSM set with no CV, same as before this change. Acceptable
+for now given the LDA's low parameter count (20-22 coefficients) relative to typical
+PSM counts; revisit separately if it becomes a concern.
+
+## External RT/IIM as a soft ranking penalty on hyperscore (2026-08-25)
+
+Before this, `--predicted-rt`/`--predicted-iim` only ever affected candidate
+retention via a **hard** filter (`evict_rt_iim_mismatches`, in/out per
+per-dimension window) — the actual ranking/truncation-to-`report_psms` key
+in `build_features` was always raw `hyperscore`, blind to RT/IIM. A candidate
+just inside the window and one dead-on its prediction ranked identically to
+SAGE if their hyperscores tied.
+
+`Score` (private struct, `crates/sage/src/scoring.rs`) now carries a second
+field, `combined_score: f64`, computed once per candidate right after
+`score_candidate` and used for `build_features`'s sort and for `delta_next`/
+`delta_best`'s margins (raw `hyperscore` stays untouched as its own reported
+`Feature` field, for diagnostics/backward compat):
+
+```
+combined_score = hyperscore - 0.5 * (z_rt_external² + z_iim_external²)
+```
+
+`z_rt_external`/`z_iim_external` are exactly the same z-scores already
+computed for the LDA's `delta_rt_z2_external`/`delta_ims_z2_external`
+features (see the LDA section above) — `0.5 * z²` is `-log(gaussian
+density)` up to an additive constant, so this is a plain log-likelihood
+combination with weight 1, not a free/tunable lambda. Both terms are `0.0`
+whenever their prediction isn't configured or `sigma <= 0.0` (same
+zero-default convention the LDA features already use), so `combined_score ==
+hyperscore` exactly on any run without `--predicted-rt`/`--predicted-iim` —
+one formula covers all four presence combinations, no per-combination
+branching or duplicated functions.
+
+A new private `Scorer::external_z2` helper (peptide_idx/charge -> `(f32,
+f32, f32, f32)`) factors out the z² computation so `build_features`'s
+pre-sort pass and its post-sort `Feature`-populating pass can't drift apart
+— it's called once per candidate in `score_vector` before the sort (cheap:
+dense-array lookups, see the benchmark table above) and again per retained
+candidate for the reported fields, exactly as before this change.
+
+**Kept, not replaced:** `evict_rt_iim_mismatches`'s hard per-window eviction
+is unchanged — this is a second, independent mechanism layered on top, not a
+swap. Hard eviction still runs first (before `trim_hits`, on the full
+preliminary candidate set); the new ranking penalty then only reorders
+whichever candidates survive it. Removing the hard filter in favor of pure
+ranking was considered and deliberately not done here — out of scope for
+this change, revisit separately if the hard filter's outlier-rejection role
+turns out to be redundant with the soft penalty in practice.
+
+Test: `combined_score_ranks_rt_tied_hyperscore_candidates`
+(`crates/sage/tests/integration.rs`) — two proteins whose sole tryptic
+peptides differ only by an I<->L swap (isomeric, so byte-identical
+theoretical fragment masses and therefore an exact hyperscore tie against
+any shared peak list), predicted RT set close for one and far for the
+other. Isolates the new ranking behavior from hyperscore itself: with a real
+tie, RT closeness is the only thing that can break it.
+
+**Runtime-selectable, not compiled in (2026-08-26).** Which key
+`build_features` sorts/truncates on is a new `RankingScore` enum
+(`Hyperscore` | `CombinedScore`, `Scorer::ranking_score`) — same
+`Option<T>` + `Input::build()`-default shape as the pre-existing
+`score_type`/`ScoreType` (config key `ranking_score`, defaults to
+`CombinedScore`). Added because A/B-ing the two rankings originally meant
+`git stash`-ing `scoring.rs` and rebuilding a second binary just to compare
+— real friction for something that should be a one-line config change, and
+exactly the pattern `score_type` already established for picking between
+`SageHyperScore`/`OpenMSHyperScore` at runtime. `combined_score` is still
+always computed regardless of this setting (cheap); `Hyperscore` mode just
+means `rank_key` reads `hyperscore` instead. Test:
+`ranking_score_hyperscore_ignores_rt_penalty` — same isomeric-tie fixture,
+confirms `delta_next` stays exactly `0.0` (real tie, unaffected by a large
+predicted-RT gap) when `ranking_score: Hyperscore`.
+
+**Real F9477 end-to-end comparison (2026-08-25/26, `jobs/f9477_gam_test.toml`-derived,
+mode 3 RT-only, 1% spectrum-level FDR):**
+
+| ranking | hard RT eviction | PSMs | peptides | ions | proteins |
+|---|---|---|---|---|---|
+| `Hyperscore` (old) | on (±0.5-99.5% window) | 104,259 | 21,537 | 25,194 | 4,143 |
+| `CombinedScore` (new, default) | on (±0.5-99.5% window) | **105,125** | **21,707** | **25,409** | **4,177** |
+| `Hyperscore` (old) | off (empiric `[0,100]` window, ≈ no-op) | 94,349 | 18,887 | 22,059 | 3,771 |
+| `CombinedScore` | off (empiric `[0,100]` window, ≈ no-op) | 84,283 | 14,913 | 18,190 | 3,437 |
+
+Full 2x2, and the eviction-off row flips the ranking comparison entirely:
+with hard eviction **on**, `CombinedScore` beats `Hyperscore` by a small,
+consistent margin (+0.8-0.85% at every level). With hard eviction **off**,
+`CombinedScore` is *worse* than `Hyperscore` by a lot (84,283 vs 94,349,
+~10.5% fewer PSMs) — the opposite direction. `CombinedScore` is not a
+general-purpose improvement over hyperscore; it specifically depends on
+hard eviction bounding its own input first. `0.5*z²` is unbounded — with
+the tight window, only candidates already inside a sane RT range ever reach
+the ranking stage, so z² there stays small and acts as a gentle tiebreaker
+(the regime the isomeric-tie test above exercises). With the window thrown
+open, genuine RT outlier candidates enter the ranking pool too, and for
+those `0.5*z²` can be large enough to outweigh a real hyperscore lead and
+flip the winner to whichever candidate happens to sit closer to the
+predicted RT by chance — right or wrong. Using `CombinedScore` *without*
+hard eviction is worse than using neither. Conclusion: **hard eviction is
+not optional if `CombinedScore` is enabled** — `CombinedScore` is a
+complementary refinement layered on an already-bounded candidate pool, not
+a standalone replacement for eviction, and not safe to enable on its own.
+
+Found blocking this comparison, unrelated to this change but fixed
+alongside it: `git/featureprediction`'s `correct_precursors_rt`/
+`correct_precursors_iim` computed `robust_sigma` but never wrote
+`rt_sigma_sec`/`iim_sigma` into the tolerance JSON (only the *first*-pass
+`predict_rt`/`predict_iim` did) — since `ionmaidentools` wires the
+*second*-pass output into SAGE's config, `rt_sigma_sec`/`iim_sigma` never
+actually reached SAGE on any real job, so the entire external-z² LDA
+feature (and this `combined_score` work) were dead on arrival end-to-end
+until that was fixed. See that repo's `AI.md`.

@@ -73,6 +73,33 @@ fn main() -> anyhow::Result<()> {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
+            Arg::new("predicted-fragment-intensity-index")
+                .long("predicted-fragment-intensity-index")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to a job-scoped parquet index (columns: sequence, charge, \
+                     start, end) into a fragment-intensity PredictionCache's shared \
+                     arrays.mmappet (git/featureprediction's \
+                     export_fragment_intensity_for_sage). Feature-only -- computes \
+                     Feature::ms2_entropy_similarity, no hard filtering. Must be given \
+                     together with --predicted-fragment-intensity-cache.",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("predicted-fragment-intensity-cache")
+                .long("predicted-fragment-intensity-cache")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Path to the shared arrays.mmappet directory that \
+                     --predicted-fragment-intensity-index's (start, end) ranges \
+                     address (a subdirectory of the fragment-intensity \
+                     PredictionCache -- not the whole cache directory, and not its \
+                     index.sqlite3).",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
             Arg::new("unimod-db-path")
                 .long("unimod-db-path")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())

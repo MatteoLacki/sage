@@ -72,6 +72,32 @@ fn resolve_predicted_iim(
     resolved
 }
 
+/// Same shape as `resolve_predicted_iim` (reuses `Scorer::iim_dense_slot`
+/// unchanged -- the `(peptide_idx, charge) -> flat slot` arithmetic is
+/// identical for any per-`(peptide, charge)` dense array, not IIM-specific
+/// despite the helper's name), for `(sequence, charge) -> (start, end)`
+/// instead of `-> iim`. See `docs/ai/predicted_fragment_intensity.md`.
+fn resolve_predicted_fragment_intensity(
+    db: &IndexedDatabase,
+    map: &HashMap<(String, u8), (u64, u64)>,
+    min_charge: u8,
+    max_charge: u8,
+) -> Vec<Option<(u64, u64)>> {
+    let charge_span = (max_charge - min_charge + 1) as usize;
+    let mut resolved = vec![None; db.peptides.len() * charge_span];
+    for (idx, peptide) in db.peptides.iter().enumerate() {
+        let sequence = peptide.to_string();
+        for charge in min_charge..=max_charge {
+            if let Some(&range) = map.get(&(sequence.clone(), charge)) {
+                if let Some(slot) = Scorer::iim_dense_slot(idx, charge, min_charge, max_charge) {
+                    resolved[slot] = Some(range);
+                }
+            }
+        }
+    }
+    resolved
+}
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
@@ -84,6 +110,19 @@ pub struct Runner {
     /// Externally-predicted `(sequence, charge) -> iim`, loaded once from
     /// `parameters.predicted_iim` if set — independent of `predicted_rt`.
     pub predicted_iim: Option<HashMap<(String, u8), f32>>,
+    /// Externally-predicted `(sequence, charge) -> (start, end)` pointer
+    /// index into `predicted_fragment_intensity_arrays`, loaded once from
+    /// `parameters.predicted_fragment_intensity_index` if set. Feature-only
+    /// (see `docs/ai/predicted_fragment_intensity.md`) — independent of
+    /// `predicted_rt`/`predicted_iim`.
+    pub predicted_fragment_intensity_index: Option<HashMap<(String, u8), (u64, u64)>>,
+    /// The shared `arrays.mmappet` mmapped arrays
+    /// `predicted_fragment_intensity_index`'s ranges address, loaded once
+    /// from `parameters.predicted_fragment_intensity_cache` if set. Owned
+    /// here (not just borrowed) so it outlives every `Scorer` built from
+    /// `&self`/`&self.database` during the run.
+    pub predicted_fragment_intensity_arrays:
+        Option<sage_cloudpath::fragment_intensity_cache::FragmentIntensityArrays>,
     start: Instant,
 }
 
@@ -183,6 +222,41 @@ impl Runner {
             None => None,
         };
 
+        let predicted_fragment_intensity_index = match &parameters.predicted_fragment_intensity_index {
+            Some(path) => {
+                let map = sage_cloudpath::fragment_intensity_cache::read_fragment_intensity_index(
+                    std::path::Path::new(path),
+                )
+                .with_context(|| {
+                    format!("Failed to read predicted fragment-intensity index from `{path}`")
+                })?;
+                info!(
+                    "loaded {} predicted (sequence, charge) -> (start, end) fragment-intensity entries",
+                    map.len()
+                );
+                Some(map)
+            }
+            None => None,
+        };
+
+        let predicted_fragment_intensity_arrays = match &parameters.predicted_fragment_intensity_cache
+        {
+            Some(path) => {
+                let arrays = sage_cloudpath::fragment_intensity_cache::FragmentIntensityArrays::open(
+                    std::path::Path::new(path),
+                )
+                .with_context(|| {
+                    format!("Failed to open shared fragment-intensity arrays.mmappet at `{path}`")
+                })?;
+                info!(
+                    "opened fragment-intensity arrays.mmappet ({} rows)",
+                    arrays.annotation_id.len()
+                );
+                Some(arrays)
+            }
+            None => None,
+        };
+
         let database = match parameters.database.prefilter {
             false => parameters.database.clone().build(fasta),
             true => {
@@ -198,11 +272,17 @@ impl Runner {
                             / parameters.database.prefilter_chunk_size,
                         parameters.database.prefilter_chunk_size,
                     );
+                    // Prefiltering is a lightweight peptide-selection pass, not a
+                    // real scoring run -- fragment-intensity is feature-only and
+                    // never needed here, regardless of whether it's configured
+                    // for the real search below.
                     let mini_runner = Self {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
                         predicted_rt: predicted_rt.clone(),
                         predicted_iim: predicted_iim.clone(),
+                        predicted_fragment_intensity_index: None,
+                        predicted_fragment_intensity_arrays: None,
                         start,
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
@@ -222,6 +302,8 @@ impl Runner {
             parameters,
             predicted_rt,
             predicted_iim,
+            predicted_fragment_intensity_index,
+            predicted_fragment_intensity_arrays,
             start,
         })
     }
@@ -296,6 +378,12 @@ impl Runner {
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
                     ranking_score: self.parameters.ranking_score,
+                    // Feature-only, never needed for prefiltering (see
+                    // `Runner::new`'s `mini_runner`, which never configures
+                    // fragment-intensity in the first place).
+                    predicted_fragment_intensity_index: None,
+                    predicted_fragment_intensity_annotation_id: None,
+                    predicted_fragment_intensity: None,
                 };
 
                 // Allocate an array of booleans indicating whether a peptide was identified in a
@@ -645,6 +733,26 @@ impl Runner {
                 self.parameters.precursor_charge.1,
             )
         });
+        let predicted_fragment_intensity_by_idx =
+            self.predicted_fragment_intensity_index.take().map(|map| {
+                resolve_predicted_fragment_intensity(
+                    &self.database,
+                    &map,
+                    self.parameters.precursor_charge.0,
+                    self.parameters.precursor_charge.1,
+                )
+            });
+        // Borrowed, not taken -- `Scorer` needs `&'db [u8]`/`&'db [f16]`
+        // slices, and the owning `FragmentIntensityArrays` (with its mmap
+        // handles) must stay alive on `self` for the rest of this run.
+        let predicted_fragment_intensity_annotation_id = self
+            .predicted_fragment_intensity_arrays
+            .as_ref()
+            .map(|arrays| arrays.annotation_id);
+        let predicted_fragment_intensity_slice = self
+            .predicted_fragment_intensity_arrays
+            .as_ref()
+            .map(|arrays| arrays.predicted_intensity);
 
         let scorer = Scorer {
             db: &self.database,
@@ -670,6 +778,9 @@ impl Runner {
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
             ranking_score: self.parameters.ranking_score,
+            predicted_fragment_intensity_index: predicted_fragment_intensity_by_idx.as_deref(),
+            predicted_fragment_intensity_annotation_id,
+            predicted_fragment_intensity: predicted_fragment_intensity_slice,
         };
 
         //Collect all results into a single container
@@ -961,6 +1072,11 @@ impl Runner {
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_entropy_similarity)
+                .as_bytes(),
+        );
         record
     }
 
@@ -1071,6 +1187,7 @@ impl Runner {
             "protein_q",
             "protein_group_q",
             "ms2_intensity",
+            "ms2_entropy_similarity",
         ];
 
         let headers = csv::ByteRecord::from(csv_headers);
@@ -1271,6 +1388,11 @@ impl Runner {
                 .format(feature.posterior_error)
                 .as_bytes(),
         );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_entropy_similarity)
+                .as_bytes(),
+        );
         record.push_field(peptide.to_string().as_bytes());
         record.push_field(
             peptide
@@ -1329,6 +1451,7 @@ impl Runner {
             "scored_candidates",
             "ln(-poisson)",
             "posterior_error",
+            "ms2_entropy_similarity",
             "Peptide",
             "Proteins",
         ]);
