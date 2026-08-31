@@ -1077,6 +1077,62 @@ impl Runner {
                 .format(feature.ms2_entropy_similarity)
                 .as_bytes(),
         );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_weighted_entropy_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_heuristic_entropy_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_cosine_similarity)
+                .as_bytes(),
+        );
+        record.push_field(ryu::Buffer::new().format(feature.ms2_dot_product).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_spectral_contrast_angle)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_euclidean_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_bray_curtis_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_pearson_corr)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_spearman_corr)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_hypergeometric_probability)
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.ms2_intersection)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_top6_matched_intensity)
+                .as_bytes(),
+        );
         record
     }
 
@@ -1188,6 +1244,18 @@ impl Runner {
             "protein_group_q",
             "ms2_intensity",
             "ms2_entropy_similarity",
+            "ms2_weighted_entropy_similarity",
+            "ms2_heuristic_entropy_similarity",
+            "ms2_cosine_similarity",
+            "ms2_dot_product",
+            "ms2_spectral_contrast_angle",
+            "ms2_euclidean_similarity",
+            "ms2_bray_curtis_similarity",
+            "ms2_pearson_corr",
+            "ms2_spearman_corr",
+            "ms2_hypergeometric_probability",
+            "ms2_intersection",
+            "ms2_top6_matched_intensity",
         ];
 
         let headers = csv::ByteRecord::from(csv_headers);
@@ -1393,6 +1461,62 @@ impl Runner {
                 .format(feature.ms2_entropy_similarity)
                 .as_bytes(),
         );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_weighted_entropy_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_heuristic_entropy_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_cosine_similarity)
+                .as_bytes(),
+        );
+        record.push_field(ryu::Buffer::new().format(feature.ms2_dot_product).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_spectral_contrast_angle)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_euclidean_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_bray_curtis_similarity)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_pearson_corr)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_spearman_corr)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_hypergeometric_probability)
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.ms2_intersection)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms2_top6_matched_intensity)
+                .as_bytes(),
+        );
         record.push_field(peptide.to_string().as_bytes());
         record.push_field(
             peptide
@@ -1452,6 +1576,18 @@ impl Runner {
             "ln(-poisson)",
             "posterior_error",
             "ms2_entropy_similarity",
+            "ms2_weighted_entropy_similarity",
+            "ms2_heuristic_entropy_similarity",
+            "ms2_cosine_similarity",
+            "ms2_dot_product",
+            "ms2_spectral_contrast_angle",
+            "ms2_euclidean_similarity",
+            "ms2_bray_curtis_similarity",
+            "ms2_pearson_corr",
+            "ms2_spearman_corr",
+            "ms2_hypergeometric_probability",
+            "ms2_intersection",
+            "ms2_top6_matched_intensity",
             "Peptide",
             "Proteins",
         ]);

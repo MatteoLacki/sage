@@ -206,16 +206,221 @@ without this feature configured at all):
   posterior_error, ms2_entropy_similarity, Peptide, Proteins` — confirmed
   the required-last-two-columns convention is preserved.
 
+## Full MSBooster parity (2026-08-31, second pass)
+
+After the first slice (`ms2_entropy_similarity` only) shipped, the user
+asked for the rest of MSBooster's MS2-similarity feature set. Two research
+passes against the real source (`github.com/Nesvilab/MSBooster`,
+`src/main/java/features/spectra/SpectrumComparison.java`) were needed — the
+first (pre-compaction, summarized rather than re-verified) wrongly claimed
+MSBooster has *no* cosine/dot-product family at all; a second, source-level
+pass (`gh api`/`raw.githubusercontent.com`, full 1011-line file read)
+corrected this and pulled exact formulas, corcting the record.
+
+**12 new `Feature` fields**, all computed from the same compacted
+real-fragment-positions-only `(observed_real, predicted_real)` pair
+`ms2_entropy_similarity` already used (`ms2_top6_matched_intensity`
+additionally needs the full raw spectrum, see below) — no new `Scorer`
+config, no new CLI flags. (Originally these took the full `[f32; 174]`
+dense arrays directly; changed after a real bug was found -- see "Bug
+found and fixed" below.)
+
+| Field | MSBooster function | Notes |
+|---|---|---|
+| `ms2_weighted_entropy_similarity` | `weightedSpectralEntropy` | `entropy_similarity * H(one_normalize(predicted))^0.5` — **not** m/z-frequency-weighted (see below), a self-weighting transform. Unbounded above 1.0 by design. |
+| `ms2_heuristic_entropy_similarity` | `heuristicSpectralEntropy` | If predicted-spectrum entropy `< 1.75`, reweight both vectors by `intensity^(H/2.75)` before recomputing entropy; else identical to `ms2_entropy_similarity`. |
+| `ms2_cosine_similarity` | `cosineSimilarity` | Raw (non-normalized) vectors. |
+| `ms2_dot_product` | `dotProduct` | Cosine of L2-normalized vectors — algebraically equal to `ms2_cosine_similarity` when both are defined; verified identical in the real run below. |
+| `ms2_spectral_contrast_angle` | `spectralContrastAngle` | `1 - (2/π)·acos(cosine)`. |
+| `ms2_euclidean_similarity` | `euclideanDistance` | Despite the MSBooster name, already a similarity (`1 - ||Δ||₂` on unit vectors) — can go negative (min `1-√2`). |
+| `ms2_bray_curtis_similarity` | `brayCurtis` | `1 - Σ|Δ|/Σsum`, on unit vectors. |
+| `ms2_pearson_corr` | `pearsonCorr` | **Real-fragment-positions only**, not the full 174-slot array (see below) — `-1.0` sentinel if degenerate. |
+| `ms2_spearman_corr` | `spearmanCorr` | Same restriction; average-rank tie handling. |
+| `ms2_hypergeometric_probability` | `hypergeometricProbability` | Scope-restricted (see below); `-log10(P(X >= k))`, no external stats crate needed (exact log-space PMF summation, `ms2_similarity::hypergeometric_upper_tail`). |
+| `ms2_intersection` | `intersection` | Scope-restricted; raw count (not Jaccard), `u32`. |
+| `ms2_top6_matched_intensity` | `top6matchedIntensity` | Numerator scope-restricted (top-6 *real* positions by predicted intensity); denominator uses the **full raw spectrum** (`query.peaks`, not just matched-fragment positions) -- the one metric here that needs more than the two 174-slot dense arrays. |
+
+### Three deliberate deviations from MSBooster's literal definitions
+
+1. **Pearson/Spearman restricted to real positions.** MSBooster's own
+   vector is exactly as long as the model's real prediction count for that
+   peptide — no padding. This repo's dense arrays are fixed at 174 slots
+   with zero-padding for positions beyond a peptide's real length. Every
+   *sum-based* metric above (cosine, dot product, Euclidean, Bray-Curtis,
+   entropy) is mathematically unaffected by that padding — a `(0, 0)` slot
+   contributes exactly `0` to every sum term. Pearson/Spearman are **not**
+   sum-invariant to padding (they normalize by sample size via mean/
+   variance/rank) — extra `(0, 0)` "agreement" points would silently bias
+   the correlation upward. Fixed by tracking `is_real_dense: [bool; 174]`
+   in `score_candidate` (set unconditionally per `(idx, charge)` the
+   fragment loop visits, regardless of match) and filtering both vectors to
+   just those positions before calling `pearson_corr`/`spearman_corr`. Real
+   run: **zero** `-1.0` sentinel triggers across 206,991 PSMs — real
+   peptides always had enough real positions.
+
+2. **Hypergeometric probability/intersection use a narrower "population".**
+   MSBooster's population is every theoretical fragment across all 6 ion
+   kinds within the scan's observable m/z range — a separate, larger
+   computation than what the job's own search uses. Per explicit decision
+   (avoid generating fragment kinds beyond what's actually configured),
+   both are restricted to this repo's 174-slot vocabulary + `is_real`:
+   population = real positions, population successes = how many were
+   observed, sample = the subset the model actually predicted for (nonzero
+   `predicted`), sample successes = how many of *those* were observed. This
+   is a real, if narrower, coherent hypergeometric test — not degenerate,
+   since Prosit `compact_trt`'s own cache coverage is itself genuinely
+   sparse (see `fragment_slots.py`'s `ordinal_in_range` finding: roughly
+   half of a peptide's structurally-valid slots may still lack a cache
+   entry), so sample size is meaningfully smaller than population in
+   practice.
+
+3. **`getWeights`/`freqs`-dependent `weighted*` variants are skipped
+   entirely** (`weightedCosineSimilarity`, `weightedDotProduct`,
+   `weightedSpectralContrastAngle`, `weightedEuclideanDistance`,
+   `weightedBrayCurtis`, `weightedPearsonCorr`) — these multiply in an
+   m/z-binned frequency table whose own computation wasn't found in either
+   research pass (not in `SpectrumComparison.java`). Shipping a guessed
+   weighting scheme would be silently wrong, not just approximate, so
+   these are left out rather than faked. `weightedSpectralEntropy`/
+   `heuristicSpectralEntropy` are **not** part of this skip — they
+   self-weight from their own computed entropy, no `freqs` dependency.
+
+### Verified end-to-end, real F9477 data (2026-08-31)
+
+Full workspace test suite green: 36 `ms2_similarity` unit tests (up from 7
+— one genuine test bug caught and fixed during this pass: `intersection`
+with `top_n >= population` correctly includes *every* real position
+regardless of its own observed value, which the first draft of
+`intersection_zero_without_overlap` didn't account for).
+
+Real search, same F9477 `pmsms`/`precursors`/`sage_config` as the
+`ms2_entropy_similarity`-only run: **159s for the first 11 new metrics —
+identical to the single-metric run**, no measurable additional overhead
+(all cheap scalar arithmetic over already-resident `[f32; 174]` arrays,
+plus a small bounded `Vec` for the Pearson/Spearman real-position subset).
+Adding `ms2_top6_matched_intensity` afterward (needs the full raw
+`query.peaks` list, not just the two dense arrays) brought it to **163s**
+— a small, real ~2.5% bump from the per-candidate peak-intensity
+collection + sort, still modest.
+
+**Every metric shows the same real target/decoy separation direction**
+(206,991 PSMs, label=1 vs label=-1 means): cosine `0.384` vs `0.249`,
+spectral contrast angle `0.273` vs `0.166`, Bray-Curtis `0.309` vs
+`0.203`, Pearson `0.249` vs `0.078`, Spearman `0.272` vs `0.129`,
+hypergeometric `0.692` vs `0.430`, Euclidean `-0.063` vs `-0.210` (still
+target > decoy despite both being negative), intersection `13.84` vs
+`13.65` (real but much smaller separation, expected — a top-20 count is
+naturally close to saturated for both). `ms2_cosine_similarity` and
+`ms2_dot_product` matched to float precision in every sampled row, as
+expected algebraically. `ms2_heuristic_entropy_similarity` matched
+`ms2_entropy_similarity` exactly for every sampled high-hyperscore
+candidate (predicted-spectrum entropy `>= 1.75` for these, so the
+reweight branch never triggers) — plausible, not yet checked against a
+real low-entropy (short/simple predicted spectrum) case specifically.
+`ms2_weighted_entropy_similarity` exceeded `1.0` in real data (max
+`1.566`), confirming the intentionally-unbounded behavior.
+
+## Verified together with `--predicted-rt` on the real full second pass (2026-08-31)
+
+All runs above used the 250,000-row `select_recalibration_precursors` subset
+(the confident-hit-selection stage of this project's normal 2-pass
+pipeline) — the same input the pre-existing baseline node used, so the
+timing comparisons were fair, but not the largest real search this project
+runs. Re-verified against the actual **second/final pass**: the real
+`run_sage` node (`cf8172b0f7c258bf...`) that already has `--predicted-rt`
+wired in (RT hard eviction via `evict_rt_iim_mismatches` + `delta_rt_z2_external`
+in the LDA/`combined_score`, see `predicted_rt_iim.md`) — full
+`rt_corrected_precursors.mmappet` (not a confident-hit subset),
+`recalibrate_pmsms_mz`'s pmsms, `--annotate-matches --write-pin`, real
+`predicted_rt.parquet`, plus this feature's two new flags added on top of
+that exact real command (pulled verbatim from the node's own
+`.rip/dependencies.toml`).
+
+- Baseline (this exact node, before this feature existed): **376.8s**
+  (necroflow's own recorded `run.toml`).
+- With `--predicted-fragment-intensity-*` added: **412s** (+35.2s, ~9.3%).
+- **468,368 PSMs** — the real full precursor set, not the 250K-row subset.
+- `predicted_rt_external` populated for 100% of rows (RT feature/eviction
+  active throughout), `ms2_entropy_similarity` for 99.65%.
+- `delta_rt_z2_external` correctly lower for targets (`1.209`) than decoys
+  (`1.407`) — RT hard eviction behaving as already established.
+- **Every one of the 12 MS2 metrics again shows the correct target/decoy
+  separation direction, and noticeably *stronger* than the
+  250K-precursor-subset run** (e.g. entropy similarity `0.478` vs `0.319`
+  here, vs. `0.421` vs `0.305` there) — consistent with RT hard eviction
+  having already filtered out weaker candidates before MS2 similarity is
+  even computed. Confirms the two features compose correctly and don't
+  interfere with each other (RT eviction still runs on `InitialHits` before
+  `score_candidate`'s MS2 unpacking; the MS2 metrics never see candidates
+  RT already rejected).
+
+## Bug found and fixed: predicted covers charges the job never searches (2026-08-31)
+
+Caught by a direct question, not by testing: **is `predicted`/`observed`
+compared against `is_real` before summing, for every metric, or only
+some?** The answer was only some -- and the ones that weren't had a real,
+currently-active bug.
+
+The cache's `predicted_dense` is unpacked directly from
+`arrays.mmappet`'s sparse entries, which cover all 3 Prosit fragment
+charges (1, 2, 3) for a given `(sequence, precursor_charge)` key,
+independent of what *this job's own* `max_fragment_charge` config
+actually searches. The real F9477 production config uses
+`max_fragment_charge: 1` -- `fn max_fragment_charge` (`scoring.rs`) maps
+that to a loop bound of `1..2`, so SAGE's own fragment-generation loop
+only ever visits **fragment charge 1** (roughly 1/3 of the 174-slot
+vocabulary) for every real job run so far. `is_real_dense` (correctly)
+only marks those charge-1 slots true. But `predicted_dense` -- unpacked
+straight from the cache, with no awareness of `max_fragment_charge` at
+all -- has real, nonzero Prosit predictions at the charge-2/3 slots too.
+
+Eight of the twelve MSBooster-parity metrics (`entropy_similarity`,
+`weighted_entropy_similarity`, `heuristic_entropy_similarity`,
+`cosine_similarity`, `dot_product`, `spectral_contrast_angle`,
+`euclidean_similarity`, `bray_curtis_similarity`) summed over the **full**
+174-slot dense array with no `is_real` filtering at all -- relying on an
+invariant ("padding with `(0, 0)` pairs is neutral for every sum-based
+metric") that's only true when `predicted` is actually `0` at every
+non-real slot. It wasn't: those charge-2/3 slots had real `predicted > 0`
+values silently compared against phantom `observed = 0` (SAGE never even
+attempts to match a fragment charge it doesn't search), biasing all eight
+metrics downward for every real job run to date. The other five
+(`hypergeometric_probability`, `intersection`, `top6_matched_intensity`,
+`pearson_corr`, `spearman_corr`) were **never** affected -- each already
+took an explicit `is_real` parameter and filtered through it before ever
+reading `predicted`.
+
+**Fix**: rather than adding an `is_real` parameter to each of the eight
+(a "remember to mask" pattern that already failed once), every metric
+function in `ms2_similarity.rs` was changed to take plain `&[f32]` slices
+instead of `&[f32; N_FRAGMENT_SLOTS]` arrays, and `score_candidate` now
+builds **one** compacted `(observed_real, predicted_real)` pair (the same
+compaction Pearson/Spearman already did) and feeds it to all thirteen
+metrics uniformly -- there's no code path left where a metric can see an
+unfiltered slot at all, so this class of bug can't recur by omission.
+`hypergeometric_probability`/`intersection`/`top6_matched_intensity`
+dropped their now-redundant `is_real` parameter (population membership is
+simply `observed_real.len()` once the slice is already compacted).
+
+Real measured effect (same F9477 second-pass run as above, target/decoy
+means): `entropy_similarity` `0.478/0.319` → `0.533/0.363`,
+`cosine_similarity` `0.453/0.267` → `0.484/0.291`, `euclidean_similarity`
+`0.008/-0.194` → `0.044/-0.172`, `bray_curtis_similarity`
+`0.361/0.215` → `0.404/0.247` -- all shifted up ~10-15%, as expected once
+phantom mismatches are excluded. The other five metrics are
+byte-for-byte identical before and after, confirming they were never
+exposed. Runtime: 423s (vs. 412s before this fix -- +2.7%, within
+run-to-run noise for this machine).
+
 ## Explicitly out of scope here
 
-- Any additional MSBooster/DiaTracer-style features (spectral-angle,
-  intersection count, hypergeometric probability, top6matchedIntensity) —
-  `ms2_entropy_similarity` is the first slice, not the whole set. The
-  `predicted_dense`/`observed_dense` pair computed in `score_candidate` is
-  general-purpose; adding another feature from the same two arrays is a
-  small, localized change, not a redesign.
+- The `getWeights`/`freqs`-dependent `weighted*` variants (see above) —
+  would need a third research pass to find where MSBooster computes its
+  m/z-binned frequency table before these can be faithfully ported.
 - Any downstream consumer (mokapot rescoring, `sagepy-rescore`) actually
-  using this field — same "reported but unconsumed so far" status
-  `predicted_rt_external`/`delta_rt_z2_external` had when they first
-  landed.
-- Profiling/optimizing the ~12.5% overhead above.
+  using any of these 13 fields — same "reported but unconsumed so far"
+  status `predicted_rt_external`/`delta_rt_z2_external` had when they
+  first landed.
+- Profiling/optimizing runtime overhead — none measured so far beyond
+  wall-clock comparison of three runs (141.3s baseline, 159s with the
+  first 11 new metrics, 163s with `ms2_top6_matched_intensity` added).

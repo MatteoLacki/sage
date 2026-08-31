@@ -78,6 +78,18 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             required float protein_q;
             required float protein_group_q;
             required float ms2_entropy_similarity;
+            required float ms2_weighted_entropy_similarity;
+            required float ms2_heuristic_entropy_similarity;
+            required float ms2_cosine_similarity;
+            required float ms2_dot_product;
+            required float ms2_spectral_contrast_angle;
+            required float ms2_euclidean_similarity;
+            required float ms2_bray_curtis_similarity;
+            required float ms2_pearson_corr;
+            required float ms2_spearman_corr;
+            required float ms2_hypergeometric_probability;
+            required int32 ms2_intersection;
+            required float ms2_top6_matched_intensity;
             optional group reporter_ion_intensity (LIST) {
                 repeated group list {
                     optional float element;
@@ -249,6 +261,18 @@ pub fn serialize_features(
         write_col!(protein_q, FloatType);
         write_col!(protein_group_q, FloatType);
         write_col!(ms2_entropy_similarity, FloatType);
+        write_col!(ms2_weighted_entropy_similarity, FloatType);
+        write_col!(ms2_heuristic_entropy_similarity, FloatType);
+        write_col!(ms2_cosine_similarity, FloatType);
+        write_col!(ms2_dot_product, FloatType);
+        write_col!(ms2_spectral_contrast_angle, FloatType);
+        write_col!(ms2_euclidean_similarity, FloatType);
+        write_col!(ms2_bray_curtis_similarity, FloatType);
+        write_col!(ms2_pearson_corr, FloatType);
+        write_col!(ms2_spearman_corr, FloatType);
+        write_col!(ms2_hypergeometric_probability, FloatType);
+        write_col!(ms2_intersection, Int32Type);
+        write_col!(ms2_top6_matched_intensity, FloatType);
 
         if let Some(col) = rg.next_column()? {
             if reporter_ions.is_empty() {

@@ -50,14 +50,27 @@ struct Score {
     ppm_difference: f32,
     precursor_charge: u8,
     isotope_error: i8,
-    /// Unweighted spectral entropy similarity between predicted and observed
-    /// fragment intensities (`ms2_similarity::entropy_similarity`) -- a
-    /// reported `Feature` field only, never part of `combined_score`/ranking
-    /// (contrast the RT/IIM z² terms). `0.0` when
-    /// `--predicted-fragment-intensity-*` isn't configured, or this
-    /// candidate's `(peptide, charge)` has no cache entry. See
-    /// `docs/ai/predicted_fragment_intensity.md`.
+    /// MS2 predicted-vs-observed fragment intensity similarity metrics
+    /// (`ms2_similarity` module, MSBooster parity -- see
+    /// `docs/ai/predicted_fragment_intensity.md`) -- reported `Feature`
+    /// fields only, never part of `combined_score`/ranking (contrast the
+    /// RT/IIM z² terms). All `0.0` (or `-1.0` for the two correlations,
+    /// their own sentinel) when `--predicted-fragment-intensity-*` isn't
+    /// configured, or this candidate's `(peptide, charge)` has no cache
+    /// entry.
     ms2_entropy_similarity: f32,
+    ms2_weighted_entropy_similarity: f32,
+    ms2_heuristic_entropy_similarity: f32,
+    ms2_cosine_similarity: f32,
+    ms2_dot_product: f32,
+    ms2_spectral_contrast_angle: f32,
+    ms2_euclidean_similarity: f32,
+    ms2_bray_curtis_similarity: f32,
+    ms2_pearson_corr: f32,
+    ms2_spearman_corr: f32,
+    ms2_hypergeometric_probability: f32,
+    ms2_intersection: u32,
+    ms2_top6_matched_intensity: f32,
 }
 
 impl Eq for Score {}
@@ -191,15 +204,27 @@ pub struct Feature {
 
     pub ms2_intensity: f32,
 
-    /// Unweighted spectral entropy similarity between this candidate's
-    /// predicted (Prosit `compact_trt`, via `git/featureprediction`) and
-    /// observed matched-fragment intensities -- `0.0` when
+    /// MS2 predicted-vs-observed fragment intensity similarity metrics
+    /// (MSBooster parity, see `ms2_similarity` module and
+    /// `docs/ai/predicted_fragment_intensity.md`) -- all `0.0` (or `-1.0`
+    /// for the two correlations, their own sentinel) when
     /// `--predicted-fragment-intensity-*` isn't configured, or this
     /// `(peptide, charge)` has no entry in the cache. Feature-only, no hard
     /// filtering (contrast `predicted_rt_external`/`delta_rt_z2_external`,
-    /// which also feed `evict_rt_iim_mismatches`/`combined_score`). See
-    /// `docs/ai/predicted_fragment_intensity.md`.
+    /// which also feed `evict_rt_iim_mismatches`/`combined_score`).
     pub ms2_entropy_similarity: f32,
+    pub ms2_weighted_entropy_similarity: f32,
+    pub ms2_heuristic_entropy_similarity: f32,
+    pub ms2_cosine_similarity: f32,
+    pub ms2_dot_product: f32,
+    pub ms2_spectral_contrast_angle: f32,
+    pub ms2_euclidean_similarity: f32,
+    pub ms2_bray_curtis_similarity: f32,
+    pub ms2_pearson_corr: f32,
+    pub ms2_spearman_corr: f32,
+    pub ms2_hypergeometric_probability: f32,
+    pub ms2_intersection: u32,
+    pub ms2_top6_matched_intensity: f32,
 
     pub protein_groups: Option<String>,
     pub num_protein_groups: u32,
@@ -917,6 +942,18 @@ impl<'db> Scorer<'db> {
                 delta_ims_z2_external,
                 ms2_intensity: score.summed_b + score.summed_y,
                 ms2_entropy_similarity: score.ms2_entropy_similarity,
+                ms2_weighted_entropy_similarity: score.ms2_weighted_entropy_similarity,
+                ms2_heuristic_entropy_similarity: score.ms2_heuristic_entropy_similarity,
+                ms2_cosine_similarity: score.ms2_cosine_similarity,
+                ms2_dot_product: score.ms2_dot_product,
+                ms2_spectral_contrast_angle: score.ms2_spectral_contrast_angle,
+                ms2_euclidean_similarity: score.ms2_euclidean_similarity,
+                ms2_bray_curtis_similarity: score.ms2_bray_curtis_similarity,
+                ms2_pearson_corr: score.ms2_pearson_corr,
+                ms2_spearman_corr: score.ms2_spearman_corr,
+                ms2_hypergeometric_probability: score.ms2_hypergeometric_probability,
+                ms2_intersection: score.ms2_intersection,
+                ms2_top6_matched_intensity: score.ms2_top6_matched_intensity,
 
                 //Fragments
                 protein_groups: None,
@@ -1059,9 +1096,22 @@ impl<'db> Scorer<'db> {
                 Some(dense)
             });
         let mut observed_dense = predicted_dense.map(|_| [0f32; N_FRAGMENT_SLOTS]);
+        // Which of the 174 slots are a structurally real fragment position
+        // for *this* peptide/charge -- set unconditionally per (idx, charge)
+        // below, regardless of whether a peak matched there. Needed for the
+        // sample-size-sensitive metrics (Pearson/Spearman correlation,
+        // hypergeometric probability, intersection -- see
+        // `docs/ai/predicted_fragment_intensity.md`), which must not treat
+        // an unvisited slot the same as a real "no intensity" fragment.
+        let mut is_real_dense = predicted_dense.map(|_| [false; N_FRAGMENT_SLOTS]);
 
         for (idx, frag) in fragments {
             for charge in 1..max_fragment_charge {
+                let annotation_slot = ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
+                if let (Some(is_real), Some(slot)) = (is_real_dense.as_mut(), annotation_slot) {
+                    is_real[slot] = true;
+                }
+
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
 
@@ -1104,12 +1154,10 @@ impl<'db> Scorer<'db> {
                         }
                     }
 
-                    if let Some(observed_dense) = observed_dense.as_mut() {
-                        if let Some(slot) = ms2_similarity::fragment_annotation_id(
-                            frag.kind, idx, charge,
-                        ) {
-                            observed_dense[slot] = peak.intensity;
-                        }
+                    if let (Some(observed_dense), Some(slot)) =
+                        (observed_dense.as_mut(), annotation_slot)
+                    {
+                        observed_dense[slot] = peak.intensity;
                     }
 
                     if self.annotate_matches {
@@ -1134,12 +1182,58 @@ impl<'db> Scorer<'db> {
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
         score.ppm_difference /= score.summed_b + score.summed_y;
-        score.ms2_entropy_similarity = match (predicted_dense, observed_dense) {
-            (Some(predicted), Some(observed)) => {
-                ms2_similarity::entropy_similarity(&observed, &predicted)
+        if let (Some(predicted), Some(observed), Some(is_real)) =
+            (predicted_dense, observed_dense, is_real_dense)
+        {
+            // Compact once, feed every metric the same real-positions-only
+            // pair -- not just Pearson/Spearman. The cache's `predicted`
+            // covers all 3 Prosit fragment charges regardless of this
+            // job's own `max_fragment_charge` (e.g. real F9477 production
+            // config uses `max_fragment_charge: 1`, so SAGE's own loop
+            // above only ever sets `is_real` for ~1/3 of the 174 slots) --
+            // summing the *full* dense arrays would silently compare real
+            // predicted intensities against phantom `observed = 0` for
+            // fragment charges this job never even attempts to match,
+            // biasing every metric downward. Found 2026-08-31, see
+            // `docs/ai/predicted_fragment_intensity.md` and
+            // `ms2_similarity::entropy_similarity`'s doc comment.
+            let mut observed_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
+            let mut predicted_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
+            for i in 0..N_FRAGMENT_SLOTS {
+                if is_real[i] {
+                    observed_real.push(observed[i]);
+                    predicted_real.push(predicted[i]);
+                }
             }
-            _ => 0.0,
-        };
+
+            score.ms2_entropy_similarity =
+                ms2_similarity::entropy_similarity(&observed_real, &predicted_real);
+            score.ms2_weighted_entropy_similarity =
+                ms2_similarity::weighted_entropy_similarity(&observed_real, &predicted_real);
+            score.ms2_heuristic_entropy_similarity =
+                ms2_similarity::heuristic_entropy_similarity(&observed_real, &predicted_real);
+            score.ms2_cosine_similarity =
+                ms2_similarity::cosine_similarity(&observed_real, &predicted_real);
+            score.ms2_dot_product = ms2_similarity::dot_product(&observed_real, &predicted_real);
+            score.ms2_spectral_contrast_angle =
+                ms2_similarity::spectral_contrast_angle(&observed_real, &predicted_real);
+            score.ms2_euclidean_similarity =
+                ms2_similarity::euclidean_similarity(&observed_real, &predicted_real);
+            score.ms2_bray_curtis_similarity =
+                ms2_similarity::bray_curtis_similarity(&observed_real, &predicted_real);
+            score.ms2_hypergeometric_probability =
+                ms2_similarity::hypergeometric_probability(&observed_real, &predicted_real);
+            score.ms2_intersection =
+                ms2_similarity::intersection(&observed_real, &predicted_real, 20);
+            let all_peak_intensities: Vec<f32> = query.peaks.iter().map(|p| p.intensity).collect();
+            score.ms2_top6_matched_intensity = ms2_similarity::top6_matched_intensity(
+                &observed_real,
+                &predicted_real,
+                &all_peak_intensities,
+            );
+            score.ms2_pearson_corr = ms2_similarity::pearson_corr(&observed_real, &predicted_real);
+            score.ms2_spearman_corr = ms2_similarity::spearman_corr(&observed_real, &predicted_real);
+        }
 
         if self.annotate_matches {
             (score, Some(fragments_details))
