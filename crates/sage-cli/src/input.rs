@@ -4,7 +4,7 @@ use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
 use sage_core::scoring::{RankingScore, ScoreType};
-use sage_core::spline::{FragmentTolSpline, ValueTolSpline};
+use sage_core::spline::{FragmentTolSpline, LinearSpline, ValueTolSpline};
 use sage_core::{
     database::{Builder, Parameters},
     lfq::LfqSettings,
@@ -31,11 +31,12 @@ pub struct Search {
     pub predicted_iim: Option<String>,
     pub rt_tol: Option<ValueTolSpline>,
     pub mobility_tol: Option<ValueTolSpline>,
-    /// Robust (MAD-based) scale of the `predicted_rt` residual, for
-    /// normalizing `Feature::delta_rt_z2_external` into a z² LDA feature —
-    /// see `plans/lda_external_rt_iim_features.md`. Already converted to
+    /// Robust (MAD-based) scale of the `predicted_rt` residual as a
+    /// function of observed `scan_start_time`, for normalizing
+    /// `Feature::delta_rt_z2_external` into a z² LDA feature — see
+    /// `plans/lda_external_rt_iim_features.md`. Already converted to
     /// minutes at build time, same as `rt_tol`'s spline values.
-    pub rt_sigma: Option<f32>,
+    pub rt_sigma: Option<LinearSpline>,
     /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
     /// conversion needed, same as `mobility_tol`.
     pub iim_sigma: Option<f32>,
@@ -133,12 +134,17 @@ pub struct Input {
     /// `Precursor::inverse_ion_mobility` (1/K0 — unambiguous, no unit
     /// suffix needed, same unit for both the spline's grid and its values).
     pub mobility_tol: Option<ValueTolSpline>,
-    /// Robust (MAD-based) scale of the `predicted_rt` residual (seconds,
-    /// same unit as `rt_tol_sec`'s values — converted to minutes at build
-    /// time). Required alongside `predicted_rt`/`rt_tol_sec` — feeds
-    /// `Feature::delta_rt_z2_external`, see
-    /// `plans/lda_external_rt_iim_features.md`.
-    pub rt_sigma_sec: Option<f32>,
+    /// Robust (MAD-based) scale of the `predicted_rt` residual as a
+    /// function of observed `scan_start_time` (seconds, same unit and grid
+    /// convention as `rt_tol_sec` — converted to minutes at build time). A
+    /// flat (value-independent) scale is just a 1- or 2-node spline with
+    /// identical values, same convention as `rt_tol_sec`'s own flat case —
+    /// there is no separate scalar type. Required alongside
+    /// `predicted_rt`/`rt_tol_sec` — feeds `Feature::delta_rt_z2_external`,
+    /// evaluated at each candidate's own `scan_start_time` rather than a
+    /// single global scale, see `plans/lda_external_rt_iim_features.md` and
+    /// `plans/rt_heteroscedastic_tolerance_spline.md`.
+    pub rt_sigma_sec: Option<LinearSpline>,
     /// Same as `rt_sigma_sec`, for `predicted_iim`/`mobility_tol` — unitless
     /// (1/K0), no conversion needed.
     pub iim_sigma: Option<f32>,
@@ -504,22 +510,25 @@ impl Input {
         }
     }
 
-    /// `rt_tol_sec`'s spline *values* are user-facing in seconds;
-    /// `ProcessedSpectrum::scan_start_time` (the internal RT representation,
-    /// see `spectrum.rs`) is in minutes. Only the values need conversion —
-    /// the spline's own grid is already in `scan_start_time`'s native
-    /// minutes (it's evaluated against observed RT directly, no unit
-    /// mismatch there).
+    /// `rt_tol_sec`/`rt_sigma_sec`'s spline *values* are user-facing in
+    /// seconds; `ProcessedSpectrum::scan_start_time` (the internal RT
+    /// representation, see `spectrum.rs`) is in minutes. Only the values
+    /// need conversion — the spline's own grid is already in
+    /// `scan_start_time`'s native minutes (it's evaluated against observed
+    /// RT directly, no unit mismatch there). Generic over spline length, so
+    /// this applies unchanged to `rt_sigma_sec` now that it's spline-shaped
+    /// too, not just `rt_tol_sec`'s two nodes.
+    fn spline_secs_to_minutes(mut spline: LinearSpline) -> LinearSpline {
+        for v in spline.values.iter_mut() {
+            *v /= 60.0;
+        }
+        spline
+    }
+
     fn rt_tol_sec_to_minutes(tolerance: ValueTolSpline) -> ValueTolSpline {
-        let to_minutes = |mut spline: sage_core::spline::LinearSpline| {
-            for v in spline.values.iter_mut() {
-                *v /= 60.0;
-            }
-            spline
-        };
         ValueTolSpline {
-            lo: to_minutes(tolerance.lo),
-            hi: to_minutes(tolerance.hi),
+            lo: Self::spline_secs_to_minutes(tolerance.lo),
+            hi: Self::spline_secs_to_minutes(tolerance.hi),
         }
     }
 
@@ -557,6 +566,11 @@ impl Input {
             spline
                 .validate()
                 .map_err(|e| anyhow::anyhow!("invalid `rt_tol_sec`: {e}"))?;
+        }
+        if let Some(spline) = &self.rt_sigma_sec {
+            spline
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid `rt_sigma_sec`: {e}"))?;
         }
         if let Some(spline) = &self.mobility_tol {
             spline
@@ -669,7 +683,7 @@ impl Input {
             predicted_iim: self.predicted_iim,
             rt_tol: self.rt_tol_sec.map(Self::rt_tol_sec_to_minutes),
             mobility_tol: self.mobility_tol,
-            rt_sigma: self.rt_sigma_sec.map(|s| s / 60.0),
+            rt_sigma: self.rt_sigma_sec.map(Self::spline_secs_to_minutes),
             iim_sigma: self.iim_sigma,
             predicted_fragment_intensity_index: self.predicted_fragment_intensity_index,
             predicted_fragment_intensity_cache: self.predicted_fragment_intensity_cache,
@@ -839,10 +853,15 @@ mod test {
     /// exercising the fully-configured/converts-successfully paths need a
     /// way to set them; tests exercising the "missing" validation errors
     /// use `mk_predicted_json` (which leaves them `None`) instead.
+    /// `rt_sigma_sec` takes a JSON `LinearSpline` blob (see
+    /// `flat_linear_spline_json`), not a bare scalar, now that it's
+    /// RT-dependent (`plans/rt_heteroscedastic_tolerance_spline.md`);
+    /// `iim_sigma` stays a bare scalar -- IIM is out of scope for that
+    /// change.
     fn mk_predicted_json_with_sigma(
         predicted_rt: Option<&str>,
         rt_tol_sec: Option<serde_json::Value>,
-        rt_sigma_sec: Option<f32>,
+        rt_sigma_sec: Option<serde_json::Value>,
         predicted_iim: Option<&str>,
         mobility_tol: Option<serde_json::Value>,
         iim_sigma: Option<f32>,
@@ -855,7 +874,7 @@ mod test {
             json["rt_tol_sec"] = rt;
         }
         if let Some(sigma) = rt_sigma_sec {
-            json["rt_sigma_sec"] = serde_json::json!(sigma);
+            json["rt_sigma_sec"] = sigma;
         }
         if let Some(path) = predicted_iim {
             json["predicted_iim"] = serde_json::json!(path);
@@ -877,6 +896,15 @@ mod test {
             "lo": {"grid_start": 0.0, "grid_step": 1.0, "values": [lo, lo]},
             "hi": {"grid_start": 0.0, "grid_step": 1.0, "values": [hi, hi]},
         })
+    }
+
+    /// A flat (value-independent) `LinearSpline` JSON blob -- single-value
+    /// grid, constant everywhere (`LinearSpline::eval`'s single-value case).
+    /// Same role for `rt_sigma_sec` as `flat_value_tol_spline_json` has for
+    /// `rt_tol_sec`, now that both are spline-shaped
+    /// (`plans/rt_heteroscedastic_tolerance_spline.md`).
+    fn flat_linear_spline_json(value: f64) -> serde_json::Value {
+        serde_json::json!({"grid_start": 0.0, "grid_step": 1.0, "values": [value]})
     }
 
     #[test]
@@ -914,7 +942,7 @@ mod test {
         let json = mk_predicted_json_with_sigma(
             Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
-            Some(5.0),
+            Some(flat_linear_spline_json(5.0)),
             None,
             None,
             None,
@@ -960,7 +988,7 @@ mod test {
         let json = mk_predicted_json_with_sigma(
             Some("predicted_rt.parquet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
-            Some(6.0),
+            Some(flat_linear_spline_json(6.0)),
             Some("predicted_iim.parquet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
             Some(0.005),
@@ -978,8 +1006,8 @@ mod test {
             "mobility_tol is unitless (1/K0), no conversion"
         );
         assert_eq!(
-            search.rt_sigma,
-            Some(0.1),
+            search.rt_sigma.as_ref().unwrap().eval(0.0),
+            0.1,
             "rt_sigma_sec is in seconds, same /60 conversion as rt_tol_sec's values"
         );
         assert_eq!(
@@ -1004,7 +1032,7 @@ mod test {
         let json = mk_predicted_json_with_sigma(
             Some("predicted_rt.parquet"),
             Some(bad_spline),
-            Some(5.0),
+            Some(flat_linear_spline_json(5.0)),
             None,
             None,
             None,
@@ -1017,6 +1045,32 @@ mod test {
         assert!(
             err.to_string().contains("rt_tol_sec"),
             "expected error naming `rt_tol_sec`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn predicted_rt_with_invalid_rt_sigma_spline_errors() {
+        // rt_sigma_sec is now spline-shaped too (LinearSpline, not a bare
+        // scalar) -- plans/rt_heteroscedastic_tolerance_spline.md -- so it
+        // needs its own validate() check, mirroring rt_tol_sec's.
+        let mut bad_sigma = flat_linear_spline_json(5.0);
+        bad_sigma["grid_step"] = serde_json::json!(0.0);
+        let json = mk_predicted_json_with_sigma(
+            Some("predicted_rt.parquet"),
+            Some(flat_value_tol_spline_json(-30.0, 30.0)),
+            Some(bad_sigma),
+            None,
+            None,
+            None,
+        );
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("non-positive grid_step in rt_sigma_sec should be rejected"),
+        };
+        assert!(
+            err.to_string().contains("rt_sigma_sec"),
+            "expected error naming `rt_sigma_sec`, got: {err}"
         );
     }
 

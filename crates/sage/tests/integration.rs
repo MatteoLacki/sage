@@ -283,6 +283,19 @@ fn flat_value_tol_spline(lo: f32, hi: f32) -> ValueTolSpline {
     }
 }
 
+/// A flat (value-independent) `LinearSpline` -- same role for `rt_sigma`/
+/// `iim_sigma`-style scale fields as `flat_value_tol_spline` has for
+/// `rt_tol`/`mobility_tol`, now that `rt_sigma` is spline-shaped too
+/// (`plans/rt_heteroscedastic_tolerance_spline.md`).
+fn flat_linear_spline(value: f32) -> LinearSpline {
+    LinearSpline {
+        grid_start: 0.0,
+        grid_step: 1000.0,
+        values: vec![value, value],
+        extrapolation: Extrapolation::Flat,
+    }
+}
+
 /// All fragment peaks shifted 100 ppm off their theoretical masses are
 /// unreachable under a narrow flat `fragment_tol` (±5 ppm) with no spline —
 /// this is the pre-existing, unchanged behavior.
@@ -505,7 +518,7 @@ fn delta_rt_z2_external_computed_from_sigma() {
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
-    scorer.rt_sigma = Some(0.1); // minutes, same unit as rt_tol's converted values
+    scorer.rt_sigma = Some(flat_linear_spline(0.1)); // minutes, same unit as rt_tol's converted values
 
     let features = scorer.score_standard(&query);
     assert_eq!(features.len(), 1);
@@ -774,7 +787,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
     scorer.report_psms = 2;
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));
-    scorer.rt_sigma = Some(0.1);
+    scorer.rt_sigma = Some(flat_linear_spline(0.1));
 
     let features = scorer.score_standard(&query);
     assert_eq!(features.len(), 2, "both isomeric candidates should survive");
@@ -855,7 +868,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
     scorer.report_psms = 2;
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));
-    scorer.rt_sigma = Some(0.1);
+    scorer.rt_sigma = Some(flat_linear_spline(0.1));
     scorer.ranking_score = RankingScore::Hyperscore;
 
     let features = scorer.score_standard(&query);

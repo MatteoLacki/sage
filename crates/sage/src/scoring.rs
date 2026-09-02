@@ -354,11 +354,15 @@ pub struct Scorer<'db> {
     /// hashmap load-factor overhead). See
     /// `plans/rt_iim_independent_dimensions.md`.
     pub predicted_iim: Option<&'db [Option<f32>]>,
-    /// Robust (MAD-based) scale of the `predicted_rt` residual, already
-    /// converted to minutes (`sage-cli/src/input.rs`'s `rt_sigma_sec / 60.0`
-    /// at config-load time). Normalizes `Feature::delta_rt_z2_external` into
-    /// a z² LDA feature — see `plans/lda_external_rt_iim_features.md`.
-    pub rt_sigma: Option<f32>,
+    /// Robust (MAD-based) scale of the `predicted_rt` residual as a
+    /// function of observed `scan_start_time`, already converted to minutes
+    /// (`sage-cli/src/input.rs`'s `spline_secs_to_minutes` at config-load
+    /// time). Normalizes `Feature::delta_rt_z2_external` into a z² LDA
+    /// feature, evaluated at each candidate's own `scan_start_time` rather
+    /// than a single global scale — see
+    /// `plans/lda_external_rt_iim_features.md` and
+    /// `plans/rt_heteroscedastic_tolerance_spline.md`.
+    pub rt_sigma: Option<crate::spline::LinearSpline>,
     /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
     /// conversion needed.
     pub iim_sigma: Option<f32>,
@@ -661,17 +665,26 @@ impl<'db> Scorer<'db> {
         peptide_idx: usize,
         charge: u8,
     ) -> (f32, f32, f32, f32) {
-        let (predicted_rt_external, delta_rt_z2_external) = match (self.predicted_rt, self.rt_sigma)
-        {
-            (Some(by_idx), Some(sigma)) if sigma > 0.0 => match by_idx[peptide_idx] {
-                Some(rt) => {
-                    let z = (query.scan_start_time - rt) / sigma;
-                    (rt, z * z)
-                }
-                None => (0.0, 0.0),
-            },
-            _ => (0.0, 0.0),
-        };
+        // `rt_sigma` is now RT-dependent (a `LinearSpline`, not a bare
+        // scalar), so it must be `.eval(scan_start_time)`-evaluated before
+        // the `sigma > 0.0` guard can be checked -- can no longer gate on
+        // that in the match pattern itself the way a `Copy` scalar could.
+        let (predicted_rt_external, delta_rt_z2_external) =
+            match (self.predicted_rt, self.rt_sigma.as_ref()) {
+                (Some(by_idx), Some(sigma_spline)) => match by_idx[peptide_idx] {
+                    Some(rt) => {
+                        let sigma = sigma_spline.eval(query.scan_start_time);
+                        if sigma > 0.0 {
+                            let z = (query.scan_start_time - rt) / sigma;
+                            (rt, z * z)
+                        } else {
+                            (0.0, 0.0)
+                        }
+                    }
+                    None => (0.0, 0.0),
+                },
+                _ => (0.0, 0.0),
+            };
 
         let observed_ims = query
             .precursors
