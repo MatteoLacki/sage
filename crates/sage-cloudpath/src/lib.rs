@@ -24,6 +24,9 @@ pub mod predicted_properties;
 #[cfg(feature = "parquet")]
 pub mod fragment_intensity_cache;
 
+#[cfg(feature = "parquet")]
+pub mod dumped_peptides_fingerprint;
+
 /// Convert a path string (local path or cloud URL) into a [`Url`].
 pub fn to_url(s: &str) -> Result<Url, Error> {
     if let Ok(url) = Url::parse(s) {

@@ -25,97 +25,118 @@ use report_builder::{
     Report, ReportSection,
 };
 
-/// Resolves a `sequence -> rt` map into an index-keyed `Vec<Option<f32>>`
-/// (one entry per `db.peptides`), calling `Peptide::to_string()` exactly
-/// once per peptide -- not once per (candidate, spectrum) as
-/// `Scorer::evict_rt_iim_mismatches` used to. See `Runner::run`'s call
-/// site and plans/rt_iim_independent_dimensions.md.
-fn resolve_predicted_rt(db: &IndexedDatabase, map: &HashMap<String, f32>) -> Vec<Option<f32>> {
-    db.peptides
-        .iter()
-        .map(|peptide| map.get(&peptide.to_string()).copied())
-        .collect()
+/// Verifies `(fingerprint, values)` (loaded from a positional
+/// `--predicted-rt`/`--predicted-iim`/`--predicted-fragment-intensity-index`
+/// file, see `sage_cloudpath::dumped_peptides_fingerprint`) was built
+/// against the *same* digest `db` just produced, before any of `values`'
+/// row positions are trusted as `PeptideIx`. Cheap: a single SHA-256 pass
+/// over `db.peptides`' `monoisotopic` fields, no string formatting.
+fn verify_dumped_peptides_fingerprint(
+    db: &IndexedDatabase,
+    fingerprint: &str,
+    file_label: &str,
+) -> anyhow::Result<()> {
+    let actual = sage_cloudpath::dumped_peptides_fingerprint::fingerprint_monoisotopic(
+        db.peptides.iter().map(|p| p.monoisotopic),
+    );
+    anyhow::ensure!(
+        actual == fingerprint,
+        "{file_label} was built from a different `dumped_peptides` digest than this run's own \
+         (`dumped_peptides_sha256` mismatch) -- regenerate it against this run's `--fasta` and \
+         `database` config before retrying."
+    );
+    Ok(())
 }
 
-/// Same as `resolve_predicted_rt`, for `(sequence, charge) -> iim`, into a
-/// dense `Vec<Option<f32>>` (one slot per `(peptide, charge)` combination,
-/// see `sage_core::scoring::Scorer::iim_dense_slot` for the indexing, also
-/// used to read this array back during eviction so the two sides can't
-/// drift apart). Charge isn't known ahead of time per peptide, so every
-/// configured charge in `[min_charge, max_charge]` (the run's own
-/// `precursor_charge` range) is checked against the source map for each
-/// peptide -- still only one `to_string()` call per peptide, reused across
-/// that small charge range. A dense array beats a `HashMap<(usize, u8),
-/// f32>` here: a standalone benchmark at real F9477 scale (18.9M entries,
-/// 20M random-access queries, fixed seed) measured 239ns/query for
-/// `std::HashMap` vs 10.4ns/query for a dense array -- 23x, and the dense
-/// array is also smaller (no per-entry key storage or hashmap load-factor
-/// overhead). See plans/rt_iim_independent_dimensions.md.
+/// Resolves a positional `predicted_rt.parquet` load (row `i` = `db.peptides[i]`)
+/// into `Vec<Option<f32>>`, after verifying the fingerprint. No per-peptide
+/// string formatting or lookup at all -- see
+/// `docs/ai/dumped_peptides_positional_predictions.md`.
+fn resolve_predicted_rt(
+    db: &IndexedDatabase,
+    (fingerprint, values): &(String, Vec<f32>),
+) -> anyhow::Result<Vec<Option<f32>>> {
+    verify_dumped_peptides_fingerprint(db, fingerprint, "predicted_rt.parquet")?;
+    anyhow::ensure!(
+        values.len() == db.peptides.len(),
+        "predicted_rt.parquet has {} rows, expected one per peptide ({})",
+        values.len(),
+        db.peptides.len()
+    );
+    Ok(values.iter().map(|&v| Some(v)).collect())
+}
+
+/// Resolves a positional `predicted_iim.parquet` load (dense over
+/// `(peptide_row, charge)`, see `sage_core::scoring::Scorer::iim_dense_slot`
+/// for the exact slot layout both sides share) into `Vec<Option<f32>>`,
+/// after verifying the fingerprint. Previously this called
+/// `Peptide::to_string()` once per peptide plus a per-charge `HashMap`
+/// lookup; now it's a length check and a direct copy -- see
+/// `docs/ai/dumped_peptides_positional_predictions.md`.
 fn resolve_predicted_iim(
     db: &IndexedDatabase,
-    map: &HashMap<(String, u8), f32>,
+    (fingerprint, values): &(String, Vec<f32>),
     min_charge: u8,
     max_charge: u8,
-) -> Vec<Option<f32>> {
+) -> anyhow::Result<Vec<Option<f32>>> {
+    verify_dumped_peptides_fingerprint(db, fingerprint, "predicted_iim.parquet")?;
     let charge_span = (max_charge - min_charge + 1) as usize;
-    let mut resolved = vec![None; db.peptides.len() * charge_span];
-    for (idx, peptide) in db.peptides.iter().enumerate() {
-        let sequence = peptide.to_string();
-        for charge in min_charge..=max_charge {
-            if let Some(&iim) = map.get(&(sequence.clone(), charge)) {
-                if let Some(slot) = Scorer::iim_dense_slot(idx, charge, min_charge, max_charge) {
-                    resolved[slot] = Some(iim);
-                }
-            }
-        }
-    }
-    resolved
+    anyhow::ensure!(
+        values.len() == db.peptides.len() * charge_span,
+        "predicted_iim.parquet has {} rows, expected {} peptides x {} charges ({})",
+        values.len(),
+        db.peptides.len(),
+        charge_span,
+        db.peptides.len() * charge_span
+    );
+    Ok(values.iter().map(|&v| Some(v)).collect())
 }
 
-/// Same shape as `resolve_predicted_iim` (reuses `Scorer::iim_dense_slot`
-/// unchanged -- the `(peptide_idx, charge) -> flat slot` arithmetic is
-/// identical for any per-`(peptide, charge)` dense array, not IIM-specific
-/// despite the helper's name), for `(sequence, charge) -> (start, end)`
-/// instead of `-> iim`. See `docs/ai/predicted_fragment_intensity.md`.
+/// Same shape as `resolve_predicted_iim`, for the fragment-intensity
+/// pointer index (`(peptide_row, charge) -> Option<(start, end)>`, `None`
+/// where the shared cache has no entry for that pair -- see
+/// `docs/ai/predicted_fragment_intensity.md`).
 fn resolve_predicted_fragment_intensity(
     db: &IndexedDatabase,
-    map: &HashMap<(String, u8), (u64, u64)>,
+    (fingerprint, values): &(String, Vec<Option<(u64, u64)>>),
     min_charge: u8,
     max_charge: u8,
-) -> Vec<Option<(u64, u64)>> {
+) -> anyhow::Result<Vec<Option<(u64, u64)>>> {
+    verify_dumped_peptides_fingerprint(db, fingerprint, "fragment_intensity_for_sage.parquet")?;
     let charge_span = (max_charge - min_charge + 1) as usize;
-    let mut resolved = vec![None; db.peptides.len() * charge_span];
-    for (idx, peptide) in db.peptides.iter().enumerate() {
-        let sequence = peptide.to_string();
-        for charge in min_charge..=max_charge {
-            if let Some(&range) = map.get(&(sequence.clone(), charge)) {
-                if let Some(slot) = Scorer::iim_dense_slot(idx, charge, min_charge, max_charge) {
-                    resolved[slot] = Some(range);
-                }
-            }
-        }
-    }
-    resolved
+    anyhow::ensure!(
+        values.len() == db.peptides.len() * charge_span,
+        "fragment_intensity_for_sage.parquet has {} rows, expected {} peptides x {} charges ({})",
+        values.len(),
+        db.peptides.len(),
+        charge_span,
+        db.peptides.len() * charge_span
+    );
+    Ok(values.clone())
 }
 
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
-    /// Externally-predicted `sequence -> rt`, loaded once from
-    /// `parameters.predicted_rt` if set — independent of `predicted_iim`,
-    /// see `plans/rt_iim_independent_dimensions.md`. Read-only, shared
-    /// across the parallel spectra search via `&self`/`Scorer` borrows,
-    /// same as `database`.
-    pub predicted_rt: Option<HashMap<String, f32>>,
-    /// Externally-predicted `(sequence, charge) -> iim`, loaded once from
-    /// `parameters.predicted_iim` if set — independent of `predicted_rt`.
-    pub predicted_iim: Option<HashMap<(String, u8), f32>>,
-    /// Externally-predicted `(sequence, charge) -> (start, end)` pointer
-    /// index into `predicted_fragment_intensity_arrays`, loaded once from
+    /// Externally-predicted, positional (`(dumped_peptides_sha256,
+    /// values)`, row `i` = `database.peptides[i]` -- see
+    /// `docs/ai/dumped_peptides_positional_predictions.md`) RT, loaded once
+    /// from `parameters.predicted_rt` if set — independent of
+    /// `predicted_iim`, see `plans/rt_iim_independent_dimensions.md`.
+    /// Read-only, shared across the parallel spectra search via
+    /// `&self`/`Scorer` borrows, same as `database`.
+    pub predicted_rt: Option<(String, Vec<f32>)>,
+    /// Externally-predicted, positional IIM (dense over `(peptide_row,
+    /// charge)`), loaded once from `parameters.predicted_iim` if set —
+    /// independent of `predicted_rt`.
+    pub predicted_iim: Option<(String, Vec<f32>)>,
+    /// Externally-predicted, positional `(peptide_row, charge) ->
+    /// Option<(start, end)>` pointer index into
+    /// `predicted_fragment_intensity_arrays`, loaded once from
     /// `parameters.predicted_fragment_intensity_index` if set. Feature-only
     /// (see `docs/ai/predicted_fragment_intensity.md`) — independent of
     /// `predicted_rt`/`predicted_iim`.
-    pub predicted_fragment_intensity_index: Option<HashMap<(String, u8), (u64, u64)>>,
+    pub predicted_fragment_intensity_index: Option<(String, Vec<Option<(u64, u64)>>)>,
     /// The shared `arrays.mmappet` mmapped arrays
     /// `predicted_fragment_intensity_index`'s ranges address, loaded once
     /// from `parameters.predicted_fragment_intensity_cache` if set. Owned
@@ -201,7 +222,7 @@ impl Runner {
                     std::path::Path::new(path),
                 )
                 .with_context(|| format!("Failed to read predicted RT from `{path}`"))?;
-                info!("loaded {} predicted sequence -> rt entries", map.len());
+                info!("loaded {} predicted rt rows (positional)", map.1.len());
                 Some(map)
             }
             None => None,
@@ -214,8 +235,8 @@ impl Runner {
                 )
                 .with_context(|| format!("Failed to read predicted IIM from `{path}`"))?;
                 info!(
-                    "loaded {} predicted (sequence, charge) -> iim entries",
-                    map.len()
+                    "loaded {} predicted iim rows (positional, dense over peptide x charge)",
+                    map.1.len()
                 );
                 Some(map)
             }
@@ -231,8 +252,9 @@ impl Runner {
                     format!("Failed to read predicted fragment-intensity index from `{path}`")
                 })?;
                 info!(
-                    "loaded {} predicted (sequence, charge) -> (start, end) fragment-intensity entries",
-                    map.len()
+                    "loaded {} predicted fragment-intensity index rows (positional, dense over peptide x charge, {} with a cache entry)",
+                    map.1.len(),
+                    map.1.iter().filter(|v| v.is_some()).count()
                 );
                 Some(map)
             }
@@ -309,6 +331,22 @@ impl Runner {
     }
 
     pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
+        // A fasta chunk's digest here is a strict subset of any single
+        // `dumped_peptides` node's peptide list, in no particular relation
+        // to its row order -- the positional `predicted_rt`/`predicted_iim`
+        // files (see `docs/ai/dumped_peptides_positional_predictions.md`)
+        // can't be resolved against a chunk-scoped digest at all. Skipped
+        // for this pass only, same existing precedent as fragment-intensity
+        // just below (already unconditionally `None` here regardless of
+        // the real search's config) -- the real search after prefiltering
+        // still uses them.
+        if self.predicted_rt.is_some() || self.predicted_iim.is_some() {
+            log::warn!(
+                "prefiltering: --predicted-rt/--predicted-iim configured but not usable during \
+                 chunked prefiltering (positional, can't align with a chunk-scoped digest) -- \
+                 skipped for this pass only; the real search below still uses them."
+            );
+        }
         let spectra: Option<Vec<ProcessedSpectrum<_>>> =
             match parallel >= self.parameters.mzml_paths.len() {
                 true => Some(
@@ -341,18 +379,10 @@ impl Runner {
                     (Instant::now() - start).as_millis()
                 );
 
-                let predicted_rt_by_idx = self
-                    .predicted_rt
-                    .as_ref()
-                    .map(|map| resolve_predicted_rt(&db, map));
-                let predicted_iim_by_idx = self.predicted_iim.as_ref().map(|map| {
-                    resolve_predicted_iim(
-                        &db,
-                        map,
-                        self.parameters.precursor_charge.0,
-                        self.parameters.precursor_charge.1,
-                    )
-                });
+                // See this function's entry: chunked prefiltering can't use
+                // the positional predicted_rt/predicted_iim files at all.
+                let predicted_rt_by_idx: Option<Vec<Option<f32>>> = None;
+                let predicted_iim_by_idx: Option<Vec<Option<f32>>> = None;
 
                 let scorer = Scorer {
                     db: &db,
@@ -704,44 +734,51 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-        // Resolved once here, against the final `database` -- `Peptide::to_string()`
-        // (which itself does a `unimod::lookup_reverse` per modified residue)
-        // is real, measurable overhead when done per (candidate, spectrum)
-        // instead of once per peptide: a real F9477 comparison found combined
-        // RT+IIM eviction added +37% (152s) to `run_sage`'s wall time before
-        // this change. See `evict_rt_iim_mismatches` (`scoring.rs`) and
+        // Resolved once here, against the final `database` -- positional
+        // (row `i` = `database.peptides[i]`) since 2026-09-08, verified via
+        // a cheap `dumped_peptides_sha256` fingerprint check instead of the
+        // `Peptide::to_string()` (unimod-lookup-per-residue) + `HashMap`
+        // lookup this used to do per peptide (a real F9477 comparison found
+        // that combined RT+IIM resolution added +37%/152s to `run_sage`'s
+        // wall time). See `docs/ai/dumped_peptides_positional_predictions.md`,
+        // `evict_rt_iim_mismatches` (`scoring.rs`), and
         // plans/rt_iim_independent_dimensions.md.
         //
         // `.take()`, not `.as_ref()` -- `run()` owns `self` and this is the
-        // only remaining use of the raw string-keyed maps in this call
-        // path (unlike `prefilter_peptides`, which re-reads them once per
-        // fasta chunk and must keep borrowing instead). Taking them here
-        // moves the (String-keyed, real per-entry heap allocations) source
-        // maps into these closures, where they're dropped as soon as
-        // resolution finishes -- freeing them before the long per-file
-        // search loop below runs, rather than keeping both the raw and
-        // resolved forms alive for the rest of the run.
+        // only remaining use of the raw loaded (fingerprint, values) pairs
+        // in this call path (unlike `prefilter_peptides`, which can't use
+        // them at all -- see its own entry). Taking them here drops the
+        // source `Vec`s as soon as resolution finishes, before the long
+        // per-file search loop below runs.
         let predicted_rt_by_idx = self
             .predicted_rt
             .take()
-            .map(|map| resolve_predicted_rt(&self.database, &map));
-        let predicted_iim_by_idx = self.predicted_iim.take().map(|map| {
-            resolve_predicted_iim(
-                &self.database,
-                &map,
-                self.parameters.precursor_charge.0,
-                self.parameters.precursor_charge.1,
-            )
-        });
-        let predicted_fragment_intensity_by_idx =
-            self.predicted_fragment_intensity_index.take().map(|map| {
+            .map(|map| resolve_predicted_rt(&self.database, &map))
+            .transpose()?;
+        let predicted_iim_by_idx = self
+            .predicted_iim
+            .take()
+            .map(|map| {
+                resolve_predicted_iim(
+                    &self.database,
+                    &map,
+                    self.parameters.precursor_charge.0,
+                    self.parameters.precursor_charge.1,
+                )
+            })
+            .transpose()?;
+        let predicted_fragment_intensity_by_idx = self
+            .predicted_fragment_intensity_index
+            .take()
+            .map(|map| {
                 resolve_predicted_fragment_intensity(
                     &self.database,
                     &map,
                     self.parameters.precursor_charge.0,
                     self.parameters.precursor_charge.1,
                 )
-            });
+            })
+            .transpose()?;
         // Borrowed, not taken -- `Scorer` needs `&'db [u8]`/`&'db [f16]`
         // slices, and the owning `FragmentIntensityArrays` (with its mmap
         // handles) must stay alive on `self` for the rest of this run.

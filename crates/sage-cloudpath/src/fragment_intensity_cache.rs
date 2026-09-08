@@ -2,9 +2,14 @@
 //! (see `necromerge2`'s `docs/ai/predicted_fragment_intensity.md`).
 //!
 //! Two separate inputs, given as explicit paths:
-//!   - a small, job-scoped parquet index: `sequence`(utf8), `charge`(int32),
-//!     `start`/`end`(int64) — half-open row range into the shared arrays
-//!     below. Produced by `feature-prediction-export-fragments-for-sage`.
+//!   - a small, job-scoped parquet index, positional not `sequence`-keyed
+//!     since 2026-09-08 (see `docs/ai/dumped_peptides_positional_predictions.md`):
+//!     `start`/`end`(int64, sentinel -1 for "no cache entry") — half-open
+//!     row range into the shared arrays below, dense over
+//!     `(peptide_row, charge)` in the same layout `Scorer::iim_dense_slot`
+//!     uses. Produced by `feature-prediction-export-fragments-for-sage`.
+//!     Carries a `dumped_peptides_sha256` file metadata entry the caller
+//!     must check (see `dumped_peptides_fingerprint`).
 //!   - the shared, ever-growing `arrays.mmappet/` directory (schema.txt +
 //!     `0.bin`/`1.bin`, same on-disk format `pmsms.rs` reads for
 //!     `pmsms.mmappet`/precursors `.mmappet` -- schema/mmap-slice helpers
@@ -16,7 +21,6 @@
 
 #![cfg(feature = "parquet")]
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -35,6 +39,8 @@ pub enum FragmentIntensityCacheError {
     MissingColumn(&'static str),
     #[error("mmappet column {0} has dtype `{1}`, expected `{2}`")]
     WrongDtype(&'static str, String, &'static str),
+    #[error("{0} is missing required `dumped_peptides_sha256` file metadata -- regenerate it with a current `feature-prediction` build")]
+    MissingFingerprint(String),
 }
 
 fn col_idx(
@@ -48,33 +54,45 @@ fn col_idx(
         .ok_or(FragmentIntensityCacheError::MissingColumn(name))
 }
 
-/// Read the job-scoped `(sequence, charge) -> (start, end)` pointer index --
-/// see module docs. Values are permanent once written (the shared cache is
-/// append-only), so this map can be resolved once, up front, same as
-/// `predicted_properties::read_predicted_iim`.
+/// Read the job-scoped, dense `(peptide_row, charge) -> Option<(start,
+/// end)>` pointer index -- see module docs. Values are permanent once
+/// written (the shared cache is append-only), so this can be resolved
+/// once, up front, same as `predicted_properties::read_predicted_iim`.
+/// Returns the embedded `dumped_peptides` fingerprint alongside the dense
+/// values -- the caller must check it against the current run's own digest
+/// before trusting these positions.
 pub fn read_fragment_intensity_index(
     path: &Path,
-) -> Result<HashMap<(String, u8), (u64, u64)>, FragmentIntensityCacheError> {
+) -> Result<(String, Vec<Option<(u64, u64)>>), FragmentIntensityCacheError> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
+    let fingerprint = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .into_iter()
+        .flatten()
+        .find(|kv| kv.key == "dumped_peptides_sha256")
+        .and_then(|kv| kv.value.clone())
+        .ok_or_else(|| FragmentIntensityCacheError::MissingFingerprint(path.display().to_string()))?;
     let schema = reader.metadata().file_metadata().schema_descr();
 
-    let i_sequence = col_idx(schema, "sequence")?;
-    let i_charge = col_idx(schema, "charge")?;
     let i_start = col_idx(schema, "start")?;
     let i_end = col_idx(schema, "end")?;
 
-    let mut map = HashMap::new();
+    let mut values = Vec::with_capacity(reader.metadata().file_metadata().num_rows() as usize);
     for row in reader.get_row_iter(None)? {
         let row = row?;
-        let sequence = row.get_string(i_sequence)?.clone();
-        let charge = row.get_int(i_charge)? as u8;
-        let start = row.get_long(i_start)? as u64;
-        let end = row.get_long(i_end)? as u64;
-        map.insert((sequence, charge), (start, end));
+        let start = row.get_long(i_start)?;
+        let end = row.get_long(i_end)?;
+        values.push(if start < 0 {
+            None
+        } else {
+            Some((start as u64, end as u64))
+        });
     }
 
-    Ok(map)
+    Ok((fingerprint, values))
 }
 
 /// Parse an mmappet `schema.txt` into an ordered list of `(dtype, column
