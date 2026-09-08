@@ -97,7 +97,8 @@ fn main() -> anyhow::Result<()> {
 
     let decoy_tag = params.decoy_tag.clone();
     let generate_decoys = params.generate_decoys;
-    let peptides = params.digest(&fasta);
+    let mut peptides = params.digest(&fasta);
+    peptides.sort_by(|a, b| a.monoisotopic.total_cmp(&b.monoisotopic));
 
     log::info!("digested {} target/decoy peptides", peptides.len());
 

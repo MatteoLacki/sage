@@ -27,6 +27,7 @@ lives in `docs/ai/`, one file per topic:
 | `docs/ai/predicted_rt_iim.md` | `--predicted-rt`/`--predicted-iim` hard-eviction filtering, dense peptide-index lookup, external RT/IIM as LDA features, `combined_score` soft ranking penalty |
 | `docs/ai/predicted_fragment_intensity.md` | `--predicted-fragment-intensity-*`: optional MS2 fragment-intensity reader (job-scoped pointer parquet + shared `arrays.mmappet`), feature-only (no hard filter), `ms2_entropy_similarity` |
 | `docs/ai/unimod.md` | `[UNIMOD:<id>]` modification notation support (`crates/sage/src/unimod.rs`) |
+| `docs/ai/dump_peptides.md` | `dump_peptides` binary's mass-sorted output (for a separate consumer); necroflow's structural (not content-addressed) provenance hashing |
 
 Check `summarise/`-style freshness only matters for the top-level monorepo;
 within this vendored fork, treat each `docs/ai/*.md` file as current unless
