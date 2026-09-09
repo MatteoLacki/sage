@@ -77,3 +77,17 @@ mass-dependent window was solving a smaller, secondary effect. `page_search`
 still takes `fragment_tol` as an explicit per-call argument (general,
 independently useful — e.g. `wide_window` mode), just no longer varies it
 by mass.
+
+Separately, even taken on its own merits, mass-dependence wasn't worth its
+cost: per-m/z-bin residual spread (real F9477 confident targets) only
+diverged meaningfully from the ~5–6 ppm core below ~300 m/z (~7–8 ppm
+there, traced to real tof-quantization physics — a single tof step is
+already ~10-16 ppm of quantization noise below 300 m/z, vs ~5-7 ppm through
+the 500–1000 m/z bulk). That region is a real but minority slice of the
+fragment population (~8% of confident fragments below 300 m/z in this
+dataset) — not enough weight to justify a per-peak spline evaluation on
+every fragment match, an extra config surface, and the correctness risk
+that bit us above, for the whole run. (The high-m/z tail's apparent
+widening, by contrast, wasn't well-supported at all — driven by bins down
+to a few dozen points, noise rather than signal, not a reason to act on
+either.)
