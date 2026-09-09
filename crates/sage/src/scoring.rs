@@ -6,8 +6,13 @@ use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
 use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use half::f16;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+thread_local! {
+    static WINDOWS_SCRATCH: RefCell<Vec<(f32, Tolerance)>> = RefCell::new(Vec::new());
+}
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum ScoreType {
@@ -518,24 +523,39 @@ impl<'db> Scorer<'db> {
             preliminary: vec![PreScore::default(); potential],
         };
 
-        for peak in query.peaks.iter() {
-            for charge in 1..max_fragment_charge {
-                let mass = peak.mass * charge as f32;
-                for frag in candidates.page_search(mass, self.fragment_tol) {
-                    let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
-                    let sc = &mut hits.preliminary[idx];
-                    if sc.matched == 0 {
-                        hits.scored_candidates += 1;
-                        sc.precursor_charge = precursor_charge;
-                        sc.peptide = frag.peptide_index;
-                        sc.isotope_error = isotope_error;
-                    }
-
-                    sc.matched += 1;
-                    hits.matched_peaks += 1;
+        // Collect every (mass, fragment_tol) window for this whole
+        // spectrum (every peak x every fragment charge) up front, then
+        // search them in one batched call -- `page_search_batch` computes
+        // each page's precursor-scoped inner range once and reuses it
+        // across every window landing on that page, instead of redoing
+        // that binary search independently per (peak, charge) the way a
+        // `page_search` call per window did. `windows` is thread-local
+        // scratch, reused across calls, not freshly allocated each time
+        // (same reasoning as `page_search_batch`'s own internal scratch).
+        // See `docs/ai/reuse_index_bins.md`.
+        WINDOWS_SCRATCH.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows.clear();
+            for peak in query.peaks.iter() {
+                for charge in 1..max_fragment_charge {
+                    windows.push((peak.mass * charge as f32, self.fragment_tol));
                 }
             }
-        }
+
+            candidates.page_search_batch(&windows, |frag| {
+                let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
+                let sc = &mut hits.preliminary[idx];
+                if sc.matched == 0 {
+                    hits.scored_candidates += 1;
+                    sc.precursor_charge = precursor_charge;
+                    sc.peptide = frag.peptide_index;
+                    sc.isotope_error = isotope_error;
+                }
+
+                sc.matched += 1;
+                hits.matched_peaks += 1;
+            });
+        });
         if hits.matched_peaks == 0 {
             return hits;
         }

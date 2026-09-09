@@ -8,6 +8,7 @@ use dashmap::DashSet;
 use fnv::FnvBuildHasher;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -533,6 +534,102 @@ impl IndexedQuery<'_> {
             })
         })
     }
+
+    /// Batched `page_search`: search many `(mass, fragment_tol)` windows
+    /// (e.g. one spectrum's whole peak list x fragment-charge range) in one
+    /// call, computing each page's precursor-scoped `[inner_left,
+    /// inner_right)` binary search only once and reusing it across every
+    /// window that overlaps that page -- repeated `page_search` calls
+    /// recompute this independently per window even though it only depends
+    /// on `(page, pre_idx_lo, pre_idx_hi)`, and `pre_idx_lo`/`pre_idx_hi`
+    /// are fixed for this whole `IndexedQuery`. Windows need not be
+    /// pre-sorted (page numbers are sorted internally), though in practice
+    /// callers already have them sorted by mass (spectra peaks are), which
+    /// keeps that sort near-free.
+    ///
+    /// Takes a callback instead of returning a `Vec` -- matches stream to
+    /// `on_match` as found, same zero-allocation-for-results shape
+    /// `page_search`'s lazy iterator chain had (a first version collected
+    /// into an owned `Vec<&Theoretical>`, which turned out to cost more,
+    /// on typical low-peak-sharing spectra, than the inner-search reuse
+    /// saved -- see `docs/ai/reuse_index_bins.md`). The two remaining
+    /// internal scratch buffers (`bounds`, `page_window`) are thread-local
+    /// and reused across calls -- rayon's worker threads are long-lived
+    /// OS threads, so this persists correctly across the many spectra one
+    /// worker processes, without needing to thread a buffer through every
+    /// call site by hand.
+    pub fn page_search_batch(&self, windows: &[(f32, Tolerance)], mut on_match: impl FnMut(&Theoretical)) {
+        let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
+
+        PAGE_SEARCH_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let PageSearchScratch { bounds, page_window } = &mut *scratch;
+            bounds.clear();
+            page_window.clear();
+
+            for (wi, &(mass, fragment_tol)) in windows.iter().enumerate() {
+                let (fragment_lo, fragment_hi) = fragment_tol.bounds(mass);
+                bounds.push((fragment_lo, fragment_hi));
+
+                let (left_page, right_page) = binary_search_slice(
+                    &self.db.min_value,
+                    |min, b| min.total_cmp(b),
+                    fragment_lo,
+                    fragment_hi,
+                );
+                for page in left_page..right_page {
+                    page_window.push((page, wi));
+                }
+            }
+            page_window.sort_unstable_by_key(|&(page, _)| page);
+
+            let mut i = 0;
+            while i < page_window.len() {
+                let page = page_window[i].0;
+                let left_idx = page * self.db.bucket_size;
+                let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.fragments.len());
+                let slice = &self.db.fragments[left_idx..right_idx];
+
+                let (inner_left, inner_right) = binary_search_slice(
+                    slice,
+                    |frag, b| (frag.peptide_index.0 as usize).cmp(b),
+                    self.pre_idx_lo,
+                    self.pre_idx_hi,
+                );
+                let inner_slice = &slice[inner_left..inner_right];
+
+                let mut j = i;
+                while j < page_window.len() && page_window[j].0 == page {
+                    let (fragment_lo, fragment_hi) = bounds[page_window[j].1];
+                    for frag in inner_slice.iter() {
+                        if (frag.peptide_index.0 > self.pre_idx_lo as u32
+                            || (frag.peptide_index.0 == self.pre_idx_lo as u32
+                                && self.db[frag.peptide_index].monoisotopic >= precursor_lo))
+                            && (frag.peptide_index.0 < self.pre_idx_hi as u32
+                                || (frag.peptide_index.0 == self.pre_idx_hi as u32
+                                    && self.db[frag.peptide_index].monoisotopic <= precursor_hi))
+                            && frag.fragment_mz >= fragment_lo
+                            && frag.fragment_mz <= fragment_hi
+                        {
+                            on_match(frag);
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+        });
+    }
+}
+
+#[derive(Default)]
+struct PageSearchScratch {
+    bounds: Vec<(f32, f32)>,
+    page_window: Vec<(usize, usize)>,
+}
+
+thread_local! {
+    static PAGE_SEARCH_SCRATCH: RefCell<PageSearchScratch> = RefCell::new(PageSearchScratch::default());
 }
 
 /// Return the widest `left` and `right` indices into a `slice` (sorted by the
