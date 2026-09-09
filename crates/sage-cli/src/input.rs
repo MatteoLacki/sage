@@ -4,7 +4,7 @@ use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::util::PmsmsPaths;
 use sage_cloudpath::Url;
 use sage_core::scoring::{RankingScore, ScoreType};
-use sage_core::spline::{FragmentTolSpline, LinearSpline, ValueTolSpline};
+use sage_core::spline::{LinearSpline, ValueTolSpline};
 use sage_core::{
     database::{Builder, Parameters},
     lfq::LfqSettings,
@@ -21,7 +21,6 @@ pub struct Search {
     pub quant: QuantSettings,
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
-    pub fragment_tol_spline: Option<FragmentTolSpline>,
     /// Predicted-RT/IIM candidate filtering — see `predicted_rt`/
     /// `predicted_iim` docs on [`Input`]. Independent of `predicted_iim`.
     /// `rt_tol`'s spline *values* here are already converted to minutes;
@@ -93,7 +92,6 @@ pub struct Input {
     pub database: Builder,
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
-    pub fragment_tol_spline: Option<FragmentTolSpline>,
     pub report_psms: Option<usize>,
     pub chimera: Option<bool>,
     pub wide_window: Option<bool>,
@@ -578,19 +576,6 @@ impl Input {
                 .map_err(|e| anyhow::anyhow!("invalid `mobility_tol`: {e}"))?;
         }
 
-        if let Some(spline) = &self.fragment_tol_spline {
-            spline
-                .validate()
-                .map_err(|e| anyhow::anyhow!("invalid `fragment_tol_spline`: {e}"))?;
-            log::warn!(
-                "Both `fragment_tol` and `fragment_tol_spline` are set — \
-                 `fragment_tol_spline` takes over fragment matching entirely \
-                 (including outside its grid range, via flat extrapolation); \
-                 `fragment_tol` is only used for its own sanity-check warnings \
-                 above and is otherwise unused."
-            );
-        }
-
         if let Some(isotope_errors) = self.isotope_errors {
             if isotope_errors.0 > isotope_errors.1 {
                 log::error!("Minimum isotope_error value greater than maximum! Typical usage: `isotope_errors: [-1, 3]`");
@@ -678,7 +663,6 @@ impl Input {
             output_directory,
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
-            fragment_tol_spline: self.fragment_tol_spline,
             predicted_rt: self.predicted_rt,
             predicted_iim: self.predicted_iim,
             rt_tol: self.rt_tol_sec.map(Self::rt_tol_sec_to_minutes),
@@ -747,95 +731,16 @@ mod test {
         Ok(())
     }
 
-    /// Minimal `log::Log` implementor that captures messages into a `Vec`,
-    /// so tests can assert on a specific `log::warn!` without depending on
-    /// a log-capturing crate. `log::set_logger` only succeeds once per
-    /// process; safe here since no other test in this binary installs one.
-    struct CapturingLogger {
-        messages: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl log::Log for CapturingLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record) {
-            self.messages
-                .lock()
-                .unwrap()
-                .push(record.args().to_string());
-        }
-        fn flush(&self) {}
-    }
-
-    fn install_capturing_logger() -> &'static CapturingLogger {
-        static LOGGER: std::sync::OnceLock<CapturingLogger> = std::sync::OnceLock::new();
-        let logger = LOGGER.get_or_init(|| CapturingLogger {
-            messages: std::sync::Mutex::new(Vec::new()),
-        });
-        let _ = log::set_logger(logger);
-        log::set_max_level(log::LevelFilter::Warn);
-        logger
-    }
-
-    fn mk_input_json(fragment_tol_spline: Option<serde_json::Value>) -> serde_json::Value {
+    fn mk_input_json() -> serde_json::Value {
         // `Input::build` resolves `mzml_paths`/`database.fasta` to real
         // filesystem paths (canonicalize), so both must exist — reuse the
         // fixtures already committed for `sage-cli`'s other tests.
-        let mut json = serde_json::json!({
+        serde_json::json!({
             "database": {"fasta": "../../tests/Q99536.fasta"},
             "precursor_tol": {"ppm": [-10.0, 10.0]},
             "fragment_tol": {"ppm": [-10.0, 10.0]},
             "mzml_paths": ["../../tests/LQSRPAAPPAPGPGQLTLR.mzML"],
-        });
-        if let Some(spline) = fragment_tol_spline {
-            json["fragment_tol_spline"] = spline;
-        }
-        json
-    }
-
-    fn flat_spline_json() -> serde_json::Value {
-        serde_json::json!({
-            "ppm_lo": {"grid_start": 0.0, "grid_step": 100.0, "values": [-10.0, -10.0]},
-            "ppm_hi": {"grid_start": 0.0, "grid_step": 100.0, "values": [10.0, 10.0]},
         })
-    }
-
-    // Both scenarios live in one #[test] (rather than two) because they
-    // share one process-global logger — cargo runs tests in the same
-    // binary in parallel by default, and two tests independently
-    // clear()-ing/reading that shared buffer would race.
-    #[test]
-    fn fragment_tol_spline_warning_only_fires_when_spline_is_set() {
-        let logger = install_capturing_logger();
-
-        logger.messages.lock().unwrap().clear();
-        let input: Input = serde_json::from_value(mk_input_json(None)).unwrap();
-        input.build().expect("valid config should build");
-        assert!(
-            !logger
-                .messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|m| m.contains("fragment_tol_spline")),
-            "expected no fragment_tol_spline warning when spline is unset"
-        );
-
-        logger.messages.lock().unwrap().clear();
-        let input: Input =
-            serde_json::from_value(mk_input_json(Some(flat_spline_json()))).unwrap();
-        input
-            .build()
-            .expect("both set is a warning, not a build error");
-        let messages = logger.messages.lock().unwrap();
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("fragment_tol") && m.contains("fragment_tol_spline")),
-            "expected a warning naming both `fragment_tol` and `fragment_tol_spline`, got: {:?}",
-            *messages
-        );
     }
 
     fn mk_predicted_json(
@@ -866,7 +771,7 @@ mod test {
         mobility_tol: Option<serde_json::Value>,
         iim_sigma: Option<f32>,
     ) -> serde_json::Value {
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         if let Some(path) = predicted_rt {
             json["predicted_rt"] = serde_json::json!(path);
         }
@@ -1117,7 +1022,7 @@ mod test {
 
     #[test]
     fn no_predicted_rt_iim_no_tolerance_error() {
-        let json = mk_input_json(None);
+        let json = mk_input_json();
         let input: Input = serde_json::from_value(json).unwrap();
         input
             .build()
@@ -1127,12 +1032,10 @@ mod test {
     /// Only test in this binary that resolves a `UNIMOD:<id>` reference --
     /// `sage_core::unimod`'s reverse table is a process-global `OnceLock`,
     /// settable once; a second test doing the same would race/conflict
-    /// with cargo's default parallel-in-one-process test execution (same
-    /// reason `fragment_tol_spline_warning_only_fires_when_spline_is_set`
-    /// above combines two scenarios into one test).
+    /// with cargo's default parallel-in-one-process test execution.
     #[test]
     fn unimod_reference_resolves_to_embedded_table_mass() {
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         json["database"]["static_mods"] = serde_json::json!({"C": "UNIMOD:4"});
         resolve_unimod_refs(&mut json).expect("UNIMOD:4 should resolve against the embedded table");
 
@@ -1151,7 +1054,7 @@ mod test {
 
     #[test]
     fn unknown_unimod_id_errors() {
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         json["database"]["static_mods"] = serde_json::json!({"C": "UNIMOD:999999999"});
         let err = resolve_unimod_refs(&mut json).expect_err("unknown UNIMOD id should error");
         assert!(
@@ -1162,7 +1065,7 @@ mod test {
 
     #[test]
     fn non_unimod_string_mod_errors_clearly() {
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         json["database"]["static_mods"] = serde_json::json!({"C": "not-a-unimod-ref"});
         let err = resolve_unimod_refs(&mut json).expect_err("non-UNIMOD string should error");
         assert!(
@@ -1176,7 +1079,7 @@ mod test {
         // Same value real job configs actually write for Carbamidomethyl
         // (see plans/) -- close to, but not bit-identical to, the
         // canonical 57.021464.
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         json["database"]["static_mods"] = serde_json::json!({"C": 57.0216});
         let err = resolve_unimod_refs(&mut json)
             .expect_err("a float coinciding with a real Unimod entry should error");
@@ -1188,7 +1091,7 @@ mod test {
 
     #[test]
     fn plain_float_not_coinciding_with_anything_is_unaffected() {
-        let mut json = mk_input_json(None);
+        let mut json = mk_input_json();
         // Not close to any real Unimod entry.
         json["database"]["static_mods"] = serde_json::json!({"C": 12345.6789});
         resolve_unimod_refs(&mut json).expect("a genuinely novel mass should pass through");

@@ -56,46 +56,24 @@ Column reading lives in `crates/sage-cloudpath/src/pmsms.rs` (parquet and
 mmappet paths both use an *optional* column lookup — missing column is
 `None`, not an error, unlike the 7 required columns).
 
-## Per-fragment ppm tolerance (mass-dependent, spline-based)
+## Per-fragment ppm tolerance: mass-dependent spline tried, then removed (2026-09)
 
-`Scorer::fragment_tol_spline: Option<FragmentTolSpline>`
-(`crates/sage/src/spline.rs`) lets the fragment ppm window vary with
-fragment mass instead of being one flat `fragment_tol` for the whole run —
-given as two independent `LinearSpline`s (`ppm_lo`, `ppm_hi`), each a
-piecewise-linear function sampled on an equally spaced grid. Extrapolation
-outside the grid range is controlled by `LinearSpline::extrapolation`
-(`Extrapolation::Flat` — the default, and `FragmentTolSpline`'s own current
-usage — clamps to the nearest edge value; `Extrapolation::Linear` continues
-the boundary segment's slope instead, added for `git/featureprediction`'s
-Python `LinearSpline` port — see that repo's `AI.md` — which needed the
-opposite default). Missing `extrapolation` in a JSON config deserializes to
-`Flat`, so existing configs are unaffected. `None` fragment_tol_spline (the
-default — no JSON config key at all) behaves exactly as before this existed.
-Design/history: `necromerge2`'s `plans/per_fragment_ppm_tolerance.md`.
-
-Configured via `Input`/`Search`'s `fragment_tol_spline` JSON field
-(`crates/sage-cli/src/input.rs`), validated once in `Input::build()`
-(non-empty grid, positive `grid_step`).
-
-Evaluated **per observed peak**, at the peak's own mass, in
-`crates/sage/src/scoring.rs`, at all three places fragment matching happens
-against `self.fragment_tol`:
-- `Scorer::matched_peaks_with_isotope` (the preliminary candidate search —
-  observed peak known, spline evaluated at `peak.mass`),
-- `Scorer::score_candidate` (the final per-candidate hyperscore pass, which
-  walks *theoretical* ions and searches for a matching peak — spline
-  evaluated at the theoretical `mz` instead, since the observed peak isn't
-  known yet; a genuine match differs from theoretical by less than the
-  tolerance width itself, so this is equivalent in practice),
-- `Scorer::remove_matched_peaks` (chimera-mode peak stripping between
-  passes).
-
-**All three must stay in sync** — the preliminary pass alone finding a
-candidate isn't sufficient; `score_candidate`'s independent re-match (using
-a stale flat `self.fragment_tol`) will silently zero out `matched_b`/`matched_y`
-and drop the candidate even though the preliminary pass found it. (This bit
-us during implementation — the reachability integration test caught it.)
-
-`IndexedQuery::page_search` (`crates/sage/src/database.rs`) takes the
-tolerance as an explicit argument rather than reading a fixed one baked into
-the query, specifically so callers can vary it per call.
+A `Scorer::fragment_tol_spline: Option<FragmentTolSpline>` existed briefly
+(`crates/sage/src/spline.rs`, design in `necromerge2`'s
+`plans/per_fragment_ppm_tolerance.md`), letting the fragment ppm window vary
+with fragment mass instead of one flat `fragment_tol`. Dropped — never wired
+into any real job config here — after real-data analysis (real F9477
+confident-PSM fragment residuals, `git/searchops`'s `recalibrate_pmsms_mz`
+fit) found two problems with it: it was evaluated at `peak.mass` (already
+charge-corrected neutral mass) while the calibration it would have needed to
+follow is fit on raw experimental *m/z*, a real mismatch; and the bigger
+finding — the *existing* flat tolerance's own calibration was itself biased,
+because the initial SAGE pass's narrow capture window (±15 ppm) truncates
+the true residual distribution before `_select_tolerance` ever sees it
+(confirmed: widening to ±25 ppm recovered ~4.4% more confident fragments and
+revealed materially wider true tails, ~19–24 ppm vs the ±15 ppm window's own
+edge). Fixing that truncation is the more consequential change; a
+mass-dependent window was solving a smaller, secondary effect. `page_search`
+still takes `fragment_tol` as an explicit per-call argument (general,
+independently useful — e.g. `wide_window` mode), just no longer varies it
+by mass.

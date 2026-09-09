@@ -6,7 +6,7 @@ use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
 use sage_core::scoring::{RankingScore, ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
-use sage_core::spline::{Extrapolation, FragmentTolSpline, LinearSpline, ValueTolSpline};
+use sage_core::spline::{Extrapolation, LinearSpline, ValueTolSpline};
 
 const FASTA: &'static str = r#"
 >sp|Q99536|VAT1_HUMAN Synaptic vesicle membrane protein VAT-1 homolog OS=Homo sapiens OX=9606 GN=VAT1 PE=1 SV=2
@@ -115,25 +115,11 @@ fn target_peaks(db: &IndexedDatabase) -> (PeptideIx, Vec<Peak>) {
     (target_idx, peaks)
 }
 
-fn mk_scorer(
-    db: &IndexedDatabase,
-    precursor_tol: Tolerance,
-    fragment_tol_spline: Option<FragmentTolSpline>,
-) -> Scorer<'_> {
-    mk_scorer_with_fragment_tol(db, precursor_tol, Tolerance::Da(-0.01, 0.01), fragment_tol_spline)
-}
-
-fn mk_scorer_with_fragment_tol(
-    db: &IndexedDatabase,
-    precursor_tol: Tolerance,
-    fragment_tol: Tolerance,
-    fragment_tol_spline: Option<FragmentTolSpline>,
-) -> Scorer<'_> {
+fn mk_scorer(db: &IndexedDatabase, precursor_tol: Tolerance) -> Scorer<'_> {
     Scorer {
         db,
         precursor_tol,
-        fragment_tol,
-        fragment_tol_spline,
+        fragment_tol: Tolerance::Da(-0.01, 0.01),
         min_matched_peaks: 1,
         min_isotope_err: 0,
         max_isotope_err: 0,
@@ -192,7 +178,7 @@ fn candidate_unreachable_without_custom_window() {
         ..Default::default()
     };
 
-    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0), None);
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
     let features = scorer.score_standard(&query);
     assert!(
         features.is_empty(),
@@ -228,7 +214,7 @@ fn candidate_reachable_with_wide_custom_window() {
     };
 
     // Same narrow global tol as the "unreachable" test above.
-    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0), None);
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
     let features = scorer.score_standard(&query);
     assert_eq!(
         features.len(),
@@ -236,34 +222,6 @@ fn candidate_reachable_with_wide_custom_window() {
         "wide per-precursor window should reach the 30 ppm-off candidate"
     );
     assert_eq!(features[0].peptide_idx, target_idx);
-}
-
-/// Shift every fragment peak's mass by `offset_ppm`, simulating a spectrum
-/// whose fragments are all systematically off by a constant relative error
-/// (what a mass-dependent calibration spline is meant to correct for).
-fn shift_peaks(peaks: &[Peak], offset_ppm: f32) -> Vec<Peak> {
-    peaks
-        .iter()
-        .map(|p| Peak {
-            mass: p.mass * (1.0 + offset_ppm / 1_000_000.0),
-            intensity: p.intensity,
-        })
-        .collect()
-}
-
-/// A flat (constant-valued) spline covering any plausible fragment mass in
-/// these tests, ±`ppm` on both edges.
-fn flat_fragment_tol_spline(ppm: f32) -> FragmentTolSpline {
-    let flat = |sign: f32| LinearSpline {
-        grid_start: 0.0,
-        grid_step: 2000.0,
-        values: vec![sign * ppm, sign * ppm],
-        extrapolation: Extrapolation::Flat,
-    };
-    FragmentTolSpline {
-        ppm_lo: flat(-1.0),
-        ppm_hi: flat(1.0),
-    }
 }
 
 /// A flat (value-independent) `ValueTolSpline`, `[lo, hi]` everywhere --
@@ -294,95 +252,6 @@ fn flat_linear_spline(value: f32) -> LinearSpline {
         values: vec![value, value],
         extrapolation: Extrapolation::Flat,
     }
-}
-
-/// All fragment peaks shifted 100 ppm off their theoretical masses are
-/// unreachable under a narrow flat `fragment_tol` (±5 ppm) with no spline —
-/// this is the pre-existing, unchanged behavior.
-#[test]
-fn candidate_unreachable_without_fragment_tol_spline() {
-    let db = mk_ppm_window_database();
-    let (target_idx, real_peaks) = target_peaks(&db);
-    assert!(
-        !real_peaks.is_empty(),
-        "expected real fragment peaks for target"
-    );
-    let peaks = shift_peaks(&real_peaks, 100.0);
-
-    let target_mass = db[target_idx].monoisotopic;
-    let mz = shifted_precursor_mz(target_mass, 0.0);
-    let precursor = Precursor {
-        mz,
-        charge: Some(1),
-        isolation_window: None,
-        ..Default::default()
-    };
-    let query = ProcessedSpectrum {
-        level: 2,
-        id: "no-spline".into(),
-        precursors: vec![precursor],
-        peaks,
-        ..Default::default()
-    };
-
-    let scorer = mk_scorer_with_fragment_tol(
-        &db,
-        Tolerance::Ppm(-50.0, 50.0),
-        Tolerance::Ppm(-5.0, 5.0),
-        None,
-    );
-    let features = scorer.score_standard(&query);
-    assert!(
-        features.is_empty(),
-        "narrow flat fragment_tol should not reach fragments 100 ppm away"
-    );
-}
-
-/// The same 100 ppm-shifted fragments ARE reachable once a
-/// `fragment_tol_spline` wide enough to cover the shift is configured, even
-/// though the flat `fragment_tol` is unchanged (and still too narrow on its
-/// own) — this exercises `Scorer::fragment_tol_spline` overriding the flat
-/// tolerance per observed peak.
-#[test]
-fn candidate_reachable_with_fragment_tol_spline() {
-    let db = mk_ppm_window_database();
-    let (target_idx, real_peaks) = target_peaks(&db);
-    assert!(
-        !real_peaks.is_empty(),
-        "expected real fragment peaks for target"
-    );
-    let peaks = shift_peaks(&real_peaks, 100.0);
-
-    let target_mass = db[target_idx].monoisotopic;
-    let mz = shifted_precursor_mz(target_mass, 0.0);
-    let precursor = Precursor {
-        mz,
-        charge: Some(1),
-        isolation_window: None,
-        ..Default::default()
-    };
-    let query = ProcessedSpectrum {
-        level: 2,
-        id: "with-spline".into(),
-        precursors: vec![precursor],
-        peaks,
-        ..Default::default()
-    };
-
-    // Same narrow flat fragment_tol as the "unreachable" test above.
-    let scorer = mk_scorer_with_fragment_tol(
-        &db,
-        Tolerance::Ppm(-50.0, 50.0),
-        Tolerance::Ppm(-5.0, 5.0),
-        Some(flat_fragment_tol_spline(150.0)),
-    );
-    let features = scorer.score_standard(&query);
-    assert_eq!(
-        features.len(),
-        1,
-        "fragment_tol_spline covering the 100 ppm shift should reach the candidate"
-    );
-    assert_eq!(features[0].peptide_idx, target_idx);
 }
 
 /// A candidate whose entry in `predicted_rt` gives it a predicted RT far
@@ -419,7 +288,7 @@ fn candidate_unreachable_outside_rt_tol() {
     let mut predicted_rt = vec![None; db.peptides.len()];
     predicted_rt[target_idx.0 as usize] = Some(15.0f32); // far outside [9.8, 10.2]
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     scorer.predicted_iim = None;
@@ -465,7 +334,7 @@ fn candidate_reachable_within_rt_tol() {
     let mut predicted_rt = vec![None; db.peptides.len()];
     predicted_rt[target_idx.0 as usize] = Some(10.05f32); // inside [9.8, 10.2]
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     scorer.predicted_iim = None;
@@ -515,7 +384,7 @@ fn delta_rt_z2_external_computed_from_sigma() {
     let mut predicted_rt = vec![None; db.peptides.len()];
     predicted_rt[target_idx.0 as usize] = Some(10.05f32);
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     scorer.rt_sigma = Some(flat_linear_spline(0.1)); // minutes, same unit as rt_tol's converted values
@@ -562,7 +431,7 @@ fn delta_rt_z2_external_zero_without_sigma() {
     let mut predicted_rt = vec![None; db.peptides.len()];
     predicted_rt[target_idx.0 as usize] = Some(10.05f32);
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-0.2, 0.2));
     // scorer.rt_sigma left None
@@ -603,7 +472,7 @@ fn candidate_unreachable_outside_iim_tol() {
     let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
     predicted_iim[slot] = Some(1.5f32); // far outside [0.9, 1.1]
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_iim = Some(&predicted_iim);
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.predicted_rt = None;
@@ -644,7 +513,7 @@ fn candidate_reachable_within_iim_tol() {
     let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
     predicted_iim[slot] = Some(1.05f32); // inside [0.9, 1.1]
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_iim = Some(&predicted_iim);
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.predicted_rt = None;
@@ -689,7 +558,7 @@ fn delta_ims_z2_external_computed_from_sigma() {
     let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
     predicted_iim[slot] = Some(1.05f32);
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.predicted_iim = Some(&predicted_iim);
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.iim_sigma = Some(0.02); // unitless (1/K0), no conversion
@@ -783,7 +652,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
     predicted_rt[iso1.0 as usize] = Some(11.0f32);
     predicted_rt[iso2.0 as usize] = Some(10.0f32);
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.report_psms = 2;
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));
@@ -864,7 +733,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
     predicted_rt[iso1.0 as usize] = Some(11.0f32);
     predicted_rt[iso2.0 as usize] = Some(10.0f32);
 
-    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0), None);
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
     scorer.report_psms = 2;
     scorer.predicted_rt = Some(&predicted_rt);
     scorer.rt_tol = Some(flat_value_tol_spline(-5.0, 5.0));

@@ -737,9 +737,7 @@ mod test {
     /// Only test in this crate's `--lib` binary that calls
     /// `unimod::set_reverse_table` -- it's a process-global `OnceLock`,
     /// settable once; a second test doing the same would race/conflict
-    /// with cargo's default parallel-in-one-process test execution (same
-    /// reason `sage-cli`'s `fragment_tol_spline_warning_only_fires_when_spline_is_set`
-    /// combines two scenarios sharing a global into one test).
+    /// with cargo's default parallel-in-one-process test execution.
     #[test]
     fn display_round_trips_unimod_reference_but_not_plain_float() {
         use ModificationSpecificity::*;

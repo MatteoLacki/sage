@@ -4,9 +4,8 @@ use crate::mass::Tolerance;
 
 /// Behavior of [`LinearSpline::eval`] outside the fitted grid range.
 ///
-/// `Flat` is the default (and `FragmentTolSpline`'s existing, already-shipped
-/// behavior — missing this field in a JSON config deserializes to `Flat`, so
-/// existing configs are unaffected). `Linear` extends the boundary segment's
+/// `Flat` is the default — missing this field in a JSON config deserializes
+/// to `Flat`, so existing configs are unaffected. `Linear` extends the boundary segment's
 /// slope instead of clamping — used by the RT/IIM calibration spline
 /// (`git/featureprediction`'s Python `LinearSpline`, same option, ported
 /// independently since Rust/Python can't share code — see that repo's AI.md).
@@ -85,33 +84,11 @@ impl LinearSpline {
     }
 }
 
-/// Fragment ppm tolerance as a function of fragment mass, given as two
-/// independent linear splines for the lower/left and upper/right edges of
-/// the ppm window (asymmetric error distributions are expected, same as
-/// `Tolerance::Ppm(lo, hi)`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FragmentTolSpline {
-    pub ppm_lo: LinearSpline,
-    pub ppm_hi: LinearSpline,
-}
-
-impl FragmentTolSpline {
-    pub fn validate(&self) -> Result<(), String> {
-        self.ppm_lo.validate()?;
-        self.ppm_hi.validate()?;
-        Ok(())
-    }
-
-    pub fn tolerance_at(&self, mass: f32) -> Tolerance {
-        Tolerance::Ppm(self.ppm_lo.eval(mass), self.ppm_hi.eval(mass))
-    }
-}
-
 /// An absolute-unit tolerance window (`Tolerance::Da`) as a function of one
 /// observed value, given as two independent linear splines for the
-/// lower/upper edges — same shape as [`FragmentTolSpline`], deliberately
-/// generic (not `RtTolSpline`/`MobilityTolSpline` as separate near-duplicate
-/// types) since RT and IIM tolerance are structurally and behaviorally
+/// lower/upper edges — deliberately generic (not `RtTolSpline`/
+/// `MobilityTolSpline` as separate near-duplicate types) since RT and IIM
+/// tolerance are structurally and behaviorally
 /// identical: evaluated against one observed `f32` (`ProcessedSpectrum::
 /// scan_start_time` for RT, `Precursor::inverse_ion_mobility` for IIM),
 /// producing a `Tolerance::Da`. A flat (value-independent) window is simply
@@ -247,31 +224,6 @@ mod test {
             extrapolation: Extrapolation::Flat,
         };
         assert!(s.validate().is_err());
-    }
-
-    #[test]
-    fn fragment_tol_spline_tolerance_at() {
-        let fts = FragmentTolSpline {
-            ppm_lo: LinearSpline {
-                grid_start: 0.0,
-                grid_step: 10.0,
-                values: vec![-5.0, -10.0],
-                extrapolation: Extrapolation::Flat,
-            },
-            ppm_hi: LinearSpline {
-                grid_start: 0.0,
-                grid_step: 10.0,
-                values: vec![5.0, 20.0],
-                extrapolation: Extrapolation::Flat,
-            },
-        };
-        match fts.tolerance_at(5.0) {
-            Tolerance::Ppm(lo, hi) => {
-                assert_eq!(lo, -7.5);
-                assert_eq!(hi, 12.5);
-            }
-            other => panic!("expected Ppm, got {other:?}"),
-        }
     }
 
     #[test]

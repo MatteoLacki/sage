@@ -471,8 +471,7 @@ pub struct IndexedQuery<'d> {
 impl IndexedQuery<'_> {
     /// Search for a specified `fragment_mz` within the database, using an
     /// explicit `fragment_tol` (rather than a fixed one baked into the
-    /// query) so callers can vary it per fragment/peak — e.g. a mass-
-    /// dependent tolerance from [`crate::spline::FragmentTolSpline`].
+    /// query) so callers can vary it per call.
     pub fn page_search(
         &self,
         mass: f32,

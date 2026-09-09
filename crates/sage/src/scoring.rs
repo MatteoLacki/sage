@@ -4,7 +4,6 @@ use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
 use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
-use crate::spline::FragmentTolSpline;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
@@ -304,10 +303,6 @@ pub struct Scorer<'db> {
     pub db: &'db IndexedDatabase,
     pub precursor_tol: Tolerance,
     pub fragment_tol: Tolerance,
-    /// Optional mass-dependent fragment tolerance, evaluated per observed
-    /// peak. When set, overrides `fragment_tol` for every peak; when
-    /// `None`, behavior is unchanged from `fragment_tol` alone.
-    pub fragment_tol_spline: Option<FragmentTolSpline>,
     /// What is the minimum number of matched b and y ion peaks to report PSMs for?
     pub min_matched_peaks: u16,
     /// Precursor isotope error lower bounds (e.g. -1)
@@ -524,18 +519,9 @@ impl<'db> Scorer<'db> {
         };
 
         for peak in query.peaks.iter() {
-            // Evaluated once per observed peak (against its raw mass, not the
-            // charge-multiplied candidate mass) — a mass-dependent tolerance is
-            // calibrated against what was actually measured.
-            let fragment_tol = self
-                .fragment_tol_spline
-                .as_ref()
-                .map(|spline| spline.tolerance_at(peak.mass))
-                .unwrap_or(self.fragment_tol);
-
             for charge in 1..max_fragment_charge {
                 let mass = peak.mass * charge as f32;
-                for frag in candidates.page_search(mass, fragment_tol) {
+                for frag in candidates.page_search(mass, self.fragment_tol) {
                     let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
                     let sc = &mut hits.preliminary[idx];
                     if sc.matched == 0 {
@@ -994,13 +980,12 @@ impl<'db> Scorer<'db> {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
-                let fragment_tol = self
-                    .fragment_tol_spline
-                    .as_ref()
-                    .map(|spline| spline.tolerance_at(mz))
-                    .unwrap_or(self.fragment_tol);
-                if let Some(i) =
-                    crate::spectrum::select_most_intense_peak(&query.peaks, mz, fragment_tol, None)
+                if let Some(i) = crate::spectrum::select_most_intense_peak(
+                    &query.peaks,
+                    mz,
+                    self.fragment_tol,
+                    None,
+                )
                 {
                     to_remove.push(query.peaks[i]);
                 }
@@ -1128,21 +1113,10 @@ impl<'db> Scorer<'db> {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
 
-                // Same fallback as the preliminary search pass — evaluated at
-                // the theoretical mz since the observed peak isn't known yet
-                // (that's what we're searching for); a genuine match differs
-                // from theoretical by less than the tolerance width itself,
-                // so this is equivalent in practice.
-                let fragment_tol = self
-                    .fragment_tol_spline
-                    .as_ref()
-                    .map(|spline| spline.tolerance_at(mz))
-                    .unwrap_or(self.fragment_tol);
-
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
                     mz,
-                    fragment_tol,
+                    self.fragment_tol,
                     None,
                 ) {
                     let peak = &query.peaks[i];

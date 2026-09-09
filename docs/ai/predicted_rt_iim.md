@@ -31,8 +31,8 @@ the FDR level, and let RT-only filtering skip IM2Deep's Koina call entirely
 (a real ~57-minute-per-run cost on a full human proteome, not just an
 ablation nicety).
 
-Both fields are `ValueTolSpline` (`crates/sage/src/spline.rs`) — the same
-two-independent-`LinearSpline` (`lo`/`hi`) shape as `FragmentTolSpline`,
+Both fields are `ValueTolSpline` (`crates/sage/src/spline.rs`) — two
+independent `LinearSpline`s (`lo`/`hi`),
 evaluated against one observed value (`ProcessedSpectrum::scan_start_time`
 for RT, `Precursor::inverse_ion_mobility` for IIM) rather than a flat
 `Tolerance::Da`. Deliberately generic (not `RtTolSpline`/`MobilityTolSpline`)
