@@ -192,6 +192,13 @@ pub fn select_most_intense_peak(
 
     let mut best_idx = None;
     let mut max_int = 0.0;
+    // `binary_search_slice`'s left bound can overshoot by one element --
+    // needed for correctness when it's used on a coarse per-bucket summary
+    // (e.g. `page_search`'s outer search over `min_value`), where an exact
+    // lower bound could skip a bucket that still straddles it. `peaks` is a
+    // flat, fully-sorted array, so this re-check is redundant here, but
+    // re-checking unconditionally keeps `binary_search_slice` one shared,
+    // uniformly-safe helper instead of two near-identical variants.
     for (idx, peak) in peaks[i..j]
         .iter()
         .enumerate()
