@@ -1,8 +1,9 @@
 use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx};
 use crate::heap::bounded_min_heapify;
-use crate::ion_series::{IonSeries, Kind};
+use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
+use crate::peptide::Peptide;
 use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -986,17 +987,11 @@ impl<'db> Scorer<'db> {
     /// Remove peaks matching a PSM from a query spectrum
     fn remove_matched_peaks(&self, query: &mut ProcessedSpectrum<Peak>, psm: &Feature) {
         let peptide = &self.db[psm.peptide_idx];
-        let fragments = self
-            .db
-            .ion_kinds
-            .iter()
-            .flat_map(|kind| IonSeries::new(peptide, *kind));
-
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, psm.charge);
 
         // Remove MS2 peaks matched by previous match
         let mut to_remove = Vec::new();
-        for frag in fragments {
+        for frag in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
@@ -1049,6 +1044,75 @@ impl<'db> Scorer<'db> {
     }
 
     /// Calculate full hyperscore for a given PSM
+    /// Unpack one candidate's sparse predicted MS2 vector (if configured and
+    /// this `(peptide, charge)` has a cache entry) into a dense,
+    /// zero-initialized `[f32; N_FRAGMENT_SLOTS]`, indexed the same way as
+    /// `score_candidate`'s own per-fragment loop (`fragment_annotation_id`)
+    /// -- see `docs/ai/predicted_fragment_intensity.md`. Always returns a
+    /// valid array plus a `found` flag, rather than an `Option`-wrapped
+    /// array -- the caller never has to unwrap/default it separately.
+    fn build_predicted_dense(&self, peptide_idx: usize, charge: u8) -> (bool, [f32; N_FRAGMENT_SLOTS]) {
+        let mut dense = [0f32; N_FRAGMENT_SLOTS];
+
+        if self.predicted_fragment_intensity_index.is_none() {
+            return (false, dense);
+        }
+        let by_slot = self.predicted_fragment_intensity_index.unwrap();
+
+        let slot = Self::iim_dense_slot(
+            peptide_idx,
+            charge,
+            self.min_precursor_charge,
+            self.max_precursor_charge,
+        );
+        if slot.is_none() {
+            return (false, dense);
+        }
+        let slot = slot.unwrap();
+
+        if slot >= by_slot.len() || by_slot[slot].is_none() {
+            return (false, dense);
+        }
+        let (start, end) = by_slot[slot].unwrap();
+        let (start, end) = (start as usize, end as usize);
+
+        if self.predicted_fragment_intensity_annotation_id.is_none() {
+            return (false, dense);
+        }
+        let annotation_id = self.predicted_fragment_intensity_annotation_id.unwrap();
+
+        if self.predicted_fragment_intensity.is_none() {
+            return (false, dense);
+        }
+        let intensity = self.predicted_fragment_intensity.unwrap();
+
+        if start > end || end > annotation_id.len() || end > intensity.len() {
+            return (false, dense);
+        }
+
+        // Data is stored sparsely, so here we densify it.
+        for i in start..end {
+            let slot = annotation_id[i] as usize;
+            if slot < N_FRAGMENT_SLOTS {
+                dense[slot] = intensity[i].to_f32();
+            }
+        }
+        (true, dense)
+    }
+
+    /// Regenerate theoretical ions - initial database search might be
+    /// using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
+    /// so we need to completely re-score this candidate.
+    fn iter_fragments<'p>(&self, peptide: &'p Peptide) -> impl Iterator<Item = Ion> + 'p
+    where
+        'db: 'p,
+    {
+        self.db
+            .ion_kinds
+            .iter()
+            .flat_map(move |kind| IonSeries::new(peptide, *kind))
+    }
+
     fn score_candidate(
         &self,
         query: &ProcessedSpectrum<Peak>,
@@ -1064,74 +1128,40 @@ impl<'db> Scorer<'db> {
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
 
-        // Regenerate theoretical ions - initial database search might be
-        // using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
-        // so we need to completely re-score this candidate
-        let fragments = self
-            .db
-            .ion_kinds
-            .iter()
-            .flat_map(|kind| IonSeries::new(peptide, *kind).enumerate());
-
         let mut b_run = Run::default();
         let mut y_run = Run::default();
 
         let mut fragments_details = Fragments::default();
 
-        // Unpack this candidate's sparse predicted MS2 vector (if
-        // configured and this (peptide, charge) has a cache entry) into a
-        // dense, zero-initialized `[f32; N_FRAGMENT_SLOTS]` once, up front
-        // -- same "unpack sparse into a dense per-candidate buffer" shape
-        // as the rest of this fork's dense-array precedent (see
-        // `iim_dense_slot`). `observed_dense` is only allocated at all when
-        // `predicted_dense` is `Some` -- no point tracking observed
-        // intensities for a candidate with nothing to compare them against.
-        // See `docs/ai/predicted_fragment_intensity.md`.
-        let predicted_dense: Option<[f32; N_FRAGMENT_SLOTS]> = self
-            .predicted_fragment_intensity_index
-            .and_then(|by_slot| {
-                let slot = Self::iim_dense_slot(
-                    score.peptide.0 as usize,
-                    score.precursor_charge,
-                    self.min_precursor_charge,
-                    self.max_precursor_charge,
-                )?;
-                by_slot.get(slot).copied().flatten()
-            })
-            .and_then(|(start, end)| {
-                let annotation_id = self.predicted_fragment_intensity_annotation_id?;
-                let intensity = self.predicted_fragment_intensity?;
-                let (start, end) = (start as usize, end as usize);
-                if start > end || end > annotation_id.len() || end > intensity.len() {
-                    return None;
-                }
-                let mut dense = [0f32; N_FRAGMENT_SLOTS];
-                for i in start..end {
-                    if let Some(slot) = dense.get_mut(annotation_id[i] as usize) {
-                        *slot = intensity[i].to_f32();
-                    }
-                }
-                Some(dense)
-            });
-        let mut observed_dense = predicted_dense.map(|_| [0f32; N_FRAGMENT_SLOTS]);
-        // Which of the 174 slots are a structurally real fragment position
-        // for *this* peptide/charge -- set unconditionally per (idx, charge)
-        // below, regardless of whether a peak matched there. Needed for the
-        // sample-size-sensitive metrics (Pearson/Spearman correlation,
-        // hypergeometric probability, intersection -- see
-        // `docs/ai/predicted_fragment_intensity.md`), which must not treat
-        // an unvisited slot the same as a real "no intensity" fragment.
-        let mut is_real_dense = predicted_dense.map(|_| [false; N_FRAGMENT_SLOTS]);
+        // Compact (observed, predicted) pairs, one push per structurally
+        // visited annotation slot -- matched or not -- built up directly in
+        // the loop below instead of via a dense `observed`/`is_real` pair
+        // plus a later masked-compaction pass. `has_predictions` is the one
+        // flag that gates both vectors together, so they can't drift out of
+        // sync the way two independent `Option`s could. The cache's
+        // `predicted` covers all 3 Prosit fragment charges regardless of
+        // this job's own `max_fragment_charge` (e.g. real F9477 production
+        // config uses `max_fragment_charge: 1`, so this loop only ever
+        // visits ~1/3 of the 174 slots) -- pushing only visited slots keeps
+        // every metric from comparing real predicted intensities against
+        // phantom `observed = 0` for fragment charges this job never even
+        // attempts to match, which would otherwise bias every metric
+        // downward (found 2026-08-31). See
+        // `docs/ai/predicted_fragment_intensity.md`.
+        let (has_predictions, predicted_array) =
+            self.build_predicted_dense(score.peptide.0 as usize, score.precursor_charge);
+        let real_capacity = has_predictions as usize * N_FRAGMENT_SLOTS;
+        let mut observed_real: Vec<f32> = Vec::with_capacity(real_capacity);
+        let mut predicted_real: Vec<f32> = Vec::with_capacity(real_capacity);
 
-        for (idx, frag) in fragments {
+        for (idx, frag) in self.iter_fragments(peptide).enumerate() {
             for charge in 1..max_fragment_charge {
                 let annotation_slot = ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
-                if let (Some(is_real), Some(slot)) = (is_real_dense.as_mut(), annotation_slot) {
-                    is_real[slot] = true;
-                }
 
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
+
+                let mut observed_intensity = 0f32;
 
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
@@ -1161,11 +1191,7 @@ impl<'db> Scorer<'db> {
                         }
                     }
 
-                    if let (Some(observed_dense), Some(slot)) =
-                        (observed_dense.as_mut(), annotation_slot)
-                    {
-                        observed_dense[slot] = peak.intensity;
-                    }
+                    observed_intensity = peak.intensity;
 
                     if self.annotate_matches {
                         let idx = match frag.kind {
@@ -1182,6 +1208,13 @@ impl<'db> Scorer<'db> {
                         fragments_details.intensities.push(peak.intensity);
                     }
                 }
+
+                if has_predictions {
+                    if let Some(slot) = annotation_slot {
+                        observed_real.push(observed_intensity);
+                        predicted_real.push(predicted_array[slot]);
+                    }
+                }
             }
         }
 
@@ -1189,30 +1222,7 @@ impl<'db> Scorer<'db> {
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
         score.ppm_difference /= score.summed_b + score.summed_y;
-        if let (Some(predicted), Some(observed), Some(is_real)) =
-            (predicted_dense, observed_dense, is_real_dense)
-        {
-            // Compact once, feed every metric the same real-positions-only
-            // pair -- not just Pearson/Spearman. The cache's `predicted`
-            // covers all 3 Prosit fragment charges regardless of this
-            // job's own `max_fragment_charge` (e.g. real F9477 production
-            // config uses `max_fragment_charge: 1`, so SAGE's own loop
-            // above only ever sets `is_real` for ~1/3 of the 174 slots) --
-            // summing the *full* dense arrays would silently compare real
-            // predicted intensities against phantom `observed = 0` for
-            // fragment charges this job never even attempts to match,
-            // biasing every metric downward. Found 2026-08-31, see
-            // `docs/ai/predicted_fragment_intensity.md` and
-            // `ms2_similarity::entropy_similarity`'s doc comment.
-            let mut observed_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
-            let mut predicted_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
-            for i in 0..N_FRAGMENT_SLOTS {
-                if is_real[i] {
-                    observed_real.push(observed[i]);
-                    predicted_real.push(predicted[i]);
-                }
-            }
-
+        if has_predictions {
             score.ms2_entropy_similarity =
                 ms2_similarity::entropy_similarity(&observed_real, &predicted_real);
             score.ms2_weighted_entropy_similarity =

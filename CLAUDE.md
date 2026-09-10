@@ -16,6 +16,18 @@ release build takes ~1-2 minutes.
 - Native support for reading ionmaiden's `pmsms`/precursors binary formats
   directly, instead of only mzML/MGF/(Bruker) TDF.
 
+## Code style for agents
+
+Prefer readable, C/C++-style imperative control flow — sequential `?`-early-returns,
+plain `if`/`match`, simple loops — over deeply chained combinators (`.and_then()`,
+`.map()`, `.filter()`) when a sequence chains multiple independent fallible steps,
+especially from different data sources. `?` and `.and_then()` chains compile to
+identical code (verified for this fork's `Scorer::build_predicted_dense`,
+`scoring.rs`) — there's no performance tradeoff, so pick whichever reads top-to-bottom
+like a checklist, not whichever chains most tersely. Iterator adapters over a genuine
+sequence (`.map()`/`.filter()`/`.fold()` over an actual collection) are fine; a
+combinator chain used only to avoid writing an early-return is not.
+
 ## Documentation index
 
 This file stays a short overview; design rationale/history for each feature
