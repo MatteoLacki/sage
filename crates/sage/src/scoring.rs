@@ -1104,6 +1104,34 @@ impl<'db> Scorer<'db> {
         (true, dense)
     }
 
+    /// Observed intensity at each `NEUTRON`-spaced offset `i` in `-1..=k` from a
+    /// fragment's theoretical monoisotopic mass -- `i=0` is the monoisotopic peak
+    /// itself, `i=1..=k` are heavier isotopes, and `i=-1` is an anchor-rejection
+    /// probe (a peak sitting below what we think is the monoisotopic fragment peak
+    /// means that pick probably isn't really the monoisotopic one). No cache, no
+    /// theoretical comparison -- this only reads the real spectrum. See
+    /// `plans/isotope_envelope_scoring.md` in the parent monorepo.
+    fn observed_isotope_ladder(
+        &self,
+        peaks: &[Peak],
+        monoisotopic_mass: f32,
+        charge: u8,
+        k: i32,
+    ) -> Vec<f32> {
+        let mut observed = Vec::with_capacity((k + 2) as usize);
+        for i in -1..=k {
+            let mass_i = (monoisotopic_mass + i as f32 * NEUTRON) / charge as f32;
+            let mut intensity = 0f32;
+            if let Some(idx) =
+                crate::spectrum::select_most_intense_peak(peaks, mass_i, self.fragment_tol, None)
+            {
+                intensity = peaks[idx].intensity;
+            }
+            observed.push(intensity);
+        }
+        observed
+    }
+
     /// Regenerate theoretical ions - initial database search might be
     /// using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
     /// so we need to completely re-score this candidate.
@@ -1343,6 +1371,90 @@ mod tests {
         assert_eq!(run.longest, 3);
         run.matched(6);
         assert_eq!(run.length, 2);
+    }
+
+    fn mk_isotope_test_scorer(database: &IndexedDatabase) -> Scorer<'_> {
+        Scorer {
+            db: database,
+            precursor_tol: Tolerance::Da(-3.0, 3.0),
+            fragment_tol: Tolerance::Ppm(-15.0, 15.0),
+            min_matched_peaks: 1,
+            min_isotope_err: 0,
+            max_isotope_err: 0,
+            min_precursor_charge: 1,
+            max_precursor_charge: 1,
+            override_precursor_charge: false,
+            max_fragment_charge: None,
+            chimera: false,
+            report_psms: 5,
+            wide_window: false,
+            predicted_rt: None,
+            predicted_iim: None,
+            rt_tol: None,
+            mobility_tol: None,
+            rt_sigma: None,
+            iim_sigma: None,
+            annotate_matches: false,
+            score_type: ScoreType::SageHyperScore,
+            ranking_score: RankingScore::CombinedScore,
+            predicted_fragment_intensity_index: None,
+            predicted_fragment_intensity_annotation_id: None,
+            predicted_fragment_intensity: None,
+        }
+    }
+
+    #[test]
+    fn isotope_ladder_reads_neutron_spaced_peaks() {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">tol_test\nPEPTIDEK\n".into(), "rev_", false);
+        let database = builder.make_parameters().build(fasta);
+        let scorer = mk_isotope_test_scorer(&database);
+
+        let monoisotopic_mass = 500.0_f32;
+        let charge = 1u8;
+
+        // i=-1 present (anchor-rejection probe still just gets read here, not
+        // acted on), i=0 monoisotopic present, i=1 present, i=2 absent.
+        let peaks = vec![
+            Peak {
+                mass: (monoisotopic_mass - NEUTRON) / charge as f32,
+                intensity: 5.0,
+            },
+            Peak {
+                mass: monoisotopic_mass / charge as f32,
+                intensity: 100.0,
+            },
+            Peak {
+                mass: (monoisotopic_mass + NEUTRON) / charge as f32,
+                intensity: 20.0,
+            },
+        ];
+
+        let ladder = scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2);
+
+        assert_eq!(ladder, vec![5.0, 100.0, 20.0, 0.0]);
+    }
+
+    #[test]
+    fn isotope_ladder_empty_spectrum_is_all_zero() {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">tol_test\nPEPTIDEK\n".into(), "rev_", false);
+        let database = builder.make_parameters().build(fasta);
+        let scorer = mk_isotope_test_scorer(&database);
+
+        let ladder = scorer.observed_isotope_ladder(&[], 500.0, 1, 2);
+
+        assert_eq!(ladder, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
