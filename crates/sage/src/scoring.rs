@@ -993,11 +993,15 @@ impl<'db> Scorer<'db> {
         let mut to_remove = Vec::new();
         for frag in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
-                // Experimental peaks are multipled by charge, therefore theoretical are divided
-                let mz = frag.monoisotopic_mass / charge as f32;
+                // `peak.mass` is a PROTON-subtracted, charge-scaled neutral mass, not a
+                // real m/z (see `spectrum.rs`) -- rescale the theoretical fragment's
+                // neutral mass onto that same scale for this candidate charge, rather
+                // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
+                // -searched array; this is the single per-iteration query value).
+                let theoretical_mass = frag.monoisotopic_mass / charge as f32;
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
-                    mz,
+                    theoretical_mass,
                     self.fragment_tol,
                     None,
                 )
@@ -1158,22 +1162,26 @@ impl<'db> Scorer<'db> {
             for charge in 1..max_fragment_charge {
                 let annotation_slot = ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
 
-                // Experimental peaks are multipled by charge, therefore theoretical are divided
-                let mz = frag.monoisotopic_mass / charge as f32;
+                // `peak.mass` is a PROTON-subtracted, charge-scaled neutral mass, not a
+                // real m/z (see `spectrum.rs`) -- rescale the theoretical fragment's
+                // neutral mass onto that same scale for this candidate charge, rather
+                // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
+                // -searched array; this is the single per-iteration query value).
+                let theoretical_mass = frag.monoisotopic_mass / charge as f32;
 
                 let mut observed_intensity = 0f32;
 
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
-                    mz,
+                    theoretical_mass,
                     self.fragment_tol,
                     None,
                 ) {
                     let peak = &query.peaks[i];
                     let peak_charge = query.peak_charges.get(i).copied().unwrap_or(1);
 
-                    score.ppm_difference +=
-                        peak.intensity * (mz - peak.mass).abs() * 2E6 / (mz + peak.mass);
+                    score.ppm_difference += peak.intensity * (theoretical_mass - peak.mass).abs() * 2E6
+                        / (theoretical_mass + peak.mass);
 
                     let exp_mz = peak.mass / peak_charge as f32 + PROTON;
                     let calc_mz = frag.monoisotopic_mass / peak_charge as f32 + PROTON;
