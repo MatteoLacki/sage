@@ -28,6 +28,21 @@ like a checklist, not whichever chains most tersely. Iterator adapters over a ge
 sequence (`.map()`/`.filter()`/`.fold()` over an actual collection) are fine; a
 combinator chain used only to avoid writing an early-return is not.
 
+Prefer naming a concept over commenting it. Before writing a comment that explains
+what a condition means or why a check is safe, check whether extracting a
+well-named function/method/field would make the comment unnecessary — the name
+then carries the explanation at every call site, not just the one currently being
+written, and can't drift out of sync with the logic the way a comment can. Example
+(`spectrum.rs`/`scoring.rs`, 2026-09): `query.peak_charges.is_empty()` guarded by a
+14-line comment explaining "this means deisotope=false, which means X, which means
+Y is safe" at its one call site was replaced with `query.is_deisotoped()`, a method
+whose own doc comment carries that explanation once, derived from the existing
+field so it can't desync from it. Still write a comment for a genuine non-obvious
+*why* (a hidden constraint, a workaround, a surprising invariant) that a name alone
+can't carry — this is about replacing explanatory comments with structure, not
+eliminating all comments. See the `self-documenting-naming` skill
+(`~/.claude/skills/self-documenting-naming/SKILL.md`).
+
 ## Documentation index
 
 This file stays a short overview; design rationale/history for each feature
