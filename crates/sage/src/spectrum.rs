@@ -293,6 +293,23 @@ pub fn path_compression(peaks: &mut [Deisotoped]) {
 }
 
 impl<T> ProcessedSpectrum<T> {
+    /// Was this spectrum's `peaks` built with isotope/charge deconvolution
+    /// (`deisotope=true`)? Derived from `peak_charges` (empty iff
+    /// `deisotope=false`, see that field's doc comment) rather than stored
+    /// separately, so it can never drift out of sync with the peaks it
+    /// describes.
+    ///
+    /// This distinction matters beyond just charge labeling: under
+    /// `deisotope=true`, `process_ms2` merges each resolved isotope
+    /// satellite's intensity into its monoisotopic root and drops the
+    /// satellite from `peaks` entirely (`.filter(|peak|
+    /// peak.envelope.is_none())`) -- so code that expects to find individual
+    /// isotope-satellite peaks (e.g. `Scorer::observed_isotope_ladder`) only
+    /// sees real data when this returns `false`.
+    pub fn is_deisotoped(&self) -> bool {
+        !self.peak_charges.is_empty()
+    }
+
     pub fn extract_ms1_precursor(&self) -> Option<(f32, u8)> {
         let precursor = self.precursors.first()?;
         let charge = precursor.charge?;
