@@ -405,6 +405,7 @@ impl Runner {
                     rt_sigma: self.parameters.rt_sigma.clone(),
                     iim_sigma: self.parameters.iim_sigma,
                     annotate_matches: self.parameters.annotate_matches,
+                    isotope_ladder: self.parameters.isotope_ladder,
                     score_type: self.parameters.score_type,
                     ranking_score: self.parameters.ranking_score,
                     // Feature-only, never needed for prefiltering (see
@@ -811,6 +812,7 @@ impl Runner {
             rt_sigma: self.parameters.rt_sigma.clone(),
             iim_sigma: self.parameters.iim_sigma,
             annotate_matches: self.parameters.annotate_matches,
+            isotope_ladder: self.parameters.isotope_ladder,
             score_type: self.parameters.score_type,
             ranking_score: self.parameters.ranking_score,
             predicted_fragment_intensity_index: predicted_fragment_intensity_by_idx.as_deref(),

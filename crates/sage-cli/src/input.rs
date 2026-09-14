@@ -55,6 +55,13 @@ pub struct Search {
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
     pub deisotope: bool,
+    /// Compute `Scorer::observed_isotope_ladder` for each matched fragment
+    /// (diagnostic only, see `plans/isotope_envelope_scoring.md` in the
+    /// parent monorepo). Requires `deisotope: false` -- validated in
+    /// `Input::build`, since isotope satellite peaks are merged into their
+    /// monoisotopic root and dropped from the peak array when
+    /// `deisotope: true`, leaving nothing for the ladder to observe.
+    pub isotope_ladder: bool,
     pub chimera: bool,
     pub wide_window: bool,
     pub min_peaks: usize,
@@ -103,6 +110,9 @@ pub struct Input {
     pub override_precursor_charge: Option<bool>,
     pub isotope_errors: Option<(i8, i8)>,
     pub deisotope: Option<bool>,
+    /// See [`Search::isotope_ladder`]. Default `false`. Requires
+    /// `deisotope: false` -- errors in `build()` otherwise.
+    pub isotope_ladder: Option<bool>,
     pub quant: Option<QuantOptions>,
     pub predict_rt: Option<bool>,
     pub output_directory: Option<String>,
@@ -560,6 +570,15 @@ impl Input {
                  must both be set together (or both omitted)."
             );
         }
+        if self.isotope_ladder.unwrap_or(false) && self.deisotope.unwrap_or(true) {
+            anyhow::bail!(
+                "`isotope_ladder: true` requires `deisotope: false` -- under \
+                 deisotope=true, isotope satellite peaks are merged into their \
+                 monoisotopic root and dropped from the spectrum's peak array \
+                 entirely, so there is nothing for `isotope_ladder` to observe. \
+                 Set `deisotope: false`, or remove `isotope_ladder`."
+            );
+        }
         if let Some(spline) = &self.rt_tol_sec {
             spline
                 .validate()
@@ -681,6 +700,7 @@ impl Input {
             override_precursor_charge: self.override_precursor_charge.unwrap_or(false),
             isotope_errors: self.isotope_errors.unwrap_or((0, 0)),
             deisotope: self.deisotope.unwrap_or(true),
+            isotope_ladder: self.isotope_ladder.unwrap_or(false),
             chimera: self.chimera.unwrap_or(false),
             wide_window: self.wide_window.unwrap_or(false),
             predict_rt: self.predict_rt.unwrap_or(true),
@@ -824,6 +844,33 @@ mod test {
             err.to_string().contains("predicted_rt") && err.to_string().contains("rt_tol_sec"),
             "expected error naming `predicted_rt` and `rt_tol_sec`, got: {err}"
         );
+    }
+
+    #[test]
+    fn isotope_ladder_without_deisotope_false_errors() {
+        let mut json = mk_input_json();
+        json["isotope_ladder"] = serde_json::json!(true);
+        // deisotope left unset -> defaults to true, so this should error.
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("isotope_ladder without deisotope=false should error"),
+        };
+        assert!(
+            err.to_string().contains("isotope_ladder") && err.to_string().contains("deisotope"),
+            "expected error naming `isotope_ladder` and `deisotope`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn isotope_ladder_with_deisotope_false_succeeds() {
+        let mut json = mk_input_json();
+        json["isotope_ladder"] = serde_json::json!(true);
+        json["deisotope"] = serde_json::json!(false);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("isotope_ladder with deisotope=false should build");
+        assert!(search.isotope_ladder);
+        assert!(!search.deisotope);
     }
 
     #[test]

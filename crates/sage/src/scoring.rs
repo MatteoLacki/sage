@@ -326,6 +326,15 @@ pub struct Scorer<'db> {
     // the precursor tolerance window based on MS2 isolation window and charge
     pub wide_window: bool,
     pub annotate_matches: bool,
+    /// Compute `observed_isotope_ladder` for each matched fragment
+    /// (diagnostic only -- not yet read by `Score`/`Feature`, see
+    /// `plans/isotope_envelope_scoring.md`). Requires a non-deisotoped
+    /// spectrum (`query.is_deisotoped() == false`); `Search::build`
+    /// (`sage-cli/src/input.rs`) rejects `isotope_ladder: true` combined with
+    /// `deisotope: true` at config-load time, so that precondition is a
+    /// validated invariant by the time `Scorer` ever runs, not something
+    /// re-checked per spectrum.
+    pub isotope_ladder: bool,
     pub score_type: ScoreType,
     pub ranking_score: RankingScore,
 
@@ -1118,8 +1127,9 @@ impl<'db> Scorer<'db> {
     /// monoisotopic root and dropped from the peak array entirely when
     /// deisotoping is on, and `charge` here, the search loop's candidate
     /// charge, only has the right units in the non-deisotoped, apparent-
-    /// charge-1 mass convention). The caller is responsible for checking
-    /// `!query.is_deisotoped()` before calling this.
+    /// charge-1 mass convention). Only called when `self.isotope_ladder` is
+    /// set, which `Search::build` guarantees implies `deisotope: false` --
+    /// see `Scorer::isotope_ladder`'s doc comment.
     ///
     /// Writes into `out` instead of returning a fresh `Vec` -- this is called
     /// once per matched fragment inside `score_candidate`'s hot loop (per
@@ -1174,11 +1184,9 @@ impl<'db> Scorer<'db> {
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
 
-        // Scratch buffer for `observed_isotope_ladder`, allocated once per candidate
-        // and reused for every matched fragment below -- see that function's doc
-        // comment. Not yet consumed by anything (no Feature field, no output
-        // column, no cache) -- wired here to prove the buffer-reuse path survives
-        // real integration; see plans/isotope_envelope_scoring.md.
+        // Scratch buffer for `observed_isotope_ladder`, allocated once per
+        // candidate and reused for every matched fragment below -- see that
+        // function's doc comment.
         const ISOTOPE_LADDER_K: i32 = 2;
         let mut isotope_ladder_scratch: Vec<f32> = Vec::with_capacity((ISOTOPE_LADDER_K + 2) as usize);
 
@@ -1251,6 +1259,30 @@ impl<'db> Scorer<'db> {
 
                     observed_intensity = peak.intensity;
 
+                    if self.isotope_ladder {
+                        // `Search::build` (sage-cli/src/input.rs) rejects
+                        // `isotope_ladder: true` with `deisotope: true` at
+                        // config-load time -- see `Scorer::isotope_ladder`'s
+                        // doc comment. This is a sanity check on that
+                        // invariant, not a normal runtime branch.
+                        debug_assert!(
+                            !query.is_deisotoped(),
+                            "isotope_ladder=true with a deisotoped spectrum \
+                             should have been rejected by config validation"
+                        );
+                        self.observed_isotope_ladder(
+                            &query.peaks,
+                            frag.monoisotopic_mass,
+                            charge,
+                            ISOTOPE_LADDER_K,
+                            &mut isotope_ladder_scratch,
+                        );
+                        // isotope_ladder_scratch now holds NEUTRON-spaced
+                        // observed intensities (i=-1..=ISOTOPE_LADDER_K)
+                        // around this matched fragment -- not consumed
+                        // further yet.
+                    }
+
                     if self.annotate_matches {
                         let idx = match frag.kind {
                             Kind::A | Kind::B | Kind::C => idx as i32 + 1,
@@ -1264,23 +1296,6 @@ impl<'db> Scorer<'db> {
                         fragments_details.mz_calculated.push(calc_mz);
                         fragments_details.fragment_ordinals.push(idx);
                         fragments_details.intensities.push(peak.intensity);
-
-                        // See `ProcessedSpectrum::is_deisotoped`'s doc comment
-                        // and `observed_isotope_ladder`'s for why this is
-                        // restricted to non-deisotoped spectra.
-                        if !query.is_deisotoped() {
-                            self.observed_isotope_ladder(
-                                &query.peaks,
-                                frag.monoisotopic_mass,
-                                charge,
-                                ISOTOPE_LADDER_K,
-                                &mut isotope_ladder_scratch,
-                            );
-                            // isotope_ladder_scratch now holds NEUTRON-spaced
-                            // observed intensities (i=-1..=ISOTOPE_LADDER_K)
-                            // around this matched fragment -- not consumed
-                            // further yet.
-                        }
                     }
                 }
 
@@ -1434,6 +1449,7 @@ mod tests {
             rt_sigma: None,
             iim_sigma: None,
             annotate_matches: false,
+            isotope_ladder: false,
             score_type: ScoreType::SageHyperScore,
             ranking_score: RankingScore::CombinedScore,
             predicted_fragment_intensity_index: None,
