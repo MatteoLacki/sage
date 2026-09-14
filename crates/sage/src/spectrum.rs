@@ -66,6 +66,14 @@ pub struct SpectrumProcessor {
     pub take_top_n: usize,
     pub min_deisotope_mz: f32,
     pub deisotope: bool,
+    /// If `true`, trust that `RawSpectrum::mz` (and therefore the `Peak`s
+    /// built from it) already arrives mass-ascending sorted, and replace
+    /// `process()`'s own sort with a linear sortedness check
+    /// (`is_sorted_by_mass`) that panics if that trust turns out misplaced.
+    /// See `Search::assume_sorted_peaks` in `sage-cli` for the full
+    /// rationale. Only affects paths where `process()` would otherwise sort
+    /// at all -- see `is_sorted_by_mass`'s call site.
+    pub assume_sorted_peaks: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -323,6 +331,13 @@ impl<T> ProcessedSpectrum<T> {
     }
 }
 
+/// Is `peaks` already sorted ascending by `mass`? Hard precondition for
+/// `select_most_intense_peak`'s binary search, which returns silently wrong
+/// or missing matches -- not a panic -- on unsorted input.
+fn is_sorted_by_mass(peaks: &[Peak]) -> bool {
+    peaks.windows(2).all(|w| w[0].mass <= w[1].mass)
+}
+
 impl SpectrumProcessor {
     /// Create a new [`SpectrumProcessor`]
     ///
@@ -331,11 +346,20 @@ impl SpectrumProcessor {
     /// * `min_fragment_mz`: Keep only fragments >= this m/z
     /// * `max_fragment_mz`: Keep only fragments <= this m/z
     /// * `deisotope`: Perform deisotoping & charge state deconvolution
-    pub fn new(take_top_n: usize, deisotope: bool, min_deisotope_mz: f32) -> Self {
+    /// * `assume_sorted_peaks`: skip `process()`'s own mass-sort and instead
+    ///   verify it with a linear scan, panicking if violated -- see the
+    ///   field's own doc comment
+    pub fn new(
+        take_top_n: usize,
+        deisotope: bool,
+        min_deisotope_mz: f32,
+        assume_sorted_peaks: bool,
+    ) -> Self {
         Self {
             take_top_n,
             min_deisotope_mz,
             deisotope,
+            assume_sorted_peaks,
         }
     }
 
@@ -420,9 +444,27 @@ impl SpectrumProcessor {
             }
         };
 
-        // process_ms2 deisotope branch already sorts; sort the other paths here
+        // process_ms2 deisotope branch already sorts; sort (or verify) the
+        // other paths here -- covers MS1 spectra and MS2 with deisotope=false,
+        // both of which return an empty peak_charges (see process_ms2/the `_`
+        // arm above).
         if peak_charges.is_empty() {
-            peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
+            if self.assume_sorted_peaks {
+                assert!(
+                    is_sorted_by_mass(&peaks),
+                    "Scan {}: `assume_sorted_peaks=true` but peaks are not \
+                     mass-sorted ascending -- the caller's guarantee that \
+                     upstream spectra arrive pre-sorted was violated. \
+                     Continuing would silently break \
+                     `select_most_intense_peak`'s binary search precondition \
+                     and produce wrong or missing fragment matches downstream, \
+                     so this refuses to continue instead. Set \
+                     `assume_sorted_peaks: false` to sort in-process instead.",
+                    spectrum.id,
+                );
+            } else {
+                peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
+            }
         }
         // If peak_charges is non-empty the pairs were already sorted inside process_ms2
 
@@ -667,5 +709,88 @@ mod test {
                 }
             ]
         );
+    }
+
+    fn mk_raw_spectrum(ms_level: u8, mz: Vec<f32>) -> RawSpectrum {
+        let intensity = vec![1.0; mz.len()];
+        RawSpectrum {
+            ms_level,
+            representation: Representation::Centroid,
+            intensity,
+            mz,
+            ..RawSpectrum::default_with_file_id(0)
+        }
+    }
+
+    #[test]
+    fn is_sorted_by_mass_sorted_slice_is_true() {
+        let peaks = vec![
+            Peak { mass: 1.0, intensity: 1.0 },
+            Peak { mass: 2.0, intensity: 1.0 },
+            Peak { mass: 2.0, intensity: 1.0 }, // ties are fine (<=)
+            Peak { mass: 3.0, intensity: 1.0 },
+        ];
+        assert!(is_sorted_by_mass(&peaks));
+    }
+
+    #[test]
+    fn is_sorted_by_mass_unsorted_slice_is_false() {
+        let peaks = vec![
+            Peak { mass: 2.0, intensity: 1.0 },
+            Peak { mass: 1.0, intensity: 1.0 },
+        ];
+        assert!(!is_sorted_by_mass(&peaks));
+    }
+
+    #[test]
+    fn is_sorted_by_mass_empty_and_singleton_are_true() {
+        assert!(is_sorted_by_mass(&[]));
+        assert!(is_sorted_by_mass(&[Peak { mass: 5.0, intensity: 1.0 }]));
+    }
+
+    #[test]
+    fn process_deisotope_false_sorts_by_default() {
+        let raw = mk_raw_spectrum(2, vec![500.0, 300.0, 400.0]);
+        let sp = SpectrumProcessor::new(100, false, 0.0, false);
+        let processed = sp.process(raw);
+        assert!(is_sorted_by_mass(&processed.peaks));
+        assert_eq!(processed.peaks.len(), 3);
+    }
+
+    #[test]
+    fn process_assume_sorted_peaks_true_passes_through_sorted_input() {
+        let raw = mk_raw_spectrum(2, vec![300.0, 400.0, 500.0]);
+        let sp = SpectrumProcessor::new(100, false, 0.0, true);
+        let processed = sp.process(raw);
+        assert!(is_sorted_by_mass(&processed.peaks));
+        assert_eq!(processed.peaks.len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "not mass-sorted ascending")]
+    fn process_assume_sorted_peaks_true_panics_on_unsorted_ms2_input() {
+        let raw = mk_raw_spectrum(2, vec![500.0, 300.0, 400.0]);
+        let sp = SpectrumProcessor::new(100, false, 0.0, true);
+        sp.process(raw);
+    }
+
+    #[test]
+    #[should_panic(expected = "not mass-sorted ascending")]
+    fn process_assume_sorted_peaks_true_panics_on_unsorted_ms1_input() {
+        let raw = mk_raw_spectrum(1, vec![500.0, 300.0, 400.0]);
+        let sp = SpectrumProcessor::new(100, false, 0.0, true);
+        sp.process(raw);
+    }
+
+    #[test]
+    fn process_assume_sorted_peaks_true_is_noop_when_deisotope_true() {
+        // deisotope=true's branch never reaches the assume_sorted_peaks
+        // check -- its own sort runs first, for a different purpose
+        // (selecting top-N by intensity) -- so this must not panic despite
+        // deliberately unsorted input.
+        let raw = mk_raw_spectrum(2, vec![500.0, 300.0, 400.0]);
+        let sp = SpectrumProcessor::new(100, true, 0.0, true);
+        let processed = sp.process(raw);
+        assert!(is_sorted_by_mass(&processed.peaks));
     }
 }

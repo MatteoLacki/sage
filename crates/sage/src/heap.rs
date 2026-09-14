@@ -98,4 +98,21 @@ mod tests {
         check(asc, 50);
         check(desc, 50);
     }
+
+    // `check()`'s own `k.min(data.len())` clamp means neither `run_quickcheck`
+    // nor `smoke` above ever exercises `k` strictly greater than the slice
+    // length -- exactly the case `unlimited_max_peaks` (sage-cli) relies on
+    // (`take_top_n == usize::MAX`). Exercise it directly, unclamped.
+    #[test]
+    fn k_strictly_greater_than_len_is_noop() {
+        let original = vec![3, 1, 4, 1, 5, 9, 2, 6];
+
+        let mut data = original.clone();
+        bounded_min_heapify(&mut data, original.len() + 5);
+        assert_eq!(data, original);
+
+        let mut data = original.clone();
+        bounded_min_heapify(&mut data, usize::MAX);
+        assert_eq!(data, original);
+    }
 }

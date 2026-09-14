@@ -62,10 +62,18 @@ pub struct Search {
     /// monoisotopic root and dropped from the peak array when
     /// `deisotope: true`, leaving nothing for the ladder to observe.
     pub isotope_ladder: bool,
+    /// See [`Input::assume_sorted_peaks`].
+    pub assume_sorted_peaks: bool,
     pub chimera: bool,
     pub wide_window: bool,
     pub min_peaks: usize,
     pub max_peaks: usize,
+    /// Mirrors [`Input::unlimited_max_peaks`]. Kept alongside `max_peaks`
+    /// (rather than folding "unlimited" into `max_peaks` itself as a
+    /// sentinel value) so that a resolved `max_peaks == usize::MAX` in
+    /// `results.json`/logs is self-explaining next to this flag, instead of
+    /// an opaque huge number.
+    pub unlimited_max_peaks: bool,
     pub max_fragment_charge: Option<u8>,
     pub min_matched_peaks: u16,
     pub report_psms: usize,
@@ -104,6 +112,15 @@ pub struct Input {
     pub wide_window: Option<bool>,
     pub min_peaks: Option<usize>,
     pub max_peaks: Option<usize>,
+    /// If `true`, retain every peak (no cap on `max_peaks`) instead of
+    /// keeping only the top-N most intense. There is deliberately no numeric
+    /// sentinel (e.g. `max_peaks: 0`) for "unlimited" -- `0` would otherwise
+    /// be a meaningless value nobody legitimately wants (keep zero peaks),
+    /// making it an easy typo to silently misinterpret; this flag makes "no
+    /// cap" an explicit, separately-named choice instead. Errors in
+    /// `build()` if both this and `max_peaks` are set -- ambiguous which the
+    /// caller intended.
+    pub unlimited_max_peaks: Option<bool>,
     pub max_fragment_charge: Option<u8>,
     pub min_matched_peaks: Option<u16>,
     pub precursor_charge: Option<(u8, u8)>,
@@ -113,6 +130,20 @@ pub struct Input {
     /// See [`Search::isotope_ladder`]. Default `false`. Requires
     /// `deisotope: false` -- errors in `build()` otherwise.
     pub isotope_ladder: Option<bool>,
+    /// If `true`, trust that each `RawSpectrum`'s peaks already arrive
+    /// ascending by m/z (as produced by the upstream parser) and skip
+    /// `SpectrumProcessor::process`'s own mass-ascending sort, replacing it
+    /// with an O(m) linear sortedness check that always runs (release and
+    /// debug builds alike) and panics, naming the offending scan, if that
+    /// guarantee turns out false -- see `spectrum.rs`'s `is_sorted_by_mass`
+    /// for why silently-broken sort order can't be allowed to pass through
+    /// (`select_most_intense_peak`'s binary search requires ascending order
+    /// and returns silently wrong or missing matches, not a panic,
+    /// otherwise). Only takes effect on MS1 spectra and MS2 spectra with
+    /// `deisotope: false` -- has no effect on MS2 spectra when
+    /// `deisotope: true` (`build()` warns if both are set). Default `false`:
+    /// always sort, matching pre-existing behavior.
+    pub assume_sorted_peaks: Option<bool>,
     pub quant: Option<QuantOptions>,
     pub predict_rt: Option<bool>,
     pub output_directory: Option<String>,
@@ -579,6 +610,22 @@ impl Input {
                  Set `deisotope: false`, or remove `isotope_ladder`."
             );
         }
+        if self.unlimited_max_peaks.unwrap_or(false) && self.max_peaks.is_some() {
+            anyhow::bail!(
+                "`unlimited_max_peaks: true` and `max_peaks` were both set -- \
+                 ambiguous. Remove `max_peaks` to use `unlimited_max_peaks`, or \
+                 remove `unlimited_max_peaks` to cap peaks at `max_peaks`."
+            );
+        }
+        if self.assume_sorted_peaks.unwrap_or(false) && self.deisotope.unwrap_or(true) {
+            log::warn!(
+                "`assume_sorted_peaks: true` has no effect on MS2 spectra while \
+                 `deisotope: true` (the default) -- that branch's own sort is \
+                 unconditional and unrelated to this flag. It still applies to \
+                 MS1 spectra. Set `deisotope: false` if you intended this flag \
+                 to also skip-and-check MS2 spectra's sort."
+            );
+        }
         if let Some(spline) = &self.rt_tol_sec {
             spline
                 .validate()
@@ -691,7 +738,12 @@ impl Input {
             predicted_fragment_intensity_index: self.predicted_fragment_intensity_index,
             predicted_fragment_intensity_cache: self.predicted_fragment_intensity_cache,
             report_psms: self.report_psms.unwrap_or(1),
-            max_peaks: self.max_peaks.unwrap_or(150),
+            max_peaks: if self.unlimited_max_peaks.unwrap_or(false) {
+                usize::MAX
+            } else {
+                self.max_peaks.unwrap_or(150)
+            },
+            unlimited_max_peaks: self.unlimited_max_peaks.unwrap_or(false),
             min_peaks: self.min_peaks.unwrap_or(15),
             min_matched_peaks: self.min_matched_peaks.unwrap_or(4),
             max_fragment_charge: self.max_fragment_charge,
@@ -701,6 +753,7 @@ impl Input {
             isotope_errors: self.isotope_errors.unwrap_or((0, 0)),
             deisotope: self.deisotope.unwrap_or(true),
             isotope_ladder: self.isotope_ladder.unwrap_or(false),
+            assume_sorted_peaks: self.assume_sorted_peaks.unwrap_or(false),
             chimera: self.chimera.unwrap_or(false),
             wide_window: self.wide_window.unwrap_or(false),
             predict_rt: self.predict_rt.unwrap_or(true),
@@ -871,6 +924,64 @@ mod test {
         let search = input.build().expect("isotope_ladder with deisotope=false should build");
         assert!(search.isotope_ladder);
         assert!(!search.deisotope);
+    }
+
+    #[test]
+    fn unlimited_max_peaks_and_max_peaks_together_errors() {
+        let mut json = mk_input_json();
+        json["unlimited_max_peaks"] = serde_json::json!(true);
+        json["max_peaks"] = serde_json::json!(800);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let err = match input.build() {
+            Err(e) => e,
+            Ok(_) => panic!("unlimited_max_peaks with max_peaks set together should error"),
+        };
+        assert!(
+            err.to_string().contains("unlimited_max_peaks") && err.to_string().contains("max_peaks"),
+            "expected error naming `unlimited_max_peaks` and `max_peaks`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unlimited_max_peaks_resolves_to_usize_max() {
+        let mut json = mk_input_json();
+        json["unlimited_max_peaks"] = serde_json::json!(true);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("unlimited_max_peaks alone should build");
+        assert_eq!(search.max_peaks, usize::MAX);
+        assert!(search.unlimited_max_peaks);
+    }
+
+    #[test]
+    fn max_peaks_without_unlimited_flag_unaffected() {
+        let mut json = mk_input_json();
+        json["max_peaks"] = serde_json::json!(800);
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("max_peaks alone should build");
+        assert_eq!(search.max_peaks, 800);
+        assert!(!search.unlimited_max_peaks);
+    }
+
+    #[test]
+    fn assume_sorted_peaks_defaults_to_false() {
+        let json = mk_input_json();
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("default config should build");
+        assert!(!search.assume_sorted_peaks);
+    }
+
+    #[test]
+    fn assume_sorted_peaks_with_deisotope_true_still_builds() {
+        let mut json = mk_input_json();
+        json["assume_sorted_peaks"] = serde_json::json!(true);
+        // deisotope left unset -> defaults to true. Unlike isotope_ladder,
+        // this combination is only a *partial* no-op (still applies to MS1
+        // spectra), so build() warns rather than erroring -- confirm it
+        // still succeeds.
+        let input: Input = serde_json::from_value(json).unwrap();
+        let search = input.build().expect("assume_sorted_peaks with deisotope=true should still build");
+        assert!(search.assume_sorted_peaks);
+        assert!(search.deisotope);
     }
 
     #[test]

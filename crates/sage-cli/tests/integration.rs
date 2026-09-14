@@ -13,7 +13,7 @@ fn integration() -> anyhow::Result<()> {
     let spectra = sage_cloudpath::util::read_mzml("../../tests/LQSRPAAPPAPGPGQLTLR.mzML", 0, None)?;
     assert_eq!(spectra.len(), 1);
 
-    let sp = SpectrumProcessor::new(100, true, 0.0);
+    let sp = SpectrumProcessor::new(100, true, 0.0, false);
     let processed = sp.process(spectra[0].clone());
     assert!(processed.peaks.len() <= 300);
 
@@ -38,6 +38,7 @@ fn integration() -> anyhow::Result<()> {
         rt_sigma: None,
         iim_sigma: None,
         annotate_matches: false,
+        isotope_ladder: false,
         score_type: ScoreType::SageHyperScore,
         ranking_score: RankingScore::CombinedScore,
         predicted_fragment_intensity_index: None,

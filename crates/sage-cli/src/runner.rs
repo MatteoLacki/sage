@@ -640,6 +640,7 @@ impl Runner {
             self.parameters.max_peaks,
             self.parameters.deisotope,
             min_deisotope_mz.unwrap_or(0.0),
+            self.parameters.assume_sorted_peaks,
         );
 
         // If the file format supports parallel reading, then we can read
