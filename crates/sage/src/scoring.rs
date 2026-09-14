@@ -1112,6 +1112,16 @@ impl<'db> Scorer<'db> {
     /// theoretical comparison -- this only reads the real spectrum. See
     /// `plans/isotope_envelope_scoring.md` in the parent monorepo.
     ///
+    /// Only meaningful against a `deisotope=false` spectrum (`peaks` must come
+    /// from `query.peaks` where `query.peak_charges.is_empty()`). Under
+    /// `deisotope=true`, resolved isotope satellites are merged into their
+    /// monoisotopic root's intensity and dropped from the peak array entirely
+    /// (`spectrum.rs`'s `process_ms2`), so there is usually nothing at `i!=0`
+    /// to find, and `charge` (the search loop's candidate charge, not the
+    /// peak's real physical charge) only has the right units in the
+    /// `deisotope=false`, apparent-charge-1 mass convention. The caller is
+    /// responsible for checking `deisotope=false` before calling this.
+    ///
     /// Writes into `out` instead of returning a fresh `Vec` -- this is called
     /// once per matched fragment inside `score_candidate`'s hot loop (per
     /// candidate, per spectrum), so the caller allocates `out` once and reuses
@@ -1256,16 +1266,33 @@ impl<'db> Scorer<'db> {
                         fragments_details.fragment_ordinals.push(idx);
                         fragments_details.intensities.push(peak.intensity);
 
-                        self.observed_isotope_ladder(
-                            &query.peaks,
-                            frag.monoisotopic_mass,
-                            charge,
-                            ISOTOPE_LADDER_K,
-                            &mut isotope_ladder_scratch,
-                        );
-                        // isotope_ladder_scratch now holds NEUTRON-spaced observed
-                        // intensities (i=-1..=ISOTOPE_LADDER_K) around this matched
-                        // fragment -- not consumed further yet.
+                        // `query.peak_charges` is empty iff this spectrum was
+                        // processed with `deisotope=false` (spectrum.rs's own
+                        // documented invariant) -- only that case is safe to run
+                        // the ladder against. Under `deisotope=true`, resolved
+                        // isotope satellites are merged into their monoisotopic
+                        // root's intensity and DROPPED from `query.peaks`
+                        // entirely (`process_ms2`'s `.filter(|peak|
+                        // peak.envelope.is_none())`), so there is usually nothing
+                        // at i=1/i=2 to find; and `charge` here (the search
+                        // loop's candidate charge) is only the matched peak's
+                        // real physical charge in the deisotope=false regime --
+                        // a resolved/decharged peak always matches at
+                        // charge_candidate=1 regardless of its true charge. See
+                        // plans/isotope_envelope_scoring.md.
+                        if query.peak_charges.is_empty() {
+                            self.observed_isotope_ladder(
+                                &query.peaks,
+                                frag.monoisotopic_mass,
+                                charge,
+                                ISOTOPE_LADDER_K,
+                                &mut isotope_ladder_scratch,
+                            );
+                            // isotope_ladder_scratch now holds NEUTRON-spaced
+                            // observed intensities (i=-1..=ISOTOPE_LADDER_K)
+                            // around this matched fragment -- not consumed
+                            // further yet.
+                        }
                     }
                 }
 
