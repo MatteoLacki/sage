@@ -352,9 +352,15 @@ impl Parameters {
             .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
             .collect::<Vec<(ModificationSpecificity, f32)>>();
 
+        let (fragment_mzs, fragment_peptide_indices) = fragments
+            .into_par_iter()
+            .map(|fragment| (fragment.fragment_mz, fragment.peptide_index))
+            .unzip();
+
         IndexedDatabase {
             peptides: target_decoys,
-            fragments,
+            fragment_mzs,
+            fragment_peptide_indices,
             min_value,
             bucket_size: self.bucket_size,
             ion_kinds: self.ion_kinds,
@@ -385,7 +391,9 @@ pub struct Theoretical {
 #[derive(Default)]
 pub struct IndexedDatabase {
     pub peptides: Vec<Peptide>,
-    pub fragments: Vec<Theoretical>,
+    /// Parallel columns, ordered by peptide index within each fragment-mass page.
+    pub fragment_mzs: Vec<f32>,
+    pub fragment_peptide_indices: Vec<PeptideIx>,
     pub ion_kinds: Vec<Kind>,
     pub min_value: Vec<f32>,
     /// Keep a list of potential (AA, mass) modifications for RT prediction
@@ -420,7 +428,17 @@ impl IndexedDatabase {
     }
 
     pub fn size(&self) -> usize {
-        self.fragments.len()
+        self.fragment_mzs.len()
+    }
+
+    pub fn fragments(&self) -> impl Iterator<Item = Theoretical> + '_ {
+        self.fragment_mzs
+            .iter()
+            .zip(&self.fragment_peptide_indices)
+            .map(|(&fragment_mz, &peptide_index)| Theoretical {
+                peptide_index,
+                fragment_mz,
+            })
     }
 
     pub fn buckets(&self) -> &[f32] {
@@ -430,7 +448,7 @@ impl IndexedDatabase {
     pub fn serialize(&self) {
         use std::io::Write;
         let mut wtr = std::io::BufWriter::new(std::fs::File::create("fragments.bin").unwrap());
-        for fragment in &self.fragments {
+        for fragment in self.fragments() {
             let _ = wtr.write(&fragment.fragment_mz.to_le_bytes()).unwrap();
             let _ = wtr.write(&fragment.peptide_index.0.to_le_bytes()).unwrap();
         }
@@ -477,13 +495,13 @@ impl IndexedQuery<'_> {
         &self,
         mass: f32,
         fragment_tol: Tolerance,
-    ) -> impl Iterator<Item = &Theoretical> {
+    ) -> impl Iterator<Item = Theoretical> + '_ {
         let (fragment_lo, fragment_hi) = fragment_tol.bounds(mass);
         let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
 
         // Locate the left and right page indices that contain matching fragments
         // Note that we need to multiply by `bucket_size` to transform these into
-        // indices that can be used with `self.db.fragments`
+        // indices into the parallel fragment columns
         let (left_idx, right_idx) = binary_search_slice(
             &self.db.min_value,
             |min, bounds| min.total_cmp(bounds),
@@ -497,41 +515,46 @@ impl IndexedQuery<'_> {
             let left_idx = page * self.db.bucket_size;
             // Last chunk not guaranted to be modulo bucket size, make sure we don't
             // accidentally go out of bounds!
-            let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.fragments.len());
+            let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.size());
 
             // Narrow down into our region of interest, then perform another binary
             // search to further refine down to the slice of matching precursor mzs
-            let slice = &&self.db.fragments[left_idx..right_idx];
+            let slice = &self.db.fragment_peptide_indices[left_idx..right_idx];
 
             let (inner_left, inner_right) = binary_search_slice(
                 slice,
-                |frag, bounds| (frag.peptide_index.0 as usize).cmp(bounds),
+                |idx, bounds| (idx.0 as usize).cmp(bounds),
                 self.pre_idx_lo,
                 self.pre_idx_hi,
             );
 
             // Finally, filter down our slice into exact matches only
-            slice[inner_left..inner_right].iter().filter(move |frag| {
-                // This looks somewhat complicated, but it's a consequence of
-                // how the `binary_search_slice` function works - it will return
-                // the set of indices that maximally cover the desired range - the exact
-                // `left` and `right` indices may be valid, or just outside of the range.
-                // Anything interior of `left` and `right` is guaranteed to be within the
-                // precursor tolerance, so we just need to check the edge cases
-                //
-                // Previously, a direct lookup to check the mass of the current fragment was
-                // performed, but the pointer indirection + float comparison can slow down
-                // open searches by as much as 2x!!
-                // e.g. used to be `self.db[frag.peptide_index].monoisotopic >= precursor_lo`
-                (frag.peptide_index.0 > self.pre_idx_lo as u32
-                    || (frag.peptide_index.0 == self.pre_idx_lo as u32
-                        && self.db[frag.peptide_index].monoisotopic >= precursor_lo))
-                    && (frag.peptide_index.0 < self.pre_idx_hi as u32
-                        || (frag.peptide_index.0 == self.pre_idx_hi as u32
-                            && self.db[frag.peptide_index].monoisotopic <= precursor_hi))
-                    && frag.fragment_mz >= fragment_lo
-                    && frag.fragment_mz <= fragment_hi
-            })
+            (inner_left..inner_right)
+                .map(move |i| Theoretical {
+                    peptide_index: slice[i],
+                    fragment_mz: self.db.fragment_mzs[left_idx + i],
+                })
+                .filter(move |frag| {
+                    // This looks somewhat complicated, but it's a consequence of
+                    // how the `binary_search_slice` function works - it will return
+                    // the set of indices that maximally cover the desired range - the exact
+                    // `left` and `right` indices may be valid, or just outside of the range.
+                    // Anything interior of `left` and `right` is guaranteed to be within the
+                    // precursor tolerance, so we just need to check the edge cases
+                    //
+                    // Previously, a direct lookup to check the mass of the current fragment was
+                    // performed, but the pointer indirection + float comparison can slow down
+                    // open searches by as much as 2x!!
+                    // e.g. used to be `self.db[frag.peptide_index].monoisotopic >= precursor_lo`
+                    (frag.peptide_index.0 > self.pre_idx_lo as u32
+                        || (frag.peptide_index.0 == self.pre_idx_lo as u32
+                            && self.db[frag.peptide_index].monoisotopic >= precursor_lo))
+                        && (frag.peptide_index.0 < self.pre_idx_hi as u32
+                            || (frag.peptide_index.0 == self.pre_idx_hi as u32
+                                && self.db[frag.peptide_index].monoisotopic <= precursor_hi))
+                        && frag.fragment_mz >= fragment_lo
+                        && frag.fragment_mz <= fragment_hi
+                })
         })
     }
 
@@ -558,12 +581,30 @@ impl IndexedQuery<'_> {
     /// OS threads, so this persists correctly across the many spectra one
     /// worker processes, without needing to thread a buffer through every
     /// call site by hand.
-    pub fn page_search_batch(&self, windows: &[(f32, Tolerance)], mut on_match: impl FnMut(&Theoretical)) {
-        let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
+    pub fn page_search_batch(
+        &self,
+        windows: &[(f32, Tolerance)],
+        mut on_match: impl FnMut(Theoretical),
+    ) {
+        let (precursor_lo, _) = self.precursor_tol.bounds(self.precursor_mass);
+        // binary_search_slice includes one predecessor at the lower boundary.
+        // Convert to an exact half-open peptide-ID range before scanning pages.
+        let exact_pre_idx_lo = self.pre_idx_lo
+            + usize::from(
+                self.db
+                    .peptides
+                    .get(self.pre_idx_lo)
+                    .map_or(false, |p| p.monoisotopic < precursor_lo),
+            );
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
 
         PAGE_SEARCH_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
-            let PageSearchScratch { bounds, page_window } = &mut *scratch;
+            let PageSearchScratch {
+                bounds,
+                page_window,
+            } = &mut *scratch;
             bounds.clear();
             page_window.clear();
 
@@ -587,39 +628,72 @@ impl IndexedQuery<'_> {
             while i < page_window.len() {
                 let page = page_window[i].0;
                 let left_idx = page * self.db.bucket_size;
-                let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.fragments.len());
-                let slice = &self.db.fragments[left_idx..right_idx];
-
-                let (inner_left, inner_right) = binary_search_slice(
-                    slice,
-                    |frag, b| (frag.peptide_index.0 as usize).cmp(b),
-                    self.pre_idx_lo,
-                    self.pre_idx_hi,
-                );
-                let inner_slice = &slice[inner_left..inner_right];
+                let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.size());
+                let ids = &self.db.fragment_peptide_indices[left_idx..right_idx];
+                let inner_left = ids.partition_point(|id| (id.0 as usize) < exact_pre_idx_lo);
+                let inner_right = inner_left
+                    + ids[inner_left..].partition_point(|id| (id.0 as usize) < self.pre_idx_hi);
+                let masses = &self.db.fragment_mzs[left_idx + inner_left..left_idx + inner_right];
+                let ids = &ids[inner_left..inner_right];
 
                 let mut j = i;
                 while j < page_window.len() && page_window[j].0 == page {
                     let (fragment_lo, fragment_hi) = bounds[page_window[j].1];
-                    for frag in inner_slice.iter() {
-                        if (frag.peptide_index.0 > self.pre_idx_lo as u32
-                            || (frag.peptide_index.0 == self.pre_idx_lo as u32
-                                && self.db[frag.peptide_index].monoisotopic >= precursor_lo))
-                            && (frag.peptide_index.0 < self.pre_idx_hi as u32
-                                || (frag.peptide_index.0 == self.pre_idx_hi as u32
-                                    && self.db[frag.peptide_index].monoisotopic <= precursor_hi))
-                            && frag.fragment_mz >= fragment_lo
-                            && frag.fragment_mz <= fragment_hi
-                        {
-                            on_match(frag);
-                        }
+                    let mut emit = |idx: usize| {
+                        on_match(Theoretical {
+                            peptide_index: ids[idx],
+                            fragment_mz: masses[idx],
+                        })
+                    };
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 && masses.len() >= 8 {
+                        // SAFETY: runtime feature detection above guards this call.
+                        unsafe { scan_masses_avx2(masses, fragment_lo, fragment_hi, &mut emit) };
+                        j += 1;
+                        continue;
                     }
+                    scan_masses_scalar(masses, fragment_lo, fragment_hi, &mut emit);
                     j += 1;
                 }
                 i = j;
             }
         });
     }
+}
+
+#[inline]
+fn scan_masses_scalar(masses: &[f32], lo: f32, hi: f32, mut on_match: impl FnMut(usize)) {
+    for (i, &mass) in masses.iter().enumerate() {
+        if mass >= lo && mass <= hi {
+            on_match(i);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_masses_avx2(masses: &[f32], lo: f32, hi: f32, mut on_match: impl FnMut(usize)) {
+    use std::arch::x86_64::*;
+
+    let lower = _mm256_set1_ps(lo);
+    let upper = _mm256_set1_ps(hi);
+    let mut i = 0;
+    while i + 8 <= masses.len() {
+        // SAFETY: eight elements remain; loadu does not require alignment.
+        let values = _mm256_loadu_ps(masses.as_ptr().add(i));
+        let accepted = _mm256_and_ps(
+            _mm256_cmp_ps(values, lower, _CMP_GE_OQ),
+            _mm256_cmp_ps(values, upper, _CMP_LE_OQ),
+        );
+        let mut mask = _mm256_movemask_ps(accepted) as u32;
+        // Emit in index order, including repeated peptide IDs in different lanes.
+        while mask != 0 {
+            on_match(i + mask.trailing_zeros() as usize);
+            mask &= mask - 1;
+        }
+        i += 8;
+    }
+    scan_masses_scalar(&masses[i..], lo, hi, |offset| on_match(i + offset));
 }
 
 #[derive(Default)]
@@ -661,6 +735,143 @@ mod test {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn batched_pages_match_brute_force_with_boundaries_and_duplicate_hits() {
+        let peptides: Vec<_> = [500.0, 500.0, 600.0, 600.0, 800.0, 900.0]
+            .into_iter()
+            .map(|monoisotopic| Peptide {
+                monoisotopic,
+                ..Default::default()
+            })
+            .collect();
+        let mut fragments = Vec::new();
+        for ordinal in 0..32 {
+            for peptide in 0..peptides.len() {
+                fragments.push(Theoretical {
+                    peptide_index: PeptideIx(peptide as u32),
+                    fragment_mz: 100.0 + ordinal as f32 * 5.0 + peptide as f32 * 0.25,
+                });
+            }
+        }
+        // Duplicate fragments must increment the same peptide more than once.
+        fragments.push(fragments[0]);
+        fragments.sort_by(|a, b| a.fragment_mz.total_cmp(&b.fragment_mz));
+        let windows = [
+            (100.0, Tolerance::Da(0.0, 0.0)),
+            (120.0, Tolerance::Da(-20.0, 20.0)),
+            (120.0, Tolerance::Da(-20.0, 20.0)), // repeated window retains multiplicity
+            (200.0, Tolerance::Ppm(-20.0, 20.0)),
+            (1000.0, Tolerance::Da(-2000.0, 2000.0)),
+            (3000.0, Tolerance::Da(0.0, 1.0)),
+        ];
+        for bucket_size in [1, 7, 8, 9, 31, 64, 256] {
+            let mut ordered = fragments.clone();
+            let mut min_value = Vec::new();
+            for page in ordered.chunks_mut(bucket_size) {
+                min_value.push(page[0].fragment_mz);
+                page.sort_by_key(|f| f.peptide_index);
+            }
+            let db = IndexedDatabase {
+                peptides: peptides.clone(),
+                fragment_mzs: ordered.iter().map(|f| f.fragment_mz).collect(),
+                fragment_peptide_indices: ordered.iter().map(|f| f.peptide_index).collect(),
+                min_value,
+                bucket_size,
+                ..Default::default()
+            };
+            for (mass, tol) in [
+                (500.0, Tolerance::Da(0.0, 0.0)),
+                (600.0, Tolerance::Da(0.0, 0.0)),
+                (550.0, Tolerance::Da(-50.0, 50.0)),
+                (550.0, Tolerance::Da(-1.0, 1.0)),
+                (900.0, Tolerance::Da(0.0, 0.0)),
+                (100.0, Tolerance::Da(-1.0, 1.0)),
+                (1000.0, Tolerance::Da(-1.0, 1.0)),
+                (700.0, Tolerance::Da(-500.0, 500.0)),
+                (600.0, Tolerance::Ppm(-10.0, 10.0)),
+            ] {
+                let (lo, hi) = tol.bounds(mass);
+                let mut expected = Vec::new();
+                for &(center, tolerance) in &windows {
+                    let (frag_lo, frag_hi) = tolerance.bounds(center);
+                    for f in &fragments {
+                        let precursor = db[f.peptide_index].monoisotopic;
+                        if precursor >= lo
+                            && precursor <= hi
+                            && f.fragment_mz >= frag_lo
+                            && f.fragment_mz <= frag_hi
+                        {
+                            expected.push((f.peptide_index, f.fragment_mz.to_bits()));
+                        }
+                    }
+                }
+                let query = db.query(mass, tol);
+                let mut actual = Vec::new();
+                query.page_search_batch(&windows, |f| {
+                    actual.push((f.peptide_index, f.fragment_mz.to_bits()))
+                });
+                let mut unbatched: Vec<_> = windows
+                    .iter()
+                    .flat_map(|&(mass, tol)| query.page_search(mass, tol))
+                    .map(|f| (f.peptide_index, f.fragment_mz.to_bits()))
+                    .collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                unbatched.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "bucket={bucket_size}, mass={mass}, tol={tol:?}"
+                );
+                assert_eq!(unbatched, expected);
+            }
+            db.query(600.0, Tolerance::Da(-1000.0, 1000.0))
+                .page_search_batch(&[], |_| panic!("empty window list matched"));
+        }
+        IndexedDatabase::default()
+            .query(600.0, Tolerance::Da(-1000.0, 1000.0))
+            .page_search_batch(&windows, |_| panic!("empty database matched"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_scan_preserves_scalar_matches_order_and_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let values: Vec<_> = (0..80)
+            .map(|i| match i % 11 {
+                0 => f32::NAN,
+                1 => f32::NEG_INFINITY,
+                2 => f32::INFINITY,
+                3 => -0.0,
+                4 => 0.0,
+                _ => (i % 11) as f32,
+            })
+            .collect();
+        for offset in 0..8 {
+            for len in 0..=65 {
+                let masses = &values[offset..offset + len];
+                for (lo, hi) in [
+                    (-0.0, 0.0),
+                    (5.0, 8.0),
+                    (-f32::INFINITY, f32::INFINITY),
+                    (f32::NAN, 8.0),
+                    (0.0, f32::NAN),
+                    (9.0, 2.0),
+                ] {
+                    let mut expected = Vec::new();
+                    scan_masses_scalar(masses, lo, hi, |i| expected.push(i));
+                    let mut actual = Vec::new();
+                    // SAFETY: checked AVX2 support above.
+                    unsafe {
+                        scan_masses_avx2(masses, lo, hi, |i| actual.push(i));
+                    }
+                    assert_eq!(actual, expected, "offset={offset}, len={len}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn binary_search_slice_smoke() {

@@ -41,7 +41,8 @@ fn check_all_ions_visited(target_fragment_mz: f32, bucket_size: usize) {
     let fragment_tol = Tolerance::Da(-100.0, 100.0);
     let (frag_lo, frag_hi) = fragment_tol.bounds(target_fragment_mz);
 
-    for (chunk_idx, chunk) in database.fragments.chunks(database.bucket_size).enumerate() {
+    let fragments: Vec<_> = database.fragments().collect();
+    for (chunk_idx, chunk) in fragments.chunks(database.bucket_size).enumerate() {
         // Check for total ordering by PeptideIx within a chunk
         let mut last = PeptideIx(0);
         for frag in chunk {
@@ -103,8 +104,7 @@ fn target_peaks(db: &IndexedDatabase) -> (PeptideIx, Vec<Peak>) {
     let target_idx = PeptideIx(target_idx as u32);
 
     let peaks = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == target_idx)
         .map(|f| Peak {
             mass: f.fragment_mz,
@@ -619,8 +619,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
     );
 
     let peaks: Vec<Peak> = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == iso1)
         .map(|f| Peak {
             mass: f.fragment_mz,
@@ -703,8 +702,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
     );
 
     let peaks: Vec<Peak> = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == iso1)
         .map(|f| Peak {
             mass: f.fragment_mz,

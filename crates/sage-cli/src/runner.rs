@@ -315,7 +315,7 @@ impl Runner {
 
         info!(
             "generated {} fragments, {} peptides in {:#?}",
-            database.fragments.len(),
+            database.size(),
             database.peptides.len(),
             (start.elapsed())
         );
@@ -374,7 +374,7 @@ impl Runner {
 
                 info!(
                     "generated {} fragments, {} peptides in {}ms",
-                    db.fragments.len(),
+                    db.size(),
                     db.peptides.len(),
                     (Instant::now() - start).as_millis()
                 );
@@ -991,7 +991,7 @@ impl Runner {
         let telemetry = telemetry::Telemetry::new(
             self.parameters,
             self.database.peptides.len(),
-            self.database.fragments.len(),
+            self.database.size(),
             parquet,
             run_time,
         );
