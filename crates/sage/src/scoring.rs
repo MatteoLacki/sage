@@ -1111,14 +1111,20 @@ impl<'db> Scorer<'db> {
     /// means that pick probably isn't really the monoisotopic one). No cache, no
     /// theoretical comparison -- this only reads the real spectrum. See
     /// `plans/isotope_envelope_scoring.md` in the parent monorepo.
+    ///
+    /// Writes into `out` instead of returning a fresh `Vec` -- this is called
+    /// once per matched fragment inside `score_candidate`'s hot loop (per
+    /// candidate, per spectrum), so the caller allocates `out` once and reuses
+    /// it across every call; `out.clear()` here does not release its capacity.
     fn observed_isotope_ladder(
         &self,
         peaks: &[Peak],
         monoisotopic_mass: f32,
         charge: u8,
         k: i32,
-    ) -> Vec<f32> {
-        let mut observed = Vec::with_capacity((k + 2) as usize);
+        out: &mut Vec<f32>,
+    ) {
+        out.clear();
         for i in -1..=k {
             let mass_i = (monoisotopic_mass + i as f32 * NEUTRON) / charge as f32;
             let mut intensity = 0f32;
@@ -1127,9 +1133,8 @@ impl<'db> Scorer<'db> {
             {
                 intensity = peaks[idx].intensity;
             }
-            observed.push(intensity);
+            out.push(intensity);
         }
-        observed
     }
 
     /// Regenerate theoretical ions - initial database search might be
@@ -1159,6 +1164,14 @@ impl<'db> Scorer<'db> {
         let peptide = &self.db[score.peptide];
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
+
+        // Scratch buffer for `observed_isotope_ladder`, allocated once per candidate
+        // and reused for every matched fragment below -- see that function's doc
+        // comment. Not yet consumed by anything (no Feature field, no output
+        // column, no cache) -- wired here to prove the buffer-reuse path survives
+        // real integration; see plans/isotope_envelope_scoring.md.
+        const ISOTOPE_LADDER_K: i32 = 2;
+        let mut isotope_ladder_scratch: Vec<f32> = Vec::with_capacity((ISOTOPE_LADDER_K + 2) as usize);
 
         let mut b_run = Run::default();
         let mut y_run = Run::default();
@@ -1242,6 +1255,17 @@ impl<'db> Scorer<'db> {
                         fragments_details.mz_calculated.push(calc_mz);
                         fragments_details.fragment_ordinals.push(idx);
                         fragments_details.intensities.push(peak.intensity);
+
+                        self.observed_isotope_ladder(
+                            &query.peaks,
+                            frag.monoisotopic_mass,
+                            charge,
+                            ISOTOPE_LADDER_K,
+                            &mut isotope_ladder_scratch,
+                        );
+                        // isotope_ladder_scratch now holds NEUTRON-spaced observed
+                        // intensities (i=-1..=ISOTOPE_LADDER_K) around this matched
+                        // fragment -- not consumed further yet.
                     }
                 }
 
@@ -1435,8 +1459,13 @@ mod tests {
             },
         ];
 
-        let ladder = scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2);
+        let mut ladder = Vec::new();
+        scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2, &mut ladder);
 
+        assert_eq!(ladder, vec![5.0, 100.0, 20.0, 0.0]);
+
+        // reused buffer on a second call must not accumulate stale entries
+        scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2, &mut ladder);
         assert_eq!(ladder, vec![5.0, 100.0, 20.0, 0.0]);
     }
 
@@ -1452,7 +1481,8 @@ mod tests {
         let database = builder.make_parameters().build(fasta);
         let scorer = mk_isotope_test_scorer(&database);
 
-        let ladder = scorer.observed_isotope_ladder(&[], 500.0, 1, 2);
+        let mut ladder = Vec::new();
+        scorer.observed_isotope_ladder(&[], 500.0, 1, 2, &mut ladder);
 
         assert_eq!(ladder, vec![0.0, 0.0, 0.0, 0.0]);
     }
