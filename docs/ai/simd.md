@@ -176,3 +176,180 @@ Reproduce PSM comparison using `compare.py LEFT RIGHT`; use
 `compare_fragments.py LEFT RIGHT` for exact annotations and ordinal bounds,
 both with the pipeline Python from this repository root. Run comparisons after
 measurements, since sorting full annotation tables consumes CPU and memory.
+
+## Interleaved bound resolution and `bucket_size`, 2026-09-15
+
+Starting point `6c20f3f`. The control binary rebuilt from that commit hashes
+`9a9ac63f…`, identical to the frozen `sage-borrowed` above, so the two
+measurement rounds share a control.
+
+### What the previous round left unmeasured
+
+The SIMD utilization diagnostic counted scans and lane occupancy but never
+attributed elapsed time, so "most narrow-window scans cannot benefit from
+eight-lane filtering" was never turned into a bound on what the kernel could
+be worth. Combining that diagnostic's own two outputs does turn it into one:
+it spent 4.129 s × 16 threads = 66 CPU-s on 29,891,644 mass comparisons, i.e.
+2.2 µs per comparison. A float compare is ~1 ns, so the comparisons were never
+where the time went, and no change to the comparison kernel could have returned
+more than a few percent.
+
+A second instrumented build (`instrument_latency.py`) confirmed this directly by
+bracketing the two phases of `page_search_batch` with `lfence`-fenced `rdtsc`
+reads, on the same 10,000-precursor sample:
+
+| Phase | Cycles | Share |
+|---|---:|---:|
+| Peptide-ID bound resolution | 170,703,174,353 | **94.1%** |
+| Fragment-mass scan (incl. AVX2 kernel) | 10,632,892,021 | 5.9% |
+
+28,366,868 page groups, 37,269,240 windows — 2,837 groups per spectrum, each
+paying two `partition_point` calls over the DRAM-resident peptide-ID column.
+That is 6,017 cycles per group, ~200 cycles per binary-search step: full memory
+latency, with nothing overlapping it. The instrumented run took 4.374 s against
+4.129 s clean, so the 5.9% instrumentation overhead does not distort the split.
+
+The fragment-mass scan is the *only* phase the existing AVX2 kernel touches.
+Its 5.9% share caps that kernel's whole addressable surface at a 1.06× speedup.
+
+### Change
+
+`page_search_batch` now splits into three phases: collect distinct pages, resolve
+every page's `[inner_left, inner_right)` in `resolve_page_peptide_bounds`, then
+scan. The resolver steps 16 pages' searches in lockstep, two independent searches
+each (lower and upper bound), so 32 cache misses are outstanding at once instead
+of one. `inner_right` is resolved against the whole page rather than
+`ids[inner_left..]` — the column is sorted ascending and `pre_idx_lo <=
+pre_idx_hi`, so the index is the same, and decoupling them doubles the lanes.
+The inner step is branchless with a fixed trip count; a converged lane gets
+`half == 0` and re-probes its own `base` without moving.
+
+A binary search is a dependent load chain — the next address comes from the value
+just loaded — so a single search leaves the core's ~22 outstanding-miss slots idle
+while it stalls. Interleaving is what fills them. This is a memory-parallelism
+change, not a vectorization one: AVX2 gather would express the same probes in one
+instruction but Zen2 decomposes gathers into individual loads, so it would not
+beat the scalar interleaving.
+
+`bucket_size` turned out to matter more than the code. It was swept as a
+config-only experiment, no rebuild:
+
+| `bucket_size` | Search (10k sample, optimized build) |
+|---:|---:|
+| 8,192 | 2653 ms |
+| 32,768 (production) | 1771 ms |
+| 65,536 | 1573 ms |
+| 131,072 | 1306 ms |
+| 524,288 | 755 ms |
+| 2,097,152 | 451 ms |
+| 4,194,304 | 411 / 390 ms |
+
+Larger pages are faster because page-group count, not page length, sets the probe
+budget. Fragment windows are narrow (±13 ppm ≈ 0.026 Da) and mostly land on one
+page whatever the page size, so 128× larger pages cut groups per spectrum from
+2,837 to under 48 — 23.8× fewer binary searches — while each search grows by only
+seven steps. The precursor-filtered mass slice grows in proportion, but that slice
+is scanned sequentially and prefetchably, and is exactly what the AVX2 kernel
+accelerates. Random dependent probes are traded for streaming scans.
+
+### Measurements
+
+10,000-precursor sample, isolating the two contributions:
+
+| Build | `bucket_size` | Search | vs production |
+|---|---:|---:|---:|
+| control `9a9ac63f` | 32,768 | 4071 / 3966 ms | 1.00× |
+| optimized `cd2c3da5` | 32,768 | 1771 ms | 2.27× |
+| control `9a9ac63f` | 4,194,304 | 534 ms | 7.53× |
+| optimized `cd2c3da5` | 4,194,304 | 411 / 390 ms | **10.0×** |
+
+`bucket_size` alone accounts for 7.53×; the interleaved resolver adds 1.37× on
+top of it, and is worth 2.27× on its own at the production page size.
+
+Full F9477 (716,614 precursors), paired runs, same session and load, 16 threads:
+
+| Run | Search (s) | Wall (s) | User CPU (s) | Peak RSS (GiB) |
+|---|---:|---:|---:|---:|
+| control `9a9ac63f`, bucket 32,768 | 279.083 | 317.72 | 4446.22 | 20.23 |
+| optimized `cd2c3da5`, bucket 4,194,304 | **29.791** | **68.22** | **731.30** | 20.23 |
+
+**Search 9.37×, wall 4.66×, user CPU 6.08×.** Peak RSS is unchanged — this buys
+time with neither memory nor accuracy.
+
+### Where the time goes now
+
+Re-running the phase instrumentation on the optimized build shows the balance has
+inverted:
+
+| | bucket 32,768 | bucket 4,194,304 |
+|---|---:|---:|
+| Page groups | 28,366,868 | 1,192,620 |
+| Bound-resolution cycles | 57,564,771,770 (89.7%) | 2,913,117,889 (41.4%) |
+| Mass-scan cycles | 6,622,371,531 (10.3%) | 4,129,274,968 (58.6%) |
+
+Two consequences. The resolver cut bound-resolution cycles 2.97× at the production
+page size (170.7e9 → 57.6e9), confirming the mechanism rather than just the wall
+clock. And at the large page size the mass scan is now the *majority* of
+`page_search_batch` — so the AVX2 kernel, capped at 1.06× when this round started,
+is now operating on the dominant phase. Any further work on that kernel should be
+measured in this regime, not the old one.
+
+`page_search_batch` itself is now only ~39% of search CPU (7.04e9 cycles vs
+435 ms × 16 threads), against ~87% before. The remaining ~61% is scoring, which
+was never profiled and is the next thing to attribute.
+
+### Caveats
+
+`bucket_size = 4,194,304` leaves 48 pages for this database. That is near-degenerate
+— the mass bucketing is nearly vestigial — and the optimum depends on database size,
+fragment tolerance and peak count, none of which were varied. Returns are already
+flat from 2,097,152 (451 ms) to 4,194,304 (411 ms), so an intermediate value in the
+1M–4M range captures nearly all of the gain with a less extreme structure. A value
+chosen from index size rather than hardcoded would be better than any constant here.
+
+Only one or two runs per configuration, on an unpinned shared workstation. The
+9.37× full-run figure comes from a single paired comparison; the effect is far
+larger than the run-to-run variation seen in earlier rounds (which reached 15%),
+but it is not a precisely bounded number.
+
+### Validation
+
+`cargo test --workspace --all-features --offline`: **206 tests passed** (205 before,
+plus `batched_page_bounds_match_partition_point`, which checks the interleaved
+resolver against the per-page `partition_point` pair it replaced across bucket
+sizes 1–17, one- to nine-page indices, partial final pages, duplicate IDs, and
+every lower/upper key pair including empty and full-page ranges).
+
+Full F9477 output equivalence against the paired control:
+
+- 363,156 PSM identities identical; all 59 non-ID TSV columns byte-identical.
+- All 2,282,985 fragment annotation rows exact after PSM-ID mapping and row
+  sorting; every ordinal within 1..peptide length − 1.
+- Only `psm_id` differs, as in every previous round (scheduling-dependent).
+
+Additionally checked at the byte level, rather than through the comparison
+scripts' per-cell string equality: dropping the scheduling-dependent ID column
+and sorting the remaining lines makes `results.sage.tsv`,
+`matched_fragments.sage.tsv` **and `results.sage.pin`** hash-identical between
+the two runs. `results.sage.pin` is covered by neither `compare.py` nor
+`compare_fragments.py` — it is a separate output with its own feature columns,
+and its ID column is `SpecId`, not `psm_id`. Any future round should check it
+explicitly; the comparison scripts alone do not.
+
+Output equivalence was additionally confirmed on the 10k sample at bucket sizes
+524,288, 2,097,152 and 4,194,304, establishing that `bucket_size` is purely an
+index-organization parameter over a 128× range.
+
+Binary SHA-256: control `9a9ac63ff6ca38fec97a337e3d22a1e11ffed074f254fa00e489b8b438366e56`,
+optimized `cd2c3da59ed9f3296856a2e4c05a02049e25ae45473ed9a7340872f0a8702cb2`.
+
+### Reproduction
+
+`perf` was unavailable (`perf_event_paranoid = 4`, needs root), so all attribution
+is in-source. `instrument_latency.py` / `build_latency_diagnostic.py` patch, build
+and restore as `instrument.py` does; `run_sample.py LABEL BINARY [CONFIG]` and
+`run.py LABEL BINARY [CONFIG]` run the 10k sample and the full fixture, both taking
+an optional config path to override `bucket_size`. Config variants are written to
+`target/simd-benchmark/config_bucket<N>.json`. Freeze each binary and check its
+SHA-256 before comparing — the shared `target/release/sage` collision documented
+above still applies.

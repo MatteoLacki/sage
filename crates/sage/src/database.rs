@@ -604,6 +604,8 @@ impl IndexedQuery<'_> {
             let PageSearchScratch {
                 bounds,
                 page_window,
+                groups,
+                page_bounds,
             } = &mut *scratch;
             bounds.clear();
             page_window.clear();
@@ -624,20 +626,38 @@ impl IndexedQuery<'_> {
             }
             page_window.sort_unstable_by_key(|&(page, _)| page);
 
+            groups.clear();
             let mut i = 0;
             while i < page_window.len() {
                 let page = page_window[i].0;
-                let left_idx = page * self.db.bucket_size;
-                let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.size());
-                let ids = &self.db.fragment_peptide_indices[left_idx..right_idx];
-                let inner_left = ids.partition_point(|id| (id.0 as usize) < exact_pre_idx_lo);
-                let inner_right = inner_left
-                    + ids[inner_left..].partition_point(|id| (id.0 as usize) < self.pre_idx_hi);
-                let masses = &self.db.fragment_mzs[left_idx + inner_left..left_idx + inner_right];
-                let ids = &ids[inner_left..inner_right];
-
                 let mut j = i;
                 while j < page_window.len() && page_window[j].0 == page {
+                    j += 1;
+                }
+                groups.push((page, i, j));
+                i = j;
+            }
+
+            resolve_page_peptide_bounds(
+                &self.db.fragment_peptide_indices,
+                self.db.bucket_size,
+                self.db.size(),
+                groups,
+                exact_pre_idx_lo,
+                self.pre_idx_hi,
+                page_bounds,
+            );
+
+            for (group_idx, &(page, window_start, window_end)) in groups.iter().enumerate() {
+                let (inner_left, inner_right) = page_bounds[group_idx];
+                let (inner_left, inner_right) = (inner_left as usize, inner_right as usize);
+                let left_idx = page * self.db.bucket_size;
+                let masses = &self.db.fragment_mzs[left_idx + inner_left..left_idx + inner_right];
+                let ids = &self.db.fragment_peptide_indices
+                    [left_idx + inner_left..left_idx + inner_right];
+
+                let mut j = window_start;
+                while j < window_end {
                     let (fragment_lo, fragment_hi) = bounds[page_window[j].1];
                     let mut emit = |idx: usize| {
                         on_match(Theoretical {
@@ -655,9 +675,100 @@ impl IndexedQuery<'_> {
                     scan_masses_scalar(masses, fragment_lo, fragment_hi, &mut emit);
                     j += 1;
                 }
-                i = j;
             }
         });
+    }
+}
+
+/// Resolve each page's precursor-scoped `[inner_left, inner_right)` peptide-ID
+/// range, running many pages' binary searches interleaved rather than one
+/// after another.
+///
+/// Each search is ~15 *dependent* loads into a DRAM-resident ID column
+/// (198M fragments here), so a search run on its own stalls on memory for
+/// nearly its whole duration and leaves the core's miss parallelism idle.
+/// Stepping `LANES` independent searches in lockstep keeps that many misses
+/// in flight at once. Measured on F9477: this resolution was 94.1% of search
+/// cycles, at ~200 cycles per binary-search step -- i.e. full memory latency,
+/// unoverlapped. See `docs/ai/simd.md`.
+///
+/// `pre_idx_lo`/`pre_idx_hi` are fixed for one `IndexedQuery`, so every page
+/// searches for the same two keys. `inner_right` is resolved against the
+/// whole page instead of `ids[inner_left..]`: the column is sorted ascending
+/// and `pre_idx_lo <= pre_idx_hi`, so both give the same index, and searching
+/// the full page makes the two searches independent -- doubling how many can
+/// be in flight.
+fn resolve_page_peptide_bounds(
+    all_ids: &[PeptideIx],
+    bucket_size: usize,
+    total: usize,
+    groups: &[(usize, usize, usize)],
+    pre_idx_lo: usize,
+    pre_idx_hi: usize,
+    out: &mut Vec<(u32, u32)>,
+) {
+    /// Pages resolved per chunk; each contributes two independent searches,
+    /// so `LANES * 2` misses are in flight at once. Sized against the core's
+    /// outstanding-miss capacity, not the vector width.
+    const LANES: usize = 16;
+    const SLOTS: usize = LANES * 2;
+
+    out.clear();
+    out.reserve(groups.len());
+    if all_ids.is_empty() {
+        return;
+    }
+
+    for chunk in groups.chunks(LANES) {
+        // Two slots per page: even = lower bound, odd = upper bound.
+        let mut base = [0usize; SLOTS];
+        let mut remaining = [0usize; SLOTS];
+        let mut page_start = [0usize; LANES];
+        let mut longest_page = 0usize;
+
+        for (c, &(page, _, _)) in chunk.iter().enumerate() {
+            let left = page * bucket_size;
+            let right = ((page + 1) * bucket_size).min(total);
+            let len = right - left;
+            page_start[c] = left;
+            base[2 * c] = left;
+            base[2 * c + 1] = left;
+            remaining[2 * c] = len;
+            remaining[2 * c + 1] = len;
+            longest_page = longest_page.max(len);
+        }
+
+        // Every slot takes the same number of halving steps, so the trip
+        // count is fixed and the body unrolls: a branch per slot per step
+        // would serialize exactly the loads this is here to overlap. A slot
+        // that has already converged (`remaining <= 1`, including the unused
+        // slots of a short final chunk) gets `half == 0`, which re-probes its
+        // own `base` and applies no movement.
+        let steps = usize::BITS - longest_page.saturating_sub(1).leading_zeros();
+        for _ in 0..steps {
+            for slot in 0..SLOTS {
+                let half = remaining[slot] / 2;
+                let key = if slot % 2 == 0 { pre_idx_lo } else { pre_idx_hi };
+                // SAFETY: `base[slot]` indexes inside its page and
+                // `half <= remaining[slot]`, so `base + half - 1` stays
+                // within that page; converged slots re-read `base[slot]`,
+                // which is itself in bounds. `all_ids` is non-empty.
+                let probe =
+                    unsafe { all_ids.get_unchecked(base[slot] + half.saturating_sub(1)).0 } as usize;
+                base[slot] += ((probe < key) as usize) * half;
+                remaining[slot] -= half;
+            }
+        }
+
+        for c in 0..chunk.len() {
+            let lo_base = base[2 * c];
+            let hi_base = base[2 * c + 1];
+            let inner_left =
+                lo_base + ((all_ids[lo_base].0 as usize) < pre_idx_lo) as usize - page_start[c];
+            let inner_right =
+                hi_base + ((all_ids[hi_base].0 as usize) < pre_idx_hi) as usize - page_start[c];
+            out.push((inner_left as u32, inner_right as u32));
+        }
     }
 }
 
@@ -700,6 +811,10 @@ unsafe fn scan_masses_avx2(masses: &[f32], lo: f32, hi: f32, mut on_match: impl 
 struct PageSearchScratch {
     bounds: Vec<(f32, f32)>,
     page_window: Vec<(usize, usize)>,
+    /// One entry per distinct page: `(page, window_start, window_end)`.
+    groups: Vec<(usize, usize, usize)>,
+    /// `(inner_left, inner_right)` per entry in `groups`.
+    page_bounds: Vec<(u32, u32)>,
 }
 
 thread_local! {
@@ -975,5 +1090,73 @@ mod test {
             peptides.last().unwrap().proteins,
             vec!["sp|AAAAA".to_string().into()]
         );
+    }
+
+    /// The interleaved resolver must agree exactly with the straightforward
+    /// per-page `partition_point` pair it replaced, including at page
+    /// boundaries, on partial final pages, and when the requested peptide-ID
+    /// range is empty or covers the whole page.
+    #[test]
+    fn batched_page_bounds_match_partition_point() {
+        fn reference(
+            all_ids: &[PeptideIx],
+            bucket_size: usize,
+            total: usize,
+            page: usize,
+            lo: usize,
+            hi: usize,
+        ) -> (u32, u32) {
+            let left = page * bucket_size;
+            let right = ((page + 1) * bucket_size).min(total);
+            let ids = &all_ids[left..right];
+            let inner_left = ids.partition_point(|id| (id.0 as usize) < lo);
+            let inner_right =
+                inner_left + ids[inner_left..].partition_point(|id| (id.0 as usize) < hi);
+            (inner_left as u32, inner_right as u32)
+        }
+
+        // Sorted-per-page ID columns with duplicates and gaps, plus a
+        // deliberately short final page.
+        for &bucket_size in &[1usize, 2, 3, 8, 17] {
+            for &n_pages in &[1usize, 2, 5, 9] {
+                for &tail in &[0usize, 1] {
+                    let total = n_pages * bucket_size + tail;
+                    if total == 0 {
+                        continue;
+                    }
+                    let mut all_ids = Vec::with_capacity(total);
+                    for page in 0..=n_pages {
+                        let start = page * bucket_size;
+                        let end = (start + bucket_size).min(total);
+                        for k in start..end {
+                            // Ascending within each page, with duplicates.
+                            all_ids.push(PeptideIx(((k - start) as u32 / 2) * 3));
+                        }
+                    }
+                    let pages = total.div_ceil(bucket_size);
+                    let max_id = 3 * (bucket_size as u32 / 2 + 2);
+
+                    for lo in 0..=max_id as usize {
+                        for hi in lo..=max_id as usize {
+                            let groups: Vec<(usize, usize, usize)> =
+                                (0..pages).map(|p| (p, 0, 0)).collect();
+                            let mut out = Vec::new();
+                            resolve_page_peptide_bounds(
+                                &all_ids, bucket_size, total, &groups, lo, hi, &mut out,
+                            );
+                            assert_eq!(out.len(), pages);
+                            for (idx, &(page, _, _)) in groups.iter().enumerate() {
+                                assert_eq!(
+                                    out[idx],
+                                    reference(&all_ids, bucket_size, total, page, lo, hi),
+                                    "bucket_size={} total={} page={} lo={} hi={}",
+                                    bucket_size, total, page, lo, hi
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
