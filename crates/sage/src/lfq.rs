@@ -240,7 +240,7 @@ impl FeatureMap {
                 let rt = (spectrum.scan_start_time / a.max_rt) * a.slope + a.intercept;
                 let query = self.rt_slice(rt, RT_TOL);
 
-                for peak in &spectrum.peaks {
+                for peak in spectrum.peaks.iter() {
                     for entry in query.mass_lookup(peak.mass) {
                         let id = match self.settings.combine_charge_states {
                             true => PrecursorId::Combined(entry.peptide),
@@ -270,7 +270,7 @@ impl FeatureMap {
                 let rt = (spectrum.scan_start_time / a.max_rt) * a.slope + a.intercept;
                 let query = self.rt_slice(rt, RT_TOL);
 
-                for peak in &spectrum.peaks {
+                for peak in spectrum.peaks.iter() {
                     for entry in query.mass_mobility_lookup(peak.mass, peak.mobility) {
                         let id = match self.settings.combine_charge_states {
                             true => PrecursorId::Combined(entry.peptide),

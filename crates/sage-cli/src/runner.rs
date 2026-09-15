@@ -467,7 +467,7 @@ impl Runner {
     fn peptide_filter_processed_spectra(
         &self,
         scorer: &Scorer,
-        spectra: &Vec<ProcessedSpectrum<sage_core::spectrum::Peak>>,
+        spectra: &Vec<ProcessedSpectrum>,
         keep: &[std::sync::atomic::AtomicBool],
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -532,7 +532,7 @@ impl Runner {
     fn search_processed_spectra(
         &self,
         scorer: &Scorer,
-        msn_spectra: &Vec<ProcessedSpectrum<sage_core::spectrum::Peak>>,
+        msn_spectra: &Vec<ProcessedSpectrum>,
     ) -> Vec<Feature> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = AtomicUsize::new(0);
@@ -563,7 +563,7 @@ impl Runner {
 
     fn complete_features(
         &self,
-        msn_spectra: Vec<ProcessedSpectrum<sage_core::spectrum::Peak>>,
+        msn_spectra: Vec<ProcessedSpectrum>,
         ms1_spectra: MS1Spectra,
         features: Vec<Feature>,
     ) -> SageResults {
@@ -609,10 +609,7 @@ impl Runner {
         chunk: &[Url],
         chunk_idx: usize,
         batch_size: usize,
-    ) -> (
-        MS1Spectra,
-        Vec<ProcessedSpectrum<sage_core::spectrum::Peak>>,
-    ) {
+    ) -> (MS1Spectra, Vec<ProcessedSpectrum>) {
         // Read all of the spectra at once - this can help prevent memory over-consumption issues
         info!(
             "processing files {} .. {} ",
@@ -643,6 +640,23 @@ impl Runner {
             self.parameters.assume_sorted_peaks,
         );
 
+        if let Some(paths) = &self.parameters.pmsms_paths {
+            let spectra = match sage_cloudpath::pmsms::parse_processed(
+                &paths.pmsms,
+                &paths.precursors,
+                chunk_idx * batch_size,
+                &sp,
+            ) {
+                Ok(spectra) => spectra,
+                Err(error) => {
+                    log::error!("- {}: {}", paths.pmsms.display(), error);
+                    Vec::new()
+                }
+            };
+            info!("- file IO: {:8} ms", start.elapsed().as_millis());
+            return (MS1Spectra::Empty, spectra);
+        }
+
         // If the file format supports parallel reading, then we can read
         // then it is faster to read each file in series. (since each spectra
         // will be processed internally in parallel).
@@ -652,16 +666,13 @@ impl Runner {
         log::trace!("file serial read: {}", file_serial_read);
         let inner_closure = |(idx, path)| {
             let file_id = chunk_idx * batch_size + idx;
-            let res = match &self.parameters.pmsms_paths {
-                Some(pmsms_paths) => sage_cloudpath::util::read_pmsms_explicit(pmsms_paths, file_id),
-                None => sage_cloudpath::util::read_spectra(
-                    path,
-                    file_id,
-                    sn,
-                    self.parameters.bruker_config,
-                    self.requires_ms1(),
-                ),
-            };
+            let res = sage_cloudpath::util::read_spectra(
+                path,
+                file_id,
+                sn,
+                self.parameters.bruker_config,
+                self.requires_ms1(),
+            );
 
             match res {
                 Ok(s) => {

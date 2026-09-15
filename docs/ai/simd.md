@@ -2,6 +2,18 @@
 
 Branch: `optimizations/simd`, based on `42510e4` (`Add unlimited_max_peaks and assume_sorted_peaks config flags`).
 
+## Correctness update, 2026-09-15
+
+Both original benchmark binaries contain the pre-existing per-kind fragment-index
+regression introduced by `5753d07`. Their output equivalence establishes that the
+index optimization preserved the affected behavior, not that MS2 similarity
+features were correct. Fix `548ffd5` restores per-kind numbering. See
+[`interai/2026-09-15_ms2_similarity_regression.md`](../../interai/2026-09-15_ms2_similarity_regression.md).
+The original timings below remain historical measurements; spectrum-layout and
+mapped-input follow-ups must use a corrected `548ffd5` control and corrected
+optimized builds. The isolated one-ULP posterior-error variation is separate
+from this systematic fragment-annotation and intensity-lookup regression.
+
 ## Change
 
 The fragment index stores separate `f32` masses and `PeptideIx` columns, preserving the original fragment-page and within-page peptide order. Its resident payload remains eight bytes per fragment. Index construction still sorts temporary `Theoretical` records before splitting them into the two columns, so construction temporarily holds both representations.
@@ -50,13 +62,13 @@ Both optimized runs have identical 363,156 PSM identities and all 59 non-ID TSV 
 
 The repeat baseline has one additional difference, also present when comparing the two **baseline** runs: `posterior_error` for `precursor_idx=616655`, peptide `QEYDESGPSIVHR`, changes from `-224.89215` to `-224.89214` (one float32 ULP). Both optimized runs retain the first baseline's value. All other non-ID columns match. This is existing downstream run-to-run variation, not a difference introduced by the patch. KDE density estimation (`ml/kde.rs`) uses a parallel floating-point fold and sum; changing reduction order is a likely mechanism, though that particular reduction was not instrumented. The strict comparison script intentionally flags it; its failure report is retained as `compare-baseline-3-simd-2.json`.
 
-## Reproduction
+## Reproduction of the historical index experiment
 
 Run from this repository root. Python preparation/comparison use the pipeline's existing `../../venvs/common/bin/python`; the run wrapper needs only Python's standard library. The scripts are specific to this F9477 fixture and write under `target/simd-benchmark`.
 
 1. Preserve a release baseline binary built from `42510e4` as `target/simd-benchmark/sage-baseline`.
 2. Run `../../venvs/common/bin/python docs/ai/simd_benchmark/prepare.py` to recover the saved invocation and prepare prediction copies.
-3. Build this branch with `cargo build --release --bin sage --offline`; preserve the result as `target/simd-benchmark/sage-simd`.
+3. Build commit `01600dd` with `cargo build --release --bin sage --offline`; preserve the result as `target/simd-benchmark/sage-simd`. Later branch revisions include additional changes and do not reproduce this historical binary.
 4. Run `python3 docs/ai/simd_benchmark/run.py LABEL BINARY` for each timing. Labels must be new output directories. The original run sequence was baseline-2, simd-1, simd-2, baseline-3.
 5. Run `../../venvs/common/bin/python docs/ai/simd_benchmark/compare.py BASELINE_LABEL SIMD_LABEL` for exact TSV comparisons.
 
@@ -76,6 +88,91 @@ Most narrow-window F9477 scans cannot benefit from eight-lane filtering. These c
 
 To reproduce the diagnostic after the full measurements: run `sample.py` with the pipeline Python, `build_diagnostic.py` with Python 3, then `run_diagnostic.py` with the pipeline Python, all from `docs/ai/simd_benchmark/`. `build_diagnostic.py` saves/restores both affected Rust files in a `finally` block and restores the frozen optimized release binary. Avoid concurrent edits to those two files while it runs. Raw counts are retained in `target/simd-benchmark/scan-statistics.json` and the diagnostic log.
 
-## Spectrum-side follow-up discussed during this experiment
+## Processed spectrum SoA and borrowed input, 2026-09-15
 
-The mmappet reader maps separate `mz: f32` and `intensity: u32` columns, but copies per-spectrum m/z slices and converts intensity into owned `RawSpectrum` vectors. Preprocessing then constructs `Vec<Peak { intensity, mass }>`. Preserving separate processed mass/intensity/charge columns would give mass-only search contiguous access; borrowing mapped raw ranges could also avoid the intermediate raw-vector allocations. With this F9477 configuration, deisotoping, peak selection and neutral-mass conversion still require transformed storage. A future experiment could use borrowed raw columns followed by owned processed columns, measuring input/preprocessing time, search time and peak RSS independently.
+The corrected control is commit `548ffd5`: SIMD fragment index plus fixed
+per-kind fragment numbering, with the original processed AoS/raw-copy path.
+The SoA-only snapshot replaces non-mobility `Vec<Peak>` storage with
+`PeakColumns`, searches the mass column directly, and passes the existing
+intensity slice to top-six scoring rather than allocating a per-candidate copy.
+Chimera removal compacts mass, intensity and observed charge columns together.
+
+The final snapshot additionally processes borrowed mapped m/z and u32 intensity
+ranges for explicit `--pmsms`/`--precursors` input. Parallel collection preserves
+precursor order; returned spectra own their selected SoA columns. Conversion to
+f32 precedes intensity comparisons and accumulation, preserving rounding ties.
+Final columns reserve the exact retained count through an exact-size iterator;
+temporary selection/deisotoping storage still scales with raw peak count.
+Legacy owned-reader APIs and positional `.pmsms` input still copy raw columns.
+See [input details](pmsms_input.md).
+
+Both optimized snapshots retain fix `548ffd5`. The new scoring regression test
+uses observed spectra matching nonuniform predictions, checks both b/y traversal
+orders, exact fragment ordinals, and unit cosine/entropy/Pearson similarity.
+Temporarily restoring global numbering makes this test fail on zero/negative
+y-ordinals; the fixed source was restored before builds and measurements.
+Borrowed-input tests additionally cover u32-to-f32 rounding ties, real isotope
+envelopes, empty/singleton spectra, top-N limits, and both precursor formats,
+including metadata and use of returned spectra after mapping closure.
+
+### Measurements
+
+Same full F9477 fixture and 16-thread release settings as above. Each row is
+one complete run; the last control repeats the frozen corrected-control binary.
+The first control occurred several hours before the other runs, so the repeat
+helps expose workstation/cache drift. No compilation, tests, or large output
+comparisons overlap measured runs.
+
+| Run | Input + preprocessing (s) | Search (s) | Wall (s) | Peak RSS (GiB) |
+|---|---:|---:|---:|---:|
+| fixed-control-1 | 31.945 | 286.132 | 344.456 | 28.868 |
+| fixed-soa-2 | 25.213 | 288.222 | 339.375 | 28.856 |
+| borrowed-2 | 14.270 | 291.286 | 330.353 | 20.232 |
+| fixed-control-2 | 27.559 | 352.777 | 407.408 | 28.858 |
+
+The robust benefit is memory and input/preprocessing: peak RSS falls from
+approximately 28.87 to 20.23 GiB
+(29.9% lower). Input plus preprocessing takes
+14.270 s with borrowing versus 27.559 s
+in the repeat control (48.2% lower), and 25.213 s
+in the SoA-only run. SoA alone does not establish a search-phase gain; one run
+per optimized variant and an unpinned shared workstation limit timing conclusions.
+These follow-ups measure changes on top of the SIMD index, not a remeasurement
+of the historical index speedup. No scalar-SoA index ablation was run.
+
+### Validation and artifacts
+
+`cargo test --workspace --all-features --offline`: **205 tests passed** for the
+final source. SoA-only had 203 passing tests. Both optimized variants have the
+same 363,156 PSM identities as corrected control and all 59 non-ID TSV columns
+byte-identical, including every MS2 similarity feature and posterior error in
+these comparisons. The final borrowed-input build additionally matches all
+2,282,985 fragment annotation rows exactly after PSM-ID mapping and row sorting;
+every ordinal lies between 1 and peptide length minus one.
+
+Frozen binaries and SHA-256:
+
+- `sage-fixed-control`: `2f495ec580f6f843b39ea2b6e9ccc43c03f16c7fcbcbb970af013976934d930f`
+- `sage-fixed-soa`: `6be11d780f82c8e953eacf61dad96670008834f0cafb70370775f4db30fe5ab5`
+- `sage-borrowed`: `9a9ac63ff6ca38fec97a337e3d22a1e11ffed074f254fa00e489b8b438366e56`
+
+Build snapshots are `fixed-soa.patch` and `borrowed.patch` against `548ffd5`,
+under `target/simd-benchmark`. The corrected control was built from an isolated
+`git archive 548ffd5`. When sharing Cargo's target directory between source
+snapshots, force a rebuild of the three local packages before freezing the next
+executable; a cached build can otherwise leave the previous executable at the
+shared `target/release/sage` path. Verify distinct binary hashes before comparison.
+Separate target directories also avoid that collision.
+
+Excluded attempts: `fixed-soa-1` was stopped after hash verification identified
+the control executable at the shared output path; `borrowed-1` stopped before
+launch because its build was not yet ready. Neither contributes measurements.
+The run wrapper now records each binary's SHA-256 and input/preprocessing time.
+
+`target/simd-benchmark/spectra-timings.json` preserves the full table and CPU
+measurements. Regression-test pass/mutation logs, workspace-test logs, build
+logs, full outputs, and comparison JSON files are retained alongside it.
+Reproduce PSM comparison using `compare.py LEFT RIGHT`; use
+`compare_fragments.py LEFT RIGHT` for exact annotations and ordinal bounds,
+both with the pipeline Python from this repository root. Run comparisons after
+measurements, since sorting full annotation tables consumes CPU and memory.

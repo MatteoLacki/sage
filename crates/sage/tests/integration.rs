@@ -175,7 +175,7 @@ fn candidate_unreachable_without_custom_window() {
         level: 2,
         id: "no-window".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -210,7 +210,7 @@ fn candidate_reachable_with_wide_custom_window() {
         level: 2,
         id: "wide-window".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -282,7 +282,7 @@ fn candidate_unreachable_outside_rt_tol() {
         id: "rt-mismatch".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -328,7 +328,7 @@ fn candidate_reachable_within_rt_tol() {
         id: "rt-match".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -378,7 +378,7 @@ fn delta_rt_z2_external_computed_from_sigma() {
         id: "rt-z2".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -425,7 +425,7 @@ fn delta_rt_z2_external_zero_without_sigma() {
         id: "rt-z2-no-sigma".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -465,7 +465,7 @@ fn candidate_unreachable_outside_iim_tol() {
         level: 2,
         id: "iim-mismatch".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -506,7 +506,7 @@ fn candidate_reachable_within_iim_tol() {
         level: 2,
         id: "iim-match".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -551,7 +551,7 @@ fn delta_ims_z2_external_computed_from_sigma() {
         level: 2,
         id: "iim-z2".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -641,7 +641,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
         id: "rt-tiebreak".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -724,7 +724,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
         id: "rt-tiebreak-hyperscore-mode".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 

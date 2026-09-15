@@ -27,8 +27,11 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
+use rayon::prelude::*;
 use sage_core::mass::Tolerance;
-use sage_core::spectrum::{Precursor, RawSpectrum, Representation};
+use sage_core::spectrum::{
+    Precursor, ProcessedSpectrum, RawSpectrum, Representation, SpectrumProcessor,
+};
 
 pub use crate::util::PmsmsPaths;
 
@@ -70,7 +73,11 @@ fn decode_charges(encoded: i64) -> Vec<u8> {
     s.bytes()
         .filter_map(|b| {
             let d = b.wrapping_sub(b'0');
-            if d > 0 && d <= 9 { Some(d) } else { None }
+            if d > 0 && d <= 9 {
+                Some(d)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -169,11 +176,7 @@ fn mmappet_column_index(
         .find(|(_, (_, colname))| colname == name)
         .ok_or(PmsmsError::MissingColumn(name))?;
     if dtype != expected_dtype {
-        return Err(PmsmsError::WrongDtype(
-            name,
-            dtype.clone(),
-            expected_dtype,
-        ));
+        return Err(PmsmsError::WrongDtype(name, dtype.clone(), expected_dtype));
     }
     Ok(idx)
 }
@@ -279,6 +282,39 @@ pub fn parse(
     precursors_path: &Path,
     file_id: usize,
 ) -> Result<Vec<RawSpectrum>, PmsmsError> {
+    parse_with(pmsms_dir, precursors_path, file_id, |s| RawSpectrum {
+        file_id: s.file_id,
+        ms_level: s.ms_level,
+        id: s.id,
+        precursors: s.precursors,
+        representation: s.representation,
+        scan_start_time: s.scan_start_time,
+        ion_injection_time: s.ion_injection_time,
+        total_ion_current: s.total_ion_current,
+        mz: s.mz.to_vec(),
+        intensity: s.intensity.iter().map(|&i| i as f32).collect(),
+        mobility: s.mobility,
+    })
+}
+
+/// Process borrowed mapped fragment columns into owned, selected peak columns.
+pub fn parse_processed(
+    pmsms_dir: &Path,
+    precursors_path: &Path,
+    file_id: usize,
+    processor: &SpectrumProcessor,
+) -> Result<Vec<ProcessedSpectrum>, PmsmsError> {
+    parse_with(pmsms_dir, precursors_path, file_id, |s| {
+        processor.process(s)
+    })
+}
+
+fn parse_with<T: Send>(
+    pmsms_dir: &Path,
+    precursors_path: &Path,
+    file_id: usize,
+    transform: impl for<'a> Fn(RawSpectrum<&'a [f32], &'a [u32]>) -> T + Sync,
+) -> Result<Vec<T>, PmsmsError> {
     let precursors = read_precursors(precursors_path)?;
 
     let frag_schema = read_mmappet_schema(pmsms_dir)?;
@@ -292,59 +328,59 @@ pub fn parse(
     let (_frag_int_mmap, frag_int) =
         unsafe { mmap_as_slice::<u32>(&pmsms_dir.join(format!("{i_int}.bin")))? };
 
-    let mut spectra = Vec::with_capacity(precursors.len());
+    let spectra = precursors
+        .into_par_iter()
+        .map(|p| {
+            let start = p.frag_start as usize;
+            let end = start + p.frag_count as usize;
 
-    for p in &precursors {
-        let start = p.frag_start as usize;
-        let end = start + p.frag_count as usize;
+            let mz = &frag_mz[start..end];
+            let int_slice = &frag_int[start..end];
 
-        let mz_vec = frag_mz[start..end].to_vec();
-        let int_slice = &frag_int[start..end];
+            let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
 
-        let int_vec: Vec<f32> = int_slice.iter().map(|&i| i as f32).collect();
-        let total_ion_current: f32 = int_vec.iter().sum();
+            let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
 
-        let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
-
-        // One Precursor per charge state — mirrors how the MGF parser handles
-        // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
-        let precursors: Vec<Precursor> = if p.charges.is_empty() {
-            vec![Precursor {
-                mz: p.mz,
-                intensity: None,
-                charge: None,
-                spectrum_ref: None,
-                isolation_window,
-                inverse_ion_mobility: Some(p.iim),
-            }]
-        } else {
-            p.charges
-                .iter()
-                .map(|&c| Precursor {
+            // One Precursor per charge state — mirrors how the MGF parser handles
+            // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
+            let precursors: Vec<Precursor> = if p.charges.is_empty() {
+                vec![Precursor {
                     mz: p.mz,
                     intensity: None,
-                    charge: Some(c),
+                    charge: None,
                     spectrum_ref: None,
                     isolation_window,
                     inverse_ion_mobility: Some(p.iim),
-                })
-                .collect()
-        };
+                }]
+            } else {
+                p.charges
+                    .iter()
+                    .map(|&c| Precursor {
+                        mz: p.mz,
+                        intensity: None,
+                        charge: Some(c),
+                        spectrum_ref: None,
+                        isolation_window,
+                        inverse_ion_mobility: Some(p.iim),
+                    })
+                    .collect()
+            };
 
-        spectra.push(RawSpectrum {
-            file_id,
-            ms_level: 2,
-            id: format!("precursor_idx={}", p.precursor_idx),
-            precursors,
-            representation: Representation::Centroid,
-            scan_start_time: p.rt_minutes,
-            ion_injection_time: 0.0,
-            total_ion_current,
-            mz: mz_vec,
-            intensity: int_vec,
-            mobility: None,
-        });
-    }
+            transform(RawSpectrum {
+                file_id,
+                ms_level: 2,
+                id: format!("precursor_idx={}", p.precursor_idx),
+                precursors,
+                representation: Representation::Centroid,
+                scan_start_time: p.rt_minutes,
+                ion_injection_time: 0.0,
+                total_ion_current,
+                mz,
+                intensity: int_slice,
+                mobility: None,
+            })
+        })
+        .collect();
 
     Ok(spectra)
 }
@@ -383,6 +419,47 @@ mod test {
                 // both readers must fall back to `None` (run's global precursor_tol).
                 assert!(pa.isolation_window.is_none());
                 assert!(pb.isolation_window.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_processing_matches_owned_reader_for_both_precursor_formats() {
+        let dir = fixture_dir();
+        for name in ["precursors.parquet", "precursors.mmappet"] {
+            for deisotope in [false, true] {
+                for top_n in [0, 2, usize::MAX] {
+                    let processor = SpectrumProcessor::new(top_n, deisotope, 0.0, false);
+                    let expected: Vec<_> = parse(&dir.join("pmsms.mmappet"), &dir.join(name), 7)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| processor.process(s))
+                        .collect();
+                    let actual =
+                        parse_processed(&dir.join("pmsms.mmappet"), &dir.join(name), 7, &processor)
+                            .unwrap();
+                    // The reader's mappings are already closed here.
+                    assert_eq!(actual.len(), expected.len());
+                    for (a, b) in actual.iter().zip(&expected) {
+                        assert_eq!(a.peaks, b.peaks);
+                        assert_eq!(a.peak_charges, b.peak_charges);
+                        assert_eq!(a.total_ion_current.to_bits(), b.total_ion_current.to_bits());
+                        assert_eq!(a.id, b.id);
+                        assert_eq!(a.file_id, b.file_id);
+                        assert_eq!(a.level, b.level);
+                        assert_eq!(a.scan_start_time, b.scan_start_time);
+                        assert_eq!(a.ion_injection_time, b.ion_injection_time);
+                        assert_eq!(a.precursors.len(), b.precursors.len());
+                        for (pa, pb) in a.precursors.iter().zip(&b.precursors) {
+                            assert_eq!(pa.mz, pb.mz);
+                            assert_eq!(pa.charge, pb.charge);
+                            assert_eq!(pa.intensity, pb.intensity);
+                            assert_eq!(pa.spectrum_ref, pb.spectrum_ref);
+                            assert_eq!(pa.inverse_ion_mobility, pb.inverse_ion_mobility);
+                            assert_eq!(pa.isolation_window, pb.isolation_window);
+                        }
+                    }
+                }
             }
         }
     }

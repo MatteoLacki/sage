@@ -1,4 +1,4 @@
-import json, os, pathlib, re, subprocess, sys, time
+import hashlib, json, os, pathlib, re, subprocess, sys, time
 
 root = pathlib.Path("target/simd-benchmark").resolve()
 label, binary = sys.argv[1:]
@@ -10,6 +10,8 @@ argv[0] = str(pathlib.Path(binary).resolve())
 argv[argv.index("--output_directory") + 1] = str(out)
 (out / "command.json").write_text(json.dumps(argv, indent=2))
 env = dict(os.environ, RAYON_NUM_THREADS=str(manifest["threads"]))
+binary_sha256 = hashlib.sha256(pathlib.Path(argv[0]).read_bytes()).hexdigest()
+(out / "binary.sha256").write_text(f"{binary_sha256}  {argv[0]}\n")
 start = time.monotonic()
 with (out / "run.log").open("w") as log:
     result = subprocess.run(
@@ -22,7 +24,9 @@ log = (out / "run.log").read_text()
 summary = {
     "label": label,
     "exit_code": result.returncode,
+    "binary_sha256": binary_sha256,
     "wall_seconds": time.monotonic() - start,
+    "file_io_ms": re.findall(r"- file IO:\s+(\d+) ms", log),
     "search_ms": re.findall(r"- search:\s+(\d+) ms", log),
 }
 (out / "summary.json").write_text(json.dumps(summary, indent=2))

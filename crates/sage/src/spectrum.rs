@@ -8,6 +8,48 @@ pub struct Peak {
     pub mass: f32,
 }
 
+/// Matched peak columns. Both arrays always have the same length and order.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct PeakColumns {
+    masses: Vec<f32>,
+    intensities: Vec<f32>,
+}
+
+impl PeakColumns {
+    pub fn len(&self) -> usize {
+        self.masses.len()
+    }
+    pub fn masses(&self) -> &[f32] {
+        &self.masses
+    }
+    pub fn intensities(&self) -> &[f32] {
+        &self.intensities
+    }
+    pub fn peak(&self, index: usize) -> Peak {
+        Peak {
+            mass: self.masses[index],
+            intensity: self.intensities[index],
+        }
+    }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Peak> + '_ {
+        self.masses
+            .iter()
+            .zip(&self.intensities)
+            .map(|(&mass, &intensity)| Peak { mass, intensity })
+    }
+}
+
+impl From<Vec<Peak>> for PeakColumns {
+    fn from(peaks: Vec<Peak>) -> Self {
+        // The exact-size iterator lets unzip reserve the retained count in each column.
+        let (masses, intensities) = peaks.into_iter().map(|p| (p.mass, p.intensity)).unzip();
+        Self {
+            masses,
+            intensities,
+        }
+    }
+}
+
 impl Eq for Peak {}
 
 impl PartialOrd for Peak {
@@ -100,7 +142,7 @@ impl Precursor {
 }
 
 #[derive(Clone, Default, Debug)]
-pub struct ProcessedSpectrum<T> {
+pub struct ProcessedSpectrum<T = PeakColumns> {
     /// MSn level
     pub level: u8,
     /// Scan ID
@@ -114,7 +156,7 @@ pub struct ProcessedSpectrum<T> {
     /// Selected ions for precursors, if `level > 1`
     pub precursors: Vec<Precursor>,
     /// MS peaks, sorted by mass in ascending order
-    pub peaks: Vec<T>,
+    pub peaks: T,
     /// Parallel to `peaks`. Non-empty only when deisotoping is enabled;
     /// `peak_charges[i]` is the observed charge of `peaks[i]`.
     /// Empty (all charges implicitly 1) when deisotope=false.
@@ -126,7 +168,7 @@ pub struct ProcessedSpectrum<T> {
 #[derive(Default, Debug, Clone)]
 /// An unprocessed mass spectrum, as returned by a parser
 /// *CRITICAL*: Users must set all fields manually, including `file_id`
-pub struct RawSpectrum {
+pub struct RawSpectrum<M = Vec<f32>, I = Vec<f32>> {
     pub file_id: usize,
     /// MSn level
     pub ms_level: u8,
@@ -143,9 +185,9 @@ pub struct RawSpectrum {
     /// Total ion current
     pub total_ion_current: f32,
     /// M/z array
-    pub mz: Vec<f32>,
+    pub mz: M,
     /// Intensity array
-    pub intensity: Vec<f32>,
+    pub intensity: I,
     /// Mobility array
     pub mobility: Option<Vec<f32>>,
 }
@@ -170,8 +212,8 @@ pub enum Representation {
 
 #[derive(Default)]
 pub enum MS1Spectra {
-    NoMobility(Vec<ProcessedSpectrum<Peak>>),
-    WithMobility(Vec<ProcessedSpectrum<IMPeak>>),
+    NoMobility(Vec<ProcessedSpectrum>),
+    WithMobility(Vec<ProcessedSpectrum<Vec<IMPeak>>>),
     #[default]
     Empty,
 }
@@ -185,7 +227,7 @@ pub enum MS1Spectra {
 /// measurements with ProteomeDiscoverer, FragPipe, etc, we need to account for this minor difference (which has an impact
 /// perhaps 0.01% of the time)
 pub fn select_most_intense_peak(
-    peaks: &[Peak],
+    peaks: &PeakColumns,
     center: f32,
     tolerance: Tolerance,
     offset: Option<f32>,
@@ -196,7 +238,7 @@ pub fn select_most_intense_peak(
         hi + offset.unwrap_or_default(),
     );
 
-    let (i, j) = binary_search_slice(peaks, |peak, query| peak.mass.total_cmp(query), lo, hi);
+    let (i, j) = binary_search_slice(peaks.masses(), |mass, query| mass.total_cmp(query), lo, hi);
 
     let mut best_idx = None;
     let mut max_int = 0.0;
@@ -207,14 +249,11 @@ pub fn select_most_intense_peak(
     // flat, fully-sorted array, so this re-check is redundant here, but
     // re-checking unconditionally keeps `binary_search_slice` one shared,
     // uniformly-safe helper instead of two near-identical variants.
-    for (idx, peak) in peaks[i..j]
-        .iter()
-        .enumerate()
-        .filter(|(_, peak)| peak.mass >= lo && peak.mass <= hi)
-    {
-        if peak.intensity >= max_int {
-            max_int = peak.intensity;
-            best_idx = Some(i + idx);
+    for idx in i..j {
+        let mass = peaks.masses[idx];
+        if mass >= lo && mass <= hi && peaks.intensities[idx] >= max_int {
+            max_int = peaks.intensities[idx];
+            best_idx = Some(idx);
         }
     }
     best_idx
@@ -237,10 +276,27 @@ pub fn select_most_intense_peak(
 //     spectra.get(idx)
 // }
 
+/// Raw intensities are converted to f32 before comparisons or accumulation.
+pub trait RawIntensity: Copy {
+    fn to_f32(self) -> f32;
+}
+
+impl RawIntensity for f32 {
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+impl RawIntensity for u32 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
 /// Deisotope a set of peaks by attempting to find C13 peaks under a given `ppm` tolerance
-pub fn deisotope(
+pub fn deisotope<T: RawIntensity>(
     mz: &[f32],
-    int: &[f32],
+    int: &[T],
     max_charge: u8,
     ppm: f32,
     min_mz: f32,
@@ -250,7 +306,7 @@ pub fn deisotope(
         .zip(int.iter())
         .map(|(mz, int)| Deisotoped {
             mz: *mz,
-            intensity: *int,
+            intensity: int.to_f32(),
             envelope: None,
             charge: None,
         })
@@ -266,7 +322,7 @@ pub fn deisotope(
             let tol = Tolerance::ppm_to_delta_mass(mz[i], ppm);
             for charge in 1..=max_charge {
                 let iso = NEUTRON / charge as f32;
-                if (delta - iso).abs() <= tol && int[i] < int[j] {
+                if (delta - iso).abs() <= tol && int[i].to_f32() < int[j].to_f32() {
                     // Make sure this peak isn't already part of an isotopic envelope
                     if let Some(existing) = peaks[i].charge {
                         if existing != charge {
@@ -297,6 +353,26 @@ pub fn path_compression(peaks: &mut [Deisotoped]) {
             }
             peaks[idx].intensity = 0.0;
         }
+    }
+}
+
+impl ProcessedSpectrum {
+    /// Compact masses, intensities and observed charges using the same mask.
+    pub fn retain_peaks(&mut self, mut keep: impl FnMut(Peak) -> bool) {
+        let mut dst = 0;
+        for src in 0..self.peaks.len() {
+            if keep(self.peaks.peak(src)) {
+                self.peaks.masses[dst] = self.peaks.masses[src];
+                self.peaks.intensities[dst] = self.peaks.intensities[src];
+                if !self.peak_charges.is_empty() {
+                    self.peak_charges[dst] = self.peak_charges[src];
+                }
+                dst += 1;
+            }
+        }
+        self.peaks.masses.truncate(dst);
+        self.peaks.intensities.truncate(dst);
+        self.peak_charges.truncate(dst);
     }
 }
 
@@ -363,10 +439,10 @@ impl SpectrumProcessor {
         }
     }
 
-    fn process_ms2(
+    fn process_ms2<T: RawIntensity>(
         &self,
         should_deisotope: bool,
-        spectrum: &RawSpectrum,
+        spectrum: &RawSpectrum<impl AsRef<[f32]>, impl AsRef<[T]>>,
     ) -> (Vec<Peak>, Vec<u8>) {
         if spectrum.representation != Representation::Centroid {
             // Panic, because there's really nothing we can do with profile data
@@ -385,8 +461,8 @@ impl SpectrumProcessor {
 
         if should_deisotope {
             let mut peaks = deisotope(
-                &spectrum.mz,
-                &spectrum.intensity,
+                spectrum.mz.as_ref(),
+                spectrum.intensity.as_ref(),
                 charge,
                 10.0,
                 self.min_deisotope_mz,
@@ -405,7 +481,13 @@ impl SpectrumProcessor {
                     // Convert from MH* to M
                     let charge = peak.charge.unwrap_or(1);
                     let mass = (peak.mz - PROTON) * charge as f32;
-                    (Peak { mass, intensity: peak.intensity }, charge)
+                    (
+                        Peak {
+                            mass,
+                            intensity: peak.intensity,
+                        },
+                        charge,
+                    )
                 })
                 .take(self.take_top_n)
                 .collect();
@@ -414,11 +496,15 @@ impl SpectrumProcessor {
         } else {
             let mut peaks = spectrum
                 .mz
+                .as_ref()
                 .iter()
-                .zip(spectrum.intensity.iter())
+                .zip(spectrum.intensity.as_ref().iter())
                 .map(|(mz, &intensity)| {
                     let mass = (mz - PROTON) * 1.0;
-                    Peak { mass, intensity }
+                    Peak {
+                        mass,
+                        intensity: intensity.to_f32(),
+                    }
                 })
                 .collect::<Vec<_>>();
             crate::heap::bounded_min_heapify(&mut peaks, self.take_top_n);
@@ -427,17 +513,24 @@ impl SpectrumProcessor {
         }
     }
 
-    pub fn process(&self, spectrum: RawSpectrum) -> ProcessedSpectrum<Peak> {
-        let (mut peaks, mut peak_charges) = match spectrum.ms_level {
+    pub fn process<T: RawIntensity>(
+        &self,
+        spectrum: RawSpectrum<impl AsRef<[f32]>, impl AsRef<[T]>>,
+    ) -> ProcessedSpectrum {
+        let (mut peaks, peak_charges) = match spectrum.ms_level {
             2 => self.process_ms2(self.deisotope, &spectrum),
             _ => {
                 let peaks = spectrum
                     .mz
+                    .as_ref()
                     .iter()
-                    .zip(spectrum.intensity.iter())
+                    .zip(spectrum.intensity.as_ref().iter())
                     .map(|(&mass, &intensity)| {
                         let mass = (mass - PROTON) * 1.0;
-                        Peak { mass, intensity }
+                        Peak {
+                            mass,
+                            intensity: intensity.to_f32(),
+                        }
                     })
                     .collect::<Vec<_>>();
                 (peaks, vec![])
@@ -477,13 +570,13 @@ impl SpectrumProcessor {
             scan_start_time: spectrum.scan_start_time,
             ion_injection_time: spectrum.ion_injection_time,
             precursors: spectrum.precursors,
-            peaks,
+            peaks: peaks.into(),
             peak_charges,
             total_ion_current,
         }
     }
 
-    pub fn process_with_mobility(&self, spectrum: RawSpectrum) -> ProcessedSpectrum<IMPeak> {
+    pub fn process_with_mobility(&self, spectrum: RawSpectrum) -> ProcessedSpectrum<Vec<IMPeak>> {
         assert!(
             spectrum.ms_level == 1,
             "Logic error, mobility processing should only be used for MS1"
@@ -527,6 +620,112 @@ impl SpectrumProcessor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn columnar_peak_selection_matches_reference_including_ties() {
+        let mut peaks = vec![
+            Peak {
+                mass: 99.0,
+                intensity: 1000.0,
+            },
+            Peak {
+                mass: 100.0,
+                intensity: 5.0,
+            },
+            Peak {
+                mass: 100.0,
+                intensity: 10.0,
+            },
+            Peak {
+                mass: 101.0,
+                intensity: 10.0,
+            },
+            Peak {
+                mass: 102.0,
+                intensity: 0.0,
+            },
+            Peak {
+                mass: 103.0,
+                intensity: f32::NAN,
+            },
+        ];
+        peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
+        let columns: PeakColumns = peaks.clone().into();
+        for center in [0.0, 99.0, 100.0, 101.0, 102.0, 103.0, 1000.0] {
+            for tolerance in [
+                Tolerance::Da(0.0, 0.0),
+                Tolerance::Da(-1.0, 1.0),
+                Tolerance::Ppm(-10.0, 10.0),
+            ] {
+                for offset in [None, Some(-PROTON)] {
+                    let (lo, hi) = tolerance.bounds(center);
+                    let (lo, hi) = (
+                        lo + offset.unwrap_or_default(),
+                        hi + offset.unwrap_or_default(),
+                    );
+                    let mut best = None;
+                    let mut intensity = 0.0;
+                    for (idx, peak) in peaks.iter().enumerate() {
+                        if peak.mass >= lo && peak.mass <= hi && peak.intensity >= intensity {
+                            best = Some(idx);
+                            intensity = peak.intensity;
+                        }
+                    }
+                    assert_eq!(
+                        select_most_intense_peak(&columns, center, tolerance, offset),
+                        best
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            select_most_intense_peak(&columns, 100.5, Tolerance::Da(-0.5, 0.5), None),
+            Some(3)
+        );
+        assert_eq!(
+            select_most_intense_peak(
+                &PeakColumns::default(),
+                100.0,
+                Tolerance::Da(-1.0, 1.0),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn retain_peaks_keeps_all_columns_aligned() {
+        let mut spectrum = ProcessedSpectrum {
+            peaks: vec![
+                Peak {
+                    mass: 100.0,
+                    intensity: 10.0,
+                },
+                Peak {
+                    mass: 101.0,
+                    intensity: 20.0,
+                },
+                Peak {
+                    mass: 101.0,
+                    intensity: 20.0,
+                },
+                Peak {
+                    mass: 103.0,
+                    intensity: 40.0,
+                },
+            ]
+            .into(),
+            peak_charges: vec![3, 1, 2, 2],
+            ..Default::default()
+        };
+        spectrum.retain_peaks(|p| p.mass != 101.0);
+        assert_eq!(spectrum.peaks.masses(), &[100.0, 103.0]);
+        assert_eq!(spectrum.peaks.intensities(), &[10.0, 40.0]);
+        assert_eq!(spectrum.peak_charges, vec![3, 2]);
+        spectrum.retain_peaks(|_| false);
+        assert_eq!(spectrum.peaks.len(), 0);
+        assert!(spectrum.peak_charges.is_empty());
+    }
 
     #[test]
     fn effective_precursor_tol_uses_own_window_when_set() {
@@ -723,12 +922,83 @@ mod test {
     }
 
     #[test]
+    fn borrowed_u32_processing_matches_owned_f32_including_rounding_ties() {
+        let mz = [
+            100.0,
+            500.0,
+            500.0 + NEUTRON,
+            600.0,
+            600.0 + NEUTRON / 2.0,
+            700.0,
+        ];
+        let intensity = [0u32, 16_777_217, 16_777_216, 100, 25, u32::MAX];
+        for count in [0, 1, mz.len()] {
+            for deisotope in [false, true] {
+                for top_n in [0, 1, 3, usize::MAX] {
+                    let processor = SpectrumProcessor::new(top_n, deisotope, 0.0, false);
+                    let precursors = vec![Precursor {
+                        charge: Some(2),
+                        ..Default::default()
+                    }];
+                    let owned: RawSpectrum = RawSpectrum {
+                        mz: mz[..count].to_vec(),
+                        intensity: intensity[..count].iter().map(|&x| x as f32).collect(),
+                        ms_level: 2,
+                        representation: Representation::Centroid,
+                        precursors: precursors.clone(),
+                        ..Default::default()
+                    };
+                    let borrowed = RawSpectrum {
+                        mz: &mz[..count],
+                        intensity: &intensity[..count],
+                        ms_level: 2,
+                        representation: Representation::Centroid,
+                        precursors,
+                        ..Default::default()
+                    };
+                    let expected = processor.process(owned);
+                    let actual = processor.process(borrowed);
+                    assert_eq!(actual.peaks, expected.peaks);
+                    assert_eq!(actual.peak_charges, expected.peak_charges);
+                    assert_eq!(
+                        actual.total_ion_current.to_bits(),
+                        expected.total_ion_current.to_bits()
+                    );
+                    assert!(actual.peaks.len() <= count.min(top_n));
+                }
+            }
+        }
+        let peaks = deisotope(&mz, &intensity, 2, 10.0, 0.0);
+        assert_eq!(
+            peaks[2].envelope, None,
+            "rounded-equal intensities must not merge"
+        );
+        assert_eq!(
+            peaks[4].envelope,
+            Some(3),
+            "ordinary isotope envelope must merge"
+        );
+    }
+
+    #[test]
     fn is_sorted_by_mass_sorted_slice_is_true() {
         let peaks = vec![
-            Peak { mass: 1.0, intensity: 1.0 },
-            Peak { mass: 2.0, intensity: 1.0 },
-            Peak { mass: 2.0, intensity: 1.0 }, // ties are fine (<=)
-            Peak { mass: 3.0, intensity: 1.0 },
+            Peak {
+                mass: 1.0,
+                intensity: 1.0,
+            },
+            Peak {
+                mass: 2.0,
+                intensity: 1.0,
+            },
+            Peak {
+                mass: 2.0,
+                intensity: 1.0,
+            }, // ties are fine (<=)
+            Peak {
+                mass: 3.0,
+                intensity: 1.0,
+            },
         ];
         assert!(is_sorted_by_mass(&peaks));
     }
@@ -736,8 +1006,14 @@ mod test {
     #[test]
     fn is_sorted_by_mass_unsorted_slice_is_false() {
         let peaks = vec![
-            Peak { mass: 2.0, intensity: 1.0 },
-            Peak { mass: 1.0, intensity: 1.0 },
+            Peak {
+                mass: 2.0,
+                intensity: 1.0,
+            },
+            Peak {
+                mass: 1.0,
+                intensity: 1.0,
+            },
         ];
         assert!(!is_sorted_by_mass(&peaks));
     }
@@ -745,7 +1021,10 @@ mod test {
     #[test]
     fn is_sorted_by_mass_empty_and_singleton_are_true() {
         assert!(is_sorted_by_mass(&[]));
-        assert!(is_sorted_by_mass(&[Peak { mass: 5.0, intensity: 1.0 }]));
+        assert!(is_sorted_by_mass(&[Peak {
+            mass: 5.0,
+            intensity: 1.0
+        }]));
     }
 
     #[test]
@@ -753,7 +1032,9 @@ mod test {
         let raw = mk_raw_spectrum(2, vec![500.0, 300.0, 400.0]);
         let sp = SpectrumProcessor::new(100, false, 0.0, false);
         let processed = sp.process(raw);
-        assert!(is_sorted_by_mass(&processed.peaks));
+        assert!(is_sorted_by_mass(
+            &processed.peaks.iter().collect::<Vec<_>>()
+        ));
         assert_eq!(processed.peaks.len(), 3);
     }
 
@@ -762,7 +1043,9 @@ mod test {
         let raw = mk_raw_spectrum(2, vec![300.0, 400.0, 500.0]);
         let sp = SpectrumProcessor::new(100, false, 0.0, true);
         let processed = sp.process(raw);
-        assert!(is_sorted_by_mass(&processed.peaks));
+        assert!(is_sorted_by_mass(
+            &processed.peaks.iter().collect::<Vec<_>>()
+        ));
         assert_eq!(processed.peaks.len(), 3);
     }
 
@@ -791,6 +1074,8 @@ mod test {
         let raw = mk_raw_spectrum(2, vec![500.0, 300.0, 400.0]);
         let sp = SpectrumProcessor::new(100, true, 0.0, true);
         let processed = sp.process(raw);
-        assert!(is_sorted_by_mass(&processed.peaks));
+        assert!(is_sorted_by_mass(
+            &processed.peaks.iter().collect::<Vec<_>>()
+        ));
     }
 }
