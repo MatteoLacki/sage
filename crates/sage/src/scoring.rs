@@ -1000,7 +1000,7 @@ impl<'db> Scorer<'db> {
 
         // Remove MS2 peaks matched by previous match
         let mut to_remove = Vec::new();
-        for frag in self.iter_fragments(peptide) {
+        for (_, frag) in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
                 // `peak.mass` is a PROTON-subtracted, charge-scaled neutral mass, not a
                 // real m/z (see `spectrum.rs`) -- rescale the theoretical fragment's
@@ -1159,14 +1159,22 @@ impl<'db> Scorer<'db> {
     /// Regenerate theoretical ions - initial database search might be
     /// using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
     /// so we need to completely re-score this candidate.
-    fn iter_fragments<'p>(&self, peptide: &'p Peptide) -> impl Iterator<Item = Ion> + 'p
+    /// Yields `(idx, Ion)` with `idx` reset to 0 at the start of each ion
+    /// kind's series (b1, b2, ... then y1, y2, ...) -- NOT a single index
+    /// running across kinds. Callers rely on this: the Y-ordinal reporting
+    /// formula (`len - 1 - idx`) and `ms2_similarity::fragment_annotation_id`
+    /// both assume `idx` is local to the current kind. `.enumerate()` must
+    /// stay inside the `flat_map` closure (per `IonSeries`) rather than
+    /// wrapping the whole chain, or it silently becomes a global counter --
+    /// see docs/ai/predicted_fragment_intensity.md.
+    fn iter_fragments<'p>(&self, peptide: &'p Peptide) -> impl Iterator<Item = (usize, Ion)> + 'p
     where
         'db: 'p,
     {
         self.db
             .ion_kinds
             .iter()
-            .flat_map(move |kind| IonSeries::new(peptide, *kind))
+            .flat_map(move |kind| IonSeries::new(peptide, *kind).enumerate())
     }
 
     fn score_candidate(
@@ -1216,7 +1224,7 @@ impl<'db> Scorer<'db> {
         let mut observed_real: Vec<f32> = Vec::with_capacity(real_capacity);
         let mut predicted_real: Vec<f32> = Vec::with_capacity(real_capacity);
 
-        for (idx, frag) in self.iter_fragments(peptide).enumerate() {
+        for (idx, frag) in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
                 let annotation_slot = ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
 
