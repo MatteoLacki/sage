@@ -353,3 +353,91 @@ an optional config path to override `bucket_size`. Config variants are written t
 `target/simd-benchmark/config_bucket<N>.json`. Freeze each binary and check its
 SHA-256 before comparing — the shared `target/release/sage` collision documented
 above still applies.
+
+## Cross-dataset replication on F9468, 2026-09-15
+
+F9468 is an independent dataset, **1,708,243 precursors (2.4x F9477's 716,614)**,
+with near-identical recalibrated tolerances: precursor ±6.08/6.43 ppm (F9477:
+±6.57/6.76), fragment ±13.24/12.34 ppm (F9477: ±13.33/12.32), same `max_peaks:
+800` and `max_fragment_charge: 1`. So it varies dataset *size* by 2.4x while
+holding the search regime fixed.
+
+Four frozen binaries, one per generation of this work, each at both page sizes.
+Full dataset, 16 threads, sequential runs:
+
+| Commit | Change | bucket 32,768 | bucket 4,194,304 | bucket gain |
+|---|---|---:|---:|---:|
+| `440c6f8` | before index sharing | 738.6 s | 269.3 s | 2.74x |
+| `42510e4` | + `page_search_batch` sharing, pre-SIMD | 748.9 s | 180.6 s | 4.15x |
+| `6c20f3f` | + columnar pages / AVX2 | 649.3 s | 87.4 s | 7.43x |
+| `950641f` | + interleaved bound resolution | **293.9 s** | **65.4 s** | 4.49x |
+
+Production-equivalent control (`6c20f3f` at 32,768) to best (`950641f` at
+4,194,304): **9.93x**. Oldest measured commit to best: **11.29x**.
+
+Every effect reproduces within a few percent of F9477:
+
+| Effect | F9477 | F9468 |
+|---|---:|---:|
+| `bucket_size` alone, on `6c20f3f` | 7.53x | 7.43x |
+| `bucket_size` alone, pre-SIMD `42510e4` | 4.24x | 4.15x |
+| Interleaved bounds alone, at 32,768 | 2.27x | 2.21x |
+| Overall control -> best | 9.37x | 9.93x |
+
+The qualitative findings reproduce too: index sharing is **negative** at 32,768
+(738.6 -> 748.9 s) and positive only once pages are large (1.49x at 4M); the
+columnar/AVX2 change is worth 1.15x at 32,768 but 2.07x at 4M. Both are starved
+by page geometry, in the same direction and for the same reason as on F9477.
+
+### Validation
+
+`f9468-mlp-control-b32768` against `f9468-mlp16-b4194304`: **640,621 PSM
+identities** identical, all 59 non-ID TSV columns byte-identical, and all
+**3,730,457** fragment annotation rows exact after PSM-ID mapping and row
+sorting, every ordinal within 1..peptide length - 1. Only `psm_id` differs.
+
+### Inputs and how they were produced
+
+`jobs/f9468_benchmark.toml` in the parent `necromerge2` repo is a byte-for-byte
+copy of `jobs/f9477_best.toml` with `tdf_path` swapped to `data/F9468.d`, so
+recalibration settings are identical and the comparison is not confounded by
+config drift. `./nf jobs/f9468_benchmark.toml -call` produced the data-dependent
+nodes in ~15 min; the ~90 min of RT/IIM/fragment-intensity prediction did **not**
+rerun, being peptide-derived and already cached for the same FASTA and database
+config.
+
+Two things to know when repeating this:
+
+- The pipeline's own final `run_sage` node **fails**, unrelated to any change
+  here: the cached `export_fragment_intensity_for_sage` parquet predates the
+  positional-schema migration and lacks `dumped_peptides_sha256`, which current
+  Sage rejects. The benchmark sidesteps it by reusing the already-prepared
+  `target/simd-benchmark/fragment_index.parquet`, which carries the fingerprint.
+  That substitution is sound because both peptide dumps
+  (`dump_peptides/e3c5b424…` and `…/1fdcfee7…`) are byte-identical
+  (`e90910feecb0e698e6804412b28d1066030d9d9c729e72e8f9edb0f124482b89`) --
+  verify that before reusing it again. The node needs regenerating for the
+  pipeline itself to complete.
+- `source_dump_peptides_binary` is a symlink to the live
+  `git/sage/target/release/dump_peptides`, so rebuilding that binary makes the
+  node stale and gives `dump_peptides` a new hash. `ln -s` there is not
+  idempotent: a pre-existing symlink makes the node fail with
+  `File exists`, and must be removed before rerunning.
+
+Run these with `SAGE_BENCH_MANIFEST=manifest_f9468.json` and
+`docs/ai/simd_benchmark/run.py LABEL BINARY CONFIG`; the F9468 manifest and its
+`f9468_bucket<N>.json` config variants live in `target/simd-benchmark`.
+
+### Pre-SIMD confirmation
+
+The result does not depend on any SIMD work. The frozen pre-SIMD baseline
+(`42510e4`, AoS `Theoretical` records, no AVX2, `d8e5adf…`) gains **4.15x** on
+F9468 and **4.24x** on F9477 from `bucket_size` alone. The commit that
+introduced columnar pages and AVX2 is worth only 1.09-1.15x at the production
+page size, which is why the original 11.9% measurement for it was so small.
+
+### Caveats
+
+Both datasets share a narrow search regime. Nothing here tests wide-window or
+open search, where the precursor-filtered slice grows with tolerance and large
+buckets are expected to invert. One run per configuration.

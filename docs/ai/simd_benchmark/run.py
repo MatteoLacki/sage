@@ -3,13 +3,17 @@
 Usage: run.py LABEL BINARY [CONFIG]
 
 CONFIG overrides the recorded sage config (used to sweep `bucket_size`).
+SAGE_BENCH_MANIFEST selects a manifest other than manifest.json (e.g. a
+second dataset's), relative to target/simd-benchmark.
 """
 
 import hashlib, json, os, pathlib, re, subprocess, sys, time
 
 root = pathlib.Path("target/simd-benchmark").resolve()
 label, binary = sys.argv[1], sys.argv[2]
-manifest = json.loads((root / "manifest.json").read_text())
+manifest = json.loads(
+    (root / os.environ.get("SAGE_BENCH_MANIFEST", "manifest.json")).read_text()
+)
 out = root / label
 out.mkdir()
 argv = manifest["argv"].copy()
