@@ -41,7 +41,8 @@ fn check_all_ions_visited(target_fragment_mz: f32, bucket_size: usize) {
     let fragment_tol = Tolerance::Da(-100.0, 100.0);
     let (frag_lo, frag_hi) = fragment_tol.bounds(target_fragment_mz);
 
-    for (chunk_idx, chunk) in database.fragments.chunks(database.bucket_size).enumerate() {
+    let fragments: Vec<_> = database.fragments().collect();
+    for (chunk_idx, chunk) in fragments.chunks(database.bucket_size).enumerate() {
         // Check for total ordering by PeptideIx within a chunk
         let mut last = PeptideIx(0);
         for frag in chunk {
@@ -103,8 +104,7 @@ fn target_peaks(db: &IndexedDatabase) -> (PeptideIx, Vec<Peak>) {
     let target_idx = PeptideIx(target_idx as u32);
 
     let peaks = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == target_idx)
         .map(|f| Peak {
             mass: f.fragment_mz,
@@ -137,6 +137,7 @@ fn mk_scorer(db: &IndexedDatabase, precursor_tol: Tolerance) -> Scorer<'_> {
         rt_sigma: None,
         iim_sigma: None,
         annotate_matches: false,
+        isotope_ladder: false,
         score_type: ScoreType::SageHyperScore,
         ranking_score: RankingScore::CombinedScore,
         predicted_fragment_intensity_index: None,
@@ -174,7 +175,7 @@ fn candidate_unreachable_without_custom_window() {
         level: 2,
         id: "no-window".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -209,7 +210,7 @@ fn candidate_reachable_with_wide_custom_window() {
         level: 2,
         id: "wide-window".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -281,7 +282,7 @@ fn candidate_unreachable_outside_rt_tol() {
         id: "rt-mismatch".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -327,7 +328,7 @@ fn candidate_reachable_within_rt_tol() {
         id: "rt-match".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -377,7 +378,7 @@ fn delta_rt_z2_external_computed_from_sigma() {
         id: "rt-z2".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -424,7 +425,7 @@ fn delta_rt_z2_external_zero_without_sigma() {
         id: "rt-z2-no-sigma".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -464,7 +465,7 @@ fn candidate_unreachable_outside_iim_tol() {
         level: 2,
         id: "iim-mismatch".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -505,7 +506,7 @@ fn candidate_reachable_within_iim_tol() {
         level: 2,
         id: "iim-match".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -550,7 +551,7 @@ fn delta_ims_z2_external_computed_from_sigma() {
         level: 2,
         id: "iim-z2".into(),
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -618,8 +619,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
     );
 
     let peaks: Vec<Peak> = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == iso1)
         .map(|f| Peak {
             mass: f.fragment_mz,
@@ -641,7 +641,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
         id: "rt-tiebreak".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 
@@ -702,8 +702,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
     );
 
     let peaks: Vec<Peak> = db
-        .fragments
-        .iter()
+        .fragments()
         .filter(|f| f.peptide_index == iso1)
         .map(|f| Peak {
             mass: f.fragment_mz,
@@ -725,7 +724,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
         id: "rt-tiebreak-hyperscore-mode".into(),
         scan_start_time: 10.0,
         precursors: vec![precursor],
-        peaks,
+        peaks: peaks.into(),
         ..Default::default()
     };
 

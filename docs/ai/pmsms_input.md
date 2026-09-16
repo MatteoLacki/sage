@@ -22,9 +22,8 @@ Two ways to pass these two paths to the `sage` CLI:
    together — validated in `crates/sage-cli/src/input.rs::Input::from_arguments`.
    Used instead of the positional spectra-paths argument; `PmsmsPaths`
    (`crates/sage-cloudpath/src/util.rs`) carries the two paths through
-   `Search`, and the runner's per-file loop
-   (`crates/sage-cli/src/runner.rs::process_chunk`) branches on
-   `parameters.pmsms_paths` to call `read_pmsms_explicit` directly, bypassing
+   `Search`. The runner's `read_processed_spectra` branches on
+   `parameters.pmsms_paths` to call `pmsms::parse_processed`, bypassing
    the normal `FileFormat`-suffix dispatch.
 2. **Positional `<dir>.pmsms`** (legacy, still works, unchanged behavior) — a
    directory whose name ends in `.pmsms`, containing `pmsms.mmappet/` and
@@ -36,6 +35,28 @@ Two ways to pass these two paths to the `sage` CLI:
 `necromerge2`'s `run_sage` Snakemake-via-necroflow rule
 (`git/ionmaidentools/src/ionmaidentools/pipelines.py`) uses option 1 — no
 staging directory, no symlinks, no mmappet→parquet conversion needed anymore.
+
+## Borrowed fragment input and processed storage
+
+The explicit-path CLI input calls `parse_processed`: each precursor's mapped
+`mz: &[f32]` and `intensity: &[u32]` ranges feed `SpectrumProcessor` directly,
+in parallel, while the reader owns both mappings. No intermediate per-spectrum
+raw m/z or float-intensity vectors are allocated. Ordered parallel collection
+preserves precursor order; returned processed spectra own their storage and
+remain valid after the mappings close.
+
+Intensity conversion to `f32` happens before every comparison and accumulation,
+preserving the legacy rounding behavior even when distinct `u32` values round
+to the same float. Deisotoping and top-N selection keep their existing ordering.
+Final `PeakColumns` hold separate mass and intensity vectors, allocated from the
+exact retained count; observed charges remain a parallel vector when present.
+For max_peaks=800, each final column contains at most 800 entries. Temporary
+selection/deisotoping storage still scales with the raw spectrum size.
+
+`pmsms::parse`, `read_pmsms_explicit`, and positional `.pmsms` inputs retain the
+owned `RawSpectrum` API. Those compatibility paths still copy raw columns.
+Non-mobility processed spectra use `PeakColumns`; mobility spectra keep `Vec<IMPeak>`.
+See [F9477 measurements](simd.md) for timing and memory validation.
 
 ## Per-precursor ppm tolerance
 

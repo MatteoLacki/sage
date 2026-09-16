@@ -1,13 +1,21 @@
 use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx};
 use crate::heap::bounded_min_heapify;
-use crate::ion_series::{IonSeries, Kind};
+use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
-use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
+use crate::peptide::Peptide;
+#[cfg(test)]
+use crate::spectrum::Peak;
+use crate::spectrum::{PeakColumns, Precursor, ProcessedSpectrum};
 use half::f16;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+thread_local! {
+    static WINDOWS_SCRATCH: RefCell<Vec<(f32, Tolerance)>> = RefCell::new(Vec::new());
+}
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum ScoreType {
@@ -320,6 +328,15 @@ pub struct Scorer<'db> {
     // the precursor tolerance window based on MS2 isolation window and charge
     pub wide_window: bool,
     pub annotate_matches: bool,
+    /// Compute `observed_isotope_ladder` for each matched fragment
+    /// (diagnostic only -- not yet read by `Score`/`Feature`, see
+    /// `plans/isotope_envelope_scoring.md`). Requires a non-deisotoped
+    /// spectrum (`query.is_deisotoped() == false`); `Search::build`
+    /// (`sage-cli/src/input.rs`) rejects `isotope_ladder: true` combined with
+    /// `deisotope: true` at config-load time, so that precondition is a
+    /// validated invariant by the time `Scorer` ever runs, not something
+    /// re-checked per spectrum.
+    pub isotope_ladder: bool,
     pub score_type: ScoreType,
     pub ranking_score: RankingScore,
 
@@ -419,7 +436,7 @@ impl<'db> Scorer<'db> {
     /// * `keep`: A vector of atomic bools is used to maintain an identification list across scans
     pub fn quick_score(
         &self,
-        query: &ProcessedSpectrum<Peak>,
+        query: &ProcessedSpectrum,
         prefilter_low_memory: bool,
         keep: &[AtomicBool],
     ) {
@@ -462,7 +479,7 @@ impl<'db> Scorer<'db> {
         }
     }
 
-    pub fn score(&self, query: &ProcessedSpectrum<crate::spectrum::Peak>) -> Vec<Feature> {
+    pub fn score(&self, query: &ProcessedSpectrum) -> Vec<Feature> {
         assert_eq!(
             query.level, 2,
             "internal bug, trying to score a non-MS2 scan!"
@@ -499,15 +516,16 @@ impl<'db> Scorer<'db> {
     /// in sorted order.
     fn matched_peaks_with_isotope(
         &self,
-        query: &ProcessedSpectrum<crate::spectrum::Peak>,
+        query: &ProcessedSpectrum,
         precursor_mass: f32,
         precursor_charge: u8,
         precursor_tol: Tolerance,
         isotope_error: i8,
     ) -> InitialHits {
-        let candidates = self
-            .db
-            .query(precursor_mass - isotope_error as f32 * NEUTRON, precursor_tol);
+        let candidates = self.db.query(
+            precursor_mass - isotope_error as f32 * NEUTRON,
+            precursor_tol,
+        );
 
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
         // Allocate space for all potential candidates - many potential candidates
@@ -518,24 +536,39 @@ impl<'db> Scorer<'db> {
             preliminary: vec![PreScore::default(); potential],
         };
 
-        for peak in query.peaks.iter() {
-            for charge in 1..max_fragment_charge {
-                let mass = peak.mass * charge as f32;
-                for frag in candidates.page_search(mass, self.fragment_tol) {
-                    let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
-                    let sc = &mut hits.preliminary[idx];
-                    if sc.matched == 0 {
-                        hits.scored_candidates += 1;
-                        sc.precursor_charge = precursor_charge;
-                        sc.peptide = frag.peptide_index;
-                        sc.isotope_error = isotope_error;
-                    }
-
-                    sc.matched += 1;
-                    hits.matched_peaks += 1;
+        // Collect every (mass, fragment_tol) window for this whole
+        // spectrum (every peak x every fragment charge) up front, then
+        // search them in one batched call -- `page_search_batch` computes
+        // each page's precursor-scoped inner range once and reuses it
+        // across every window landing on that page, instead of redoing
+        // that binary search independently per (peak, charge) the way a
+        // `page_search` call per window did. `windows` is thread-local
+        // scratch, reused across calls, not freshly allocated each time
+        // (same reasoning as `page_search_batch`'s own internal scratch).
+        // See `docs/ai/reuse_index_bins.md`.
+        WINDOWS_SCRATCH.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows.clear();
+            for &mass in query.peaks.masses() {
+                for charge in 1..max_fragment_charge {
+                    windows.push((mass * charge as f32, self.fragment_tol));
                 }
             }
-        }
+
+            candidates.page_search_batch(&windows, |frag| {
+                let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
+                let sc = &mut hits.preliminary[idx];
+                if sc.matched == 0 {
+                    hits.scored_candidates += 1;
+                    sc.precursor_charge = precursor_charge;
+                    sc.peptide = frag.peptide_index;
+                    sc.isotope_error = isotope_error;
+                }
+
+                sc.matched += 1;
+                hits.matched_peaks += 1;
+            });
+        });
         if hits.matched_peaks == 0 {
             return hits;
         }
@@ -582,7 +615,7 @@ impl<'db> Scorer<'db> {
     /// the RT check still applies.
     fn evict_rt_iim_mismatches(
         &self,
-        query: &ProcessedSpectrum<crate::spectrum::Peak>,
+        query: &ProcessedSpectrum,
         candidates: &IndexedQuery,
         hits: &mut InitialHits,
     ) {
@@ -647,7 +680,7 @@ impl<'db> Scorer<'db> {
     /// its post-sort `Feature`-building pass so the two can't drift apart.
     fn external_z2(
         &self,
-        query: &ProcessedSpectrum<Peak>,
+        query: &ProcessedSpectrum,
         peptide_idx: usize,
         charge: u8,
     ) -> (f32, f32, f32, f32) {
@@ -678,19 +711,17 @@ impl<'db> Scorer<'db> {
             .and_then(|p| p.inverse_ion_mobility);
         let (predicted_ims_external, delta_ims_z2_external) =
             match (self.predicted_iim, self.iim_sigma, observed_ims) {
-                (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => {
-                    Self::iim_dense_slot(
-                        peptide_idx,
-                        charge,
-                        self.min_precursor_charge,
-                        self.max_precursor_charge,
-                    )
-                    .and_then(|slot| dense[slot])
-                    .map_or((0.0, 0.0), |ims| {
-                        let z = (observed - ims) / sigma;
-                        (ims, z * z)
-                    })
-                }
+                (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => Self::iim_dense_slot(
+                    peptide_idx,
+                    charge,
+                    self.min_precursor_charge,
+                    self.max_precursor_charge,
+                )
+                .and_then(|slot| dense[slot])
+                .map_or((0.0, 0.0), |ims| {
+                    let z = (observed - ims) / sigma;
+                    (ims, z * z)
+                }),
                 _ => (0.0, 0.0),
             };
 
@@ -704,7 +735,7 @@ impl<'db> Scorer<'db> {
 
     fn matched_peaks(
         &self,
-        query: &ProcessedSpectrum<Peak>,
+        query: &ProcessedSpectrum,
         precursor_mass: f32,
         precursor_charge: u8,
         precursor_tol: Tolerance,
@@ -736,7 +767,7 @@ impl<'db> Scorer<'db> {
         }
     }
 
-    fn initial_hits(&self, query: &ProcessedSpectrum<Peak>, precursor: &Precursor) -> InitialHits {
+    fn initial_hits(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> InitialHits {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
 
@@ -770,12 +801,8 @@ impl<'db> Scorer<'db> {
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
                     let precursor_mass = mz * precursor_charge as f32;
-                    hits += self.matched_peaks(
-                        query,
-                        precursor_mass,
-                        precursor_charge,
-                        precursor_tol,
-                    );
+                    hits +=
+                        self.matched_peaks(query, precursor_mass, precursor_charge, precursor_tol);
                     hits
                 },
             )
@@ -785,7 +812,7 @@ impl<'db> Scorer<'db> {
     }
 
     /// Score a single [`ProcessedSpectrum`] against the database
-    pub fn score_standard(&self, query: &ProcessedSpectrum<Peak>) -> Vec<Feature> {
+    pub fn score_standard(&self, query: &ProcessedSpectrum) -> Vec<Feature> {
         let precursor = query.precursors.first().unwrap_or_else(|| {
             panic!("missing MS1 precursor for {}", query.id);
         });
@@ -800,7 +827,7 @@ impl<'db> Scorer<'db> {
     /// best PSMs ([`Feature`])
     fn build_features(
         &self,
-        query: &ProcessedSpectrum<Peak>,
+        query: &ProcessedSpectrum,
         precursor: &Precursor,
         hits: &InitialHits,
         report_psms: usize,
@@ -815,8 +842,7 @@ impl<'db> Scorer<'db> {
             .map(|(mut score, fragments)| {
                 let (_, z_rt2, _, z_iim2) =
                     self.external_z2(query, score.peptide.0 as usize, score.precursor_charge);
-                score.combined_score =
-                    score.hyperscore - 0.5 * (z_rt2 as f64 + z_iim2 as f64);
+                score.combined_score = score.hyperscore - 0.5 * (z_rt2 as f64 + z_iim2 as f64);
                 (score, fragments)
             })
             .collect::<Vec<_>>();
@@ -879,8 +905,12 @@ impl<'db> Scorer<'db> {
             // `plans/lda_external_rt_iim_features.md`. 0.0 when
             // `--predicted-rt`/`--predicted-iim` aren't configured; the LDA
             // only includes the z² columns when they are (`ml/linear_discriminant.rs`).
-            let (predicted_rt_external, delta_rt_z2_external, predicted_ims_external, delta_ims_z2_external) =
-                self.external_z2(query, score.peptide.0 as usize, score.precursor_charge);
+            let (
+                predicted_rt_external,
+                delta_rt_z2_external,
+                predicted_ims_external,
+                delta_ims_z2_external,
+            ) = self.external_z2(query, score.peptide.0 as usize, score.precursor_charge);
 
             // let (num_proteins, proteins) = self.db.assign_proteins(peptide);
 
@@ -964,45 +994,38 @@ impl<'db> Scorer<'db> {
     }
 
     /// Remove peaks matching a PSM from a query spectrum
-    fn remove_matched_peaks(&self, query: &mut ProcessedSpectrum<Peak>, psm: &Feature) {
+    fn remove_matched_peaks(&self, query: &mut ProcessedSpectrum, psm: &Feature) {
         let peptide = &self.db[psm.peptide_idx];
-        let fragments = self
-            .db
-            .ion_kinds
-            .iter()
-            .flat_map(|kind| IonSeries::new(peptide, *kind));
-
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, psm.charge);
 
         // Remove MS2 peaks matched by previous match
         let mut to_remove = Vec::new();
-        for frag in fragments {
+        for (_, frag) in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
-                // Experimental peaks are multipled by charge, therefore theoretical are divided
-                let mz = frag.monoisotopic_mass / charge as f32;
+                // `peak.mass` is a PROTON-subtracted, charge-scaled neutral mass, not a
+                // real m/z (see `spectrum.rs`) -- rescale the theoretical fragment's
+                // neutral mass onto that same scale for this candidate charge, rather
+                // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
+                // -searched array; this is the single per-iteration query value).
+                let theoretical_mass = frag.monoisotopic_mass / charge as f32;
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
-                    mz,
+                    theoretical_mass,
                     self.fragment_tol,
                     None,
-                )
-                {
-                    to_remove.push(query.peaks[i]);
+                ) {
+                    to_remove.push(query.peaks.peak(i));
                 }
             }
         }
 
-        query.peaks = query
-            .peaks
-            .drain(..)
-            .filter(|peak| !to_remove.contains(peak))
-            .collect();
-        query.total_ion_current = query.peaks.iter().map(|peak| peak.intensity).sum::<f32>();
+        query.retain_peaks(|peak| !to_remove.contains(&peak));
+        query.total_ion_current = query.peaks.intensities().iter().sum::<f32>();
     }
 
     /// Return multiple PSMs for each spectra - first is the best match, second PSM is the best match
     /// after all theoretical peaks assigned to the best match are removed, etc
-    pub fn score_chimera_fast(&self, query: &ProcessedSpectrum<Peak>) -> Vec<Feature> {
+    pub fn score_chimera_fast(&self, query: &ProcessedSpectrum) -> Vec<Feature> {
         let precursor = query.precursors.first().unwrap_or_else(|| {
             panic!("missing MS1 precursor for {}", query.id);
         });
@@ -1029,9 +1052,133 @@ impl<'db> Scorer<'db> {
     }
 
     /// Calculate full hyperscore for a given PSM
+    /// Unpack one candidate's sparse predicted MS2 vector (if configured and
+    /// this `(peptide, charge)` has a cache entry) into a dense,
+    /// zero-initialized `[f32; N_FRAGMENT_SLOTS]`, indexed the same way as
+    /// `score_candidate`'s own per-fragment loop (`fragment_annotation_id`)
+    /// -- see `docs/ai/predicted_fragment_intensity.md`. Always returns a
+    /// valid array plus a `found` flag, rather than an `Option`-wrapped
+    /// array -- the caller never has to unwrap/default it separately.
+    fn build_predicted_dense(
+        &self,
+        peptide_idx: usize,
+        charge: u8,
+    ) -> (bool, [f32; N_FRAGMENT_SLOTS]) {
+        let mut dense = [0f32; N_FRAGMENT_SLOTS];
+
+        if self.predicted_fragment_intensity_index.is_none() {
+            return (false, dense);
+        }
+        let by_slot = self.predicted_fragment_intensity_index.unwrap();
+
+        let slot = Self::iim_dense_slot(
+            peptide_idx,
+            charge,
+            self.min_precursor_charge,
+            self.max_precursor_charge,
+        );
+        if slot.is_none() {
+            return (false, dense);
+        }
+        let slot = slot.unwrap();
+
+        if slot >= by_slot.len() || by_slot[slot].is_none() {
+            return (false, dense);
+        }
+        let (start, end) = by_slot[slot].unwrap();
+        let (start, end) = (start as usize, end as usize);
+
+        if self.predicted_fragment_intensity_annotation_id.is_none() {
+            return (false, dense);
+        }
+        let annotation_id = self.predicted_fragment_intensity_annotation_id.unwrap();
+
+        if self.predicted_fragment_intensity.is_none() {
+            return (false, dense);
+        }
+        let intensity = self.predicted_fragment_intensity.unwrap();
+
+        if start > end || end > annotation_id.len() || end > intensity.len() {
+            return (false, dense);
+        }
+
+        // Data is stored sparsely, so here we densify it.
+        for i in start..end {
+            let slot = annotation_id[i] as usize;
+            if slot < N_FRAGMENT_SLOTS {
+                dense[slot] = intensity[i].to_f32();
+            }
+        }
+        (true, dense)
+    }
+
+    /// Observed intensity at each `NEUTRON`-spaced offset `i` in `-1..=k` from a
+    /// fragment's theoretical monoisotopic mass -- `i=0` is the monoisotopic peak
+    /// itself, `i=1..=k` are heavier isotopes, and `i=-1` is an anchor-rejection
+    /// probe (a peak sitting below what we think is the monoisotopic fragment peak
+    /// means that pick probably isn't really the monoisotopic one). No cache, no
+    /// theoretical comparison -- this only reads the real spectrum. See
+    /// `plans/isotope_envelope_scoring.md` in the parent monorepo.
+    ///
+    /// Only meaningful when `peaks` comes from a spectrum where
+    /// `ProcessedSpectrum::is_deisotoped()` is `false` -- see that method's
+    /// doc comment for why (resolved isotope satellites are merged into their
+    /// monoisotopic root and dropped from the peak array entirely when
+    /// deisotoping is on, and `charge` here, the search loop's candidate
+    /// charge, only has the right units in the non-deisotoped, apparent-
+    /// charge-1 mass convention). Only called when `self.isotope_ladder` is
+    /// set, which `Search::build` guarantees implies `deisotope: false` --
+    /// see `Scorer::isotope_ladder`'s doc comment.
+    ///
+    /// Writes into `out` instead of returning a fresh `Vec` -- this is called
+    /// once per matched fragment inside `score_candidate`'s hot loop (per
+    /// candidate, per spectrum), so the caller allocates `out` once and reuses
+    /// it across every call; `out.clear()` here does not release its capacity.
+    fn observed_isotope_ladder(
+        &self,
+        peaks: &PeakColumns,
+        monoisotopic_mass: f32,
+        charge: u8,
+        k: i32,
+        out: &mut Vec<f32>,
+    ) {
+        out.clear();
+        for i in -1..=k {
+            let mass_i = (monoisotopic_mass + i as f32 * NEUTRON) / charge as f32;
+            let mut intensity = 0f32;
+            if let Some(idx) =
+                crate::spectrum::select_most_intense_peak(peaks, mass_i, self.fragment_tol, None)
+            {
+                intensity = peaks.intensities()[idx];
+            }
+            out.push(intensity);
+        }
+    }
+
+    /// Regenerate theoretical ions - initial database search might be
+    /// using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
+    /// so we need to completely re-score this candidate.
+    /// Yields `(idx, Ion)` with `idx` reset to 0 at the start of each ion
+    /// kind's series (b1, b2, ... then y1, y2, ...) -- NOT a single index
+    /// running across kinds. Callers rely on this: the Y-ordinal reporting
+    /// formula (`len - 1 - idx`) and `ms2_similarity::fragment_annotation_id`
+    /// both assume `idx` is local to the current kind. `.enumerate()` must
+    /// stay inside the `flat_map` closure (per `IonSeries`) rather than
+    /// wrapping the whole chain, or it silently becomes a global counter --
+    /// see docs/ai/predicted_fragment_intensity.md.
+    fn iter_fragments<'p>(&self, peptide: &'p Peptide) -> impl Iterator<Item = (usize, Ion)> + 'p
+    where
+        'db: 'p,
+    {
+        self.db
+            .ion_kinds
+            .iter()
+            .flat_map(move |kind| IonSeries::new(peptide, *kind).enumerate())
+    }
+
     fn score_candidate(
         &self,
-        query: &ProcessedSpectrum<Peak>,
+        query: &ProcessedSpectrum,
         pre_score: &PreScore,
     ) -> (Score, Option<Fragments>) {
         let mut score = Score {
@@ -1044,86 +1191,65 @@ impl<'db> Scorer<'db> {
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
 
-        // Regenerate theoretical ions - initial database search might be
-        // using only a subset of all possible ions (e.g. no b1/b2/y1/y2)
-        // so we need to completely re-score this candidate
-        let fragments = self
-            .db
-            .ion_kinds
-            .iter()
-            .flat_map(|kind| IonSeries::new(peptide, *kind).enumerate());
+        // Scratch buffer for `observed_isotope_ladder`, allocated once per
+        // candidate and reused for every matched fragment below -- see that
+        // function's doc comment.
+        const ISOTOPE_LADDER_K: i32 = 2;
+        let mut isotope_ladder_scratch: Vec<f32> =
+            Vec::with_capacity((ISOTOPE_LADDER_K + 2) as usize);
 
         let mut b_run = Run::default();
         let mut y_run = Run::default();
 
         let mut fragments_details = Fragments::default();
 
-        // Unpack this candidate's sparse predicted MS2 vector (if
-        // configured and this (peptide, charge) has a cache entry) into a
-        // dense, zero-initialized `[f32; N_FRAGMENT_SLOTS]` once, up front
-        // -- same "unpack sparse into a dense per-candidate buffer" shape
-        // as the rest of this fork's dense-array precedent (see
-        // `iim_dense_slot`). `observed_dense` is only allocated at all when
-        // `predicted_dense` is `Some` -- no point tracking observed
-        // intensities for a candidate with nothing to compare them against.
-        // See `docs/ai/predicted_fragment_intensity.md`.
-        let predicted_dense: Option<[f32; N_FRAGMENT_SLOTS]> = self
-            .predicted_fragment_intensity_index
-            .and_then(|by_slot| {
-                let slot = Self::iim_dense_slot(
-                    score.peptide.0 as usize,
-                    score.precursor_charge,
-                    self.min_precursor_charge,
-                    self.max_precursor_charge,
-                )?;
-                by_slot.get(slot).copied().flatten()
-            })
-            .and_then(|(start, end)| {
-                let annotation_id = self.predicted_fragment_intensity_annotation_id?;
-                let intensity = self.predicted_fragment_intensity?;
-                let (start, end) = (start as usize, end as usize);
-                if start > end || end > annotation_id.len() || end > intensity.len() {
-                    return None;
-                }
-                let mut dense = [0f32; N_FRAGMENT_SLOTS];
-                for i in start..end {
-                    if let Some(slot) = dense.get_mut(annotation_id[i] as usize) {
-                        *slot = intensity[i].to_f32();
-                    }
-                }
-                Some(dense)
-            });
-        let mut observed_dense = predicted_dense.map(|_| [0f32; N_FRAGMENT_SLOTS]);
-        // Which of the 174 slots are a structurally real fragment position
-        // for *this* peptide/charge -- set unconditionally per (idx, charge)
-        // below, regardless of whether a peak matched there. Needed for the
-        // sample-size-sensitive metrics (Pearson/Spearman correlation,
-        // hypergeometric probability, intersection -- see
-        // `docs/ai/predicted_fragment_intensity.md`), which must not treat
-        // an unvisited slot the same as a real "no intensity" fragment.
-        let mut is_real_dense = predicted_dense.map(|_| [false; N_FRAGMENT_SLOTS]);
+        // Compact (observed, predicted) pairs, one push per structurally
+        // visited annotation slot -- matched or not -- built up directly in
+        // the loop below instead of via a dense `observed`/`is_real` pair
+        // plus a later masked-compaction pass. `has_predictions` is the one
+        // flag that gates both vectors together, so they can't drift out of
+        // sync the way two independent `Option`s could. The cache's
+        // `predicted` covers all 3 Prosit fragment charges regardless of
+        // this job's own `max_fragment_charge` (e.g. real F9477 production
+        // config uses `max_fragment_charge: 1`, so this loop only ever
+        // visits ~1/3 of the 174 slots) -- pushing only visited slots keeps
+        // every metric from comparing real predicted intensities against
+        // phantom `observed = 0` for fragment charges this job never even
+        // attempts to match, which would otherwise bias every metric
+        // downward (found 2026-08-31). See
+        // `docs/ai/predicted_fragment_intensity.md`.
+        let (has_predictions, predicted_array) =
+            self.build_predicted_dense(score.peptide.0 as usize, score.precursor_charge);
+        let real_capacity = has_predictions as usize * N_FRAGMENT_SLOTS;
+        let mut observed_real: Vec<f32> = Vec::with_capacity(real_capacity);
+        let mut predicted_real: Vec<f32> = Vec::with_capacity(real_capacity);
 
-        for (idx, frag) in fragments {
+        for (idx, frag) in self.iter_fragments(peptide) {
             for charge in 1..max_fragment_charge {
-                let annotation_slot = ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
-                if let (Some(is_real), Some(slot)) = (is_real_dense.as_mut(), annotation_slot) {
-                    is_real[slot] = true;
-                }
+                let annotation_slot =
+                    ms2_similarity::fragment_annotation_id(frag.kind, idx, charge);
 
-                // Experimental peaks are multipled by charge, therefore theoretical are divided
-                let mz = frag.monoisotopic_mass / charge as f32;
+                // `peak.mass` is a PROTON-subtracted, charge-scaled neutral mass, not a
+                // real m/z (see `spectrum.rs`) -- rescale the theoretical fragment's
+                // neutral mass onto that same scale for this candidate charge, rather
+                // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
+                // -searched array; this is the single per-iteration query value).
+                let theoretical_mass = frag.monoisotopic_mass / charge as f32;
+
+                let mut observed_intensity = 0f32;
 
                 if let Some(i) = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
-                    mz,
+                    theoretical_mass,
                     self.fragment_tol,
                     None,
                 ) {
-                    let peak = &query.peaks[i];
+                    let peak = query.peaks.peak(i);
                     let peak_charge = query.peak_charges.get(i).copied().unwrap_or(1);
 
                     score.ppm_difference +=
-                        peak.intensity * (mz - peak.mass).abs() * 2E6 / (mz + peak.mass);
+                        peak.intensity * (theoretical_mass - peak.mass).abs() * 2E6
+                            / (theoretical_mass + peak.mass);
 
                     let exp_mz = peak.mass / peak_charge as f32 + PROTON;
                     let calc_mz = frag.monoisotopic_mass / peak_charge as f32 + PROTON;
@@ -1141,10 +1267,30 @@ impl<'db> Scorer<'db> {
                         }
                     }
 
-                    if let (Some(observed_dense), Some(slot)) =
-                        (observed_dense.as_mut(), annotation_slot)
-                    {
-                        observed_dense[slot] = peak.intensity;
+                    observed_intensity = peak.intensity;
+
+                    if self.isotope_ladder {
+                        // `Search::build` (sage-cli/src/input.rs) rejects
+                        // `isotope_ladder: true` with `deisotope: true` at
+                        // config-load time -- see `Scorer::isotope_ladder`'s
+                        // doc comment. This is a sanity check on that
+                        // invariant, not a normal runtime branch.
+                        debug_assert!(
+                            !query.is_deisotoped(),
+                            "isotope_ladder=true with a deisotoped spectrum \
+                             should have been rejected by config validation"
+                        );
+                        self.observed_isotope_ladder(
+                            &query.peaks,
+                            frag.monoisotopic_mass,
+                            charge,
+                            ISOTOPE_LADDER_K,
+                            &mut isotope_ladder_scratch,
+                        );
+                        // isotope_ladder_scratch now holds NEUTRON-spaced
+                        // observed intensities (i=-1..=ISOTOPE_LADDER_K)
+                        // around this matched fragment -- not consumed
+                        // further yet.
                     }
 
                     if self.annotate_matches {
@@ -1162,6 +1308,13 @@ impl<'db> Scorer<'db> {
                         fragments_details.intensities.push(peak.intensity);
                     }
                 }
+
+                if has_predictions {
+                    if let Some(slot) = annotation_slot {
+                        observed_real.push(observed_intensity);
+                        predicted_real.push(predicted_array[slot]);
+                    }
+                }
             }
         }
 
@@ -1169,30 +1322,7 @@ impl<'db> Scorer<'db> {
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
         score.ppm_difference /= score.summed_b + score.summed_y;
-        if let (Some(predicted), Some(observed), Some(is_real)) =
-            (predicted_dense, observed_dense, is_real_dense)
-        {
-            // Compact once, feed every metric the same real-positions-only
-            // pair -- not just Pearson/Spearman. The cache's `predicted`
-            // covers all 3 Prosit fragment charges regardless of this
-            // job's own `max_fragment_charge` (e.g. real F9477 production
-            // config uses `max_fragment_charge: 1`, so SAGE's own loop
-            // above only ever sets `is_real` for ~1/3 of the 174 slots) --
-            // summing the *full* dense arrays would silently compare real
-            // predicted intensities against phantom `observed = 0` for
-            // fragment charges this job never even attempts to match,
-            // biasing every metric downward. Found 2026-08-31, see
-            // `docs/ai/predicted_fragment_intensity.md` and
-            // `ms2_similarity::entropy_similarity`'s doc comment.
-            let mut observed_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
-            let mut predicted_real = Vec::with_capacity(N_FRAGMENT_SLOTS);
-            for i in 0..N_FRAGMENT_SLOTS {
-                if is_real[i] {
-                    observed_real.push(observed[i]);
-                    predicted_real.push(predicted[i]);
-                }
-            }
-
+        if has_predictions {
             score.ms2_entropy_similarity =
                 ms2_similarity::entropy_similarity(&observed_real, &predicted_real);
             score.ms2_weighted_entropy_similarity =
@@ -1212,14 +1342,14 @@ impl<'db> Scorer<'db> {
                 ms2_similarity::hypergeometric_probability(&observed_real, &predicted_real);
             score.ms2_intersection =
                 ms2_similarity::intersection(&observed_real, &predicted_real, 20);
-            let all_peak_intensities: Vec<f32> = query.peaks.iter().map(|p| p.intensity).collect();
             score.ms2_top6_matched_intensity = ms2_similarity::top6_matched_intensity(
                 &observed_real,
                 &predicted_real,
-                &all_peak_intensities,
+                query.peaks.intensities(),
             );
             score.ms2_pearson_corr = ms2_similarity::pearson_corr(&observed_real, &predicted_real);
-            score.ms2_spearman_corr = ms2_similarity::spearman_corr(&observed_real, &predicted_real);
+            score.ms2_spearman_corr =
+                ms2_similarity::spearman_corr(&observed_real, &predicted_real);
         }
 
         if self.annotate_matches {
@@ -1305,6 +1435,165 @@ mod tests {
         assert_eq!(run.longest, 3);
         run.matched(6);
         assert_eq!(run.length, 2);
+    }
+
+    fn mk_isotope_test_scorer(database: &IndexedDatabase) -> Scorer<'_> {
+        Scorer {
+            db: database,
+            precursor_tol: Tolerance::Da(-3.0, 3.0),
+            fragment_tol: Tolerance::Ppm(-15.0, 15.0),
+            min_matched_peaks: 1,
+            min_isotope_err: 0,
+            max_isotope_err: 0,
+            min_precursor_charge: 1,
+            max_precursor_charge: 1,
+            override_precursor_charge: false,
+            max_fragment_charge: None,
+            chimera: false,
+            report_psms: 5,
+            wide_window: false,
+            predicted_rt: None,
+            predicted_iim: None,
+            rt_tol: None,
+            mobility_tol: None,
+            rt_sigma: None,
+            iim_sigma: None,
+            annotate_matches: false,
+            isotope_ladder: false,
+            score_type: ScoreType::SageHyperScore,
+            ranking_score: RankingScore::CombinedScore,
+            predicted_fragment_intensity_index: None,
+            predicted_fragment_intensity_annotation_id: None,
+            predicted_fragment_intensity: None,
+        }
+    }
+
+    #[test]
+    fn scoring_preserves_per_kind_ordinals_and_prediction_slots() {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">regression\nPEPTIDEK\n".into(), "rev_", false);
+        let mut database = builder.make_parameters().build(fasta);
+        for kinds in [vec![Kind::B, Kind::Y], vec![Kind::Y, Kind::B]] {
+            database.ion_kinds = kinds;
+            let peptide = &database[PeptideIx(0)];
+            let n = peptide.sequence.len() - 1;
+            let mut peaks = Vec::new();
+            let mut annotations = Vec::new();
+            let mut intensities = Vec::new();
+            let mut expected_ordinals = Vec::new();
+            let mut expected_kinds = Vec::new();
+            for &kind in &database.ion_kinds {
+                for (idx, ion) in IonSeries::new(peptide, kind).enumerate() {
+                    let (slot, intensity, ordinal) = match kind {
+                        Kind::B => (idx * 3, (idx + 1) as f32, idx + 1),
+                        Kind::Y => (87 + idx * 3, (100 + idx) as f32, n - idx),
+                        _ => unreachable!(),
+                    };
+                    peaks.push(Peak {
+                        mass: ion.monoisotopic_mass,
+                        intensity,
+                    });
+                    annotations.push(slot as u8);
+                    intensities.push(f16::from_f32(intensity));
+                    expected_ordinals.push(ordinal as i32);
+                    expected_kinds.push(kind);
+                }
+            }
+            peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
+            let query = ProcessedSpectrum {
+                peaks: peaks.into(),
+                ..Default::default()
+            };
+            let index = vec![Some((0, annotations.len() as u64)); database.peptides.len()];
+            let mut scorer = mk_isotope_test_scorer(&database);
+            scorer.annotate_matches = true;
+            scorer.max_fragment_charge = Some(1);
+            scorer.predicted_fragment_intensity_index = Some(&index);
+            scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
+            scorer.predicted_fragment_intensity = Some(&intensities);
+            let (score, fragments) = scorer.score_candidate(
+                &query,
+                &PreScore {
+                    peptide: PeptideIx(0),
+                    precursor_charge: 1,
+                    ..Default::default()
+                },
+            );
+            let fragments = fragments.unwrap();
+            assert_eq!(fragments.fragment_ordinals, expected_ordinals);
+            assert_eq!(fragments.kinds, expected_kinds);
+            assert_eq!(score.matched_b as usize, n);
+            assert_eq!(score.matched_y as usize, n);
+            assert!((score.ms2_cosine_similarity - 1.0).abs() < 1e-6);
+            assert!((score.ms2_entropy_similarity - 1.0).abs() < 1e-6);
+            assert!((score.ms2_pearson_corr - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn isotope_ladder_reads_neutron_spaced_peaks() {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">tol_test\nPEPTIDEK\n".into(), "rev_", false);
+        let database = builder.make_parameters().build(fasta);
+        let scorer = mk_isotope_test_scorer(&database);
+
+        let monoisotopic_mass = 500.0_f32;
+        let charge = 1u8;
+
+        // i=-1 present (anchor-rejection probe still just gets read here, not
+        // acted on), i=0 monoisotopic present, i=1 present, i=2 absent.
+        let peaks = vec![
+            Peak {
+                mass: (monoisotopic_mass - NEUTRON) / charge as f32,
+                intensity: 5.0,
+            },
+            Peak {
+                mass: monoisotopic_mass / charge as f32,
+                intensity: 100.0,
+            },
+            Peak {
+                mass: (monoisotopic_mass + NEUTRON) / charge as f32,
+                intensity: 20.0,
+            },
+        ];
+
+        let peaks: PeakColumns = peaks.into();
+        let mut ladder = Vec::new();
+        scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2, &mut ladder);
+
+        assert_eq!(ladder, vec![5.0, 100.0, 20.0, 0.0]);
+
+        // reused buffer on a second call must not accumulate stale entries
+        scorer.observed_isotope_ladder(&peaks, monoisotopic_mass, charge, 2, &mut ladder);
+        assert_eq!(ladder, vec![5.0, 100.0, 20.0, 0.0]);
+    }
+
+    #[test]
+    fn isotope_ladder_empty_spectrum_is_all_zero() {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">tol_test\nPEPTIDEK\n".into(), "rev_", false);
+        let database = builder.make_parameters().build(fasta);
+        let scorer = mk_isotope_test_scorer(&database);
+
+        let mut ladder = Vec::new();
+        scorer.observed_isotope_ladder(&PeakColumns::default(), 500.0, 1, 2, &mut ladder);
+
+        assert_eq!(ladder, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
