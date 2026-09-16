@@ -441,3 +441,86 @@ page size, which is why the original 11.9% measurement for it was so small.
 Both datasets share a narrow search regime. Nothing here tests wide-window or
 open search, where the precursor-filtered slice grows with tolerance and large
 buckets are expected to invert. One run per configuration.
+
+## Open follow-ups
+
+Ranked by expected value given where time now goes. Profile before optimizing
+any of them -- the one lesson this whole exercise keeps repeating is that the
+obvious target was the wrong one.
+
+### Profile scoring (largest remaining unknown)
+
+`page_search_batch` is now only ~39% of search CPU, down from ~87%. **The other
+~61% is scoring and has never been attributed.** Instrument `score_candidate`,
+`build_predicted_dense` and the `matched_peaks_with_isotope` preliminary pass
+before touching any of them.
+
+One concrete candidate to confirm or dismiss with that profile:
+`matched_peaks_with_isotope` allocates and zero-fills
+`vec![PreScore::default(); potential]` once per isotope error, the RT/IIM
+eviction loop walks all `potential` entries, `AddAssign` concatenates all four
+vectors, and `trim_hits` heapifies the concatenation -- four O(potential) passes
+per spectrum for a handful of non-zero entries. Measured candidate counts are
+578 mean / 1,182 p95 per query (summed over the four isotope errors), so this is
+real but bounded work. Cheap to fix, payoff unknown.
+
+### Re-evaluate the mass-scan kernel in the new regime
+
+At `bucket_size = 4,194,304` the mass scan is **58.6%** of `page_search_batch`,
+up from 10.3%, and slices run ~96 fragments instead of ~0.8. The AVX2 kernel now
+runs on the dominant phase with lanes that actually fill, so the old utilization
+diagnostic (0.431% of ranges reaching eight masses) no longer describes it.
+Re-run that diagnostic before concluding anything about the kernel -- including
+the previously-skipped Scalar-SoA ablation, which is a more informative question
+now than when it was proposed.
+
+Of the four SIMD candidates proposed before any profiling existed, "SIMD across
+windows on one page" is the only one this regime change revives, and only if the
+re-run diagnostic supports it. The other three remain unsupported by evidence.
+
+### Derive `bucket_size` instead of hardcoding it
+
+4,194,304 leaves 48 pages and is near-degenerate. Returns are already flat from
+2,097,152 (451 ms) to 4,194,304 (411 ms) on the F9477 sample, so an intermediate
+value captures nearly all the gain with a saner structure.
+
+Balancing bound-resolution cost `(F/B)·log2(B)` against scan cost
+`peaks · B · precursor_tol` gives `B* ∝ sqrt(F / (peaks · precursor_tol))` --
+so it should grow with the square root of database size and shrink with peak
+count and precursor tolerance. The constants are hand-waved (plugging F9477 in
+gives ~1.5e7 against a measured optimum nearer 2-4e6), so the *form* looks right
+and the coefficient needs calibrating; treat it as a shape to fit, not a formula
+to ship. `Builder::make_parameters` has everything needed except `F`, which is
+known by the time of the `par_chunks_mut(bucket_size)` call.
+
+**Blocking prerequisite: a wide-window/open search test.** Both benchmarked
+datasets are narrow (precursor ~±6 ppm, fragment ~±13 ppm). The model predicts
+large buckets *invert* as precursor tolerance grows, and Sage's index is
+organized for open search in the first place. Do not change a production default
+before measuring there.
+
+### Remaining memory-parallelism headroom
+
+Lane count is spent: 16 slots gave 1.94x on the bound phase, 32 gave 2.50x, so
+the core's outstanding-miss slots are saturated. Further gains need *fewer*
+misses, not more overlap -- a two-level summary index (sample every 512th
+peptide ID per page into a ~1.5 MB, L3-resident side array, then scan the
+narrowed window) would cut dependent DRAM probes from ~15 to ~2.
+
+With `bucket_size` raised this is second-order: bound resolution is 41.4% of
+`page_search_batch`, which is 39% of search, so making it free gains ~16% of
+search. Its real value is robustness -- it would let `bucket_size` return to a
+size with good mass locality, and should hold up in the wide-window regime where
+large buckets are expected to fail. Do it if open search matters or if scoring
+profiling turns up nothing larger.
+
+### Not worth doing
+
+Reorganizing the index precursor-major (bucket by peptide ID, sort by fragment
+mass within bucket) was considered and rejected on measurement. It would make
+the precursor range direct arithmetic and delete the bound-resolution phase
+outright, but fragment-first does **5.7x less fundamental work** at these
+tolerances -- 3,200 window searches against 18,258 theoretical-fragment lookups
+(578 candidates x 31.6 fragments/peptide) -- and the per-query working set is
+143 KB mean / 292 KB p95, not the L1-resident figure that would justify the
+trade. Fragment-first was never the problem; the memory layout beneath it was.
