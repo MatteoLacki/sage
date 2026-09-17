@@ -7,8 +7,9 @@ use sage_core::database::Builder;
 ///
 /// Takes the same digestion-only `database` config section `dump_peptides`
 /// does (enzyme, static/variable mods, mass bounds, decoy_tag) plus the
-/// index-shaping keys the fragment set itself depends on (`ion_kinds`,
-/// `min_ion_index`, `bucket_size`).
+/// keys the fragment set itself depends on (`ion_kinds`, `min_ion_index`).
+/// `bucket_size` only orders fragments within a page, which the histogram
+/// cannot see.
 ///
 /// The histogram is accumulated here rather than dumped as ~150M raw pairs:
 /// a true 5ppm x 5ppm grid over the full mass ranges is ~3.2e11 cells, so

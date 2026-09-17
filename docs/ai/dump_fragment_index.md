@@ -45,8 +45,10 @@ the pipeline's own `sample_tensors.mmappet`.
 ## What it reads from the config
 
 The same `database` section `dump_peptides` takes, plus the keys the
-fragment set itself depends on (`ion_kinds`, `min_ion_index`,
-`bucket_size`). Note `fragment_min_mz`/`fragment_max_mz` do **not** apply:
+fragment set itself depends on (`ion_kinds`, `min_ion_index`).
+`bucket_size` is accepted but irrelevant: it only reorders fragments within
+an index page, and the histogram is order-independent, so the pipeline
+leaves it out of this rule's config. Note `fragment_min_mz`/`fragment_max_mz` do **not** apply:
 they filter observed peaks in `SpectrumProcessor`, so the index holds
 fragments outside them (171–3943 Da for the settings above, against a
 configured 200–1700 window). Fragment masses are neutral and
