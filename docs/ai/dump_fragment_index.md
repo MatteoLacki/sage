@@ -4,10 +4,11 @@
 `IndexedDatabase` and dumps a 2D histogram of its (peptide monoisotopic
 mass, fragment neutral mass) pairs, for visualising where the index
 actually puts mass. It is a diagnostic/plotting tool: nothing in the search
-path reads its output, and it is deliberately **not** a necroflow rule —
-`necromerge2`'s `scripts/mass_grid_heatmap.py` renders it by hand (the
-same renderer also serves that repo's Koina-prediction grid, so `grid.json`
-carries the axis labels).
+path reads its output. `git/ionmaidentools` runs it as the request-only
+`bin_fragment_index` rule and renders it with necromerge2's
+`scripts/mass_grid_heatmap.py` (the same renderer serves the
+Koina-prediction grid, so `grid.json` carries the axis labels) -- see that
+repo's `docs/ai/mass_grid_plots.md`.
 
 ## Why the histogram is accumulated in Rust, not dumped as pairs
 
