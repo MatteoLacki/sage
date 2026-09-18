@@ -160,6 +160,8 @@ pub struct Feature {
     pub delta_rt_z2_external: f32,
     /// Ion mobility
     pub ims: f32,
+    /// MS1 precursor intensity (see docs/ai/pmsms_input.md). 0.0 when unset.
+    pub ms1_intensity: f32,
     /// Predicted ion mobility, if enabled
     pub predicted_ims: f32,
     /// Difference between predicted & observed ion mobility
@@ -933,6 +935,7 @@ impl<'db> Scorer<'db> {
                     .unwrap()
                     .inverse_ion_mobility
                     .unwrap_or(0.0),
+                ms1_intensity: query.precursors.first().unwrap().intensity.unwrap_or(0.0),
                 delta_mass,
                 isotope_error,
                 average_ppm: score.ppm_difference,

@@ -1380,6 +1380,11 @@ impl Runner {
         record.push_field(filenames[feature.file_id].as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.ims).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.ms1_intensity.ln_1p())
+                .as_bytes(),
+        );
         record.push_field(itoa::Buffer::new().format(feature.rank).as_bytes());
         record.push_field(
             itoa::Buffer::new()
@@ -1507,6 +1512,11 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
+                .format(feature.ms2_intensity.ln_1p())
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
                 .format(feature.ms2_entropy_similarity)
                 .as_bytes(),
         );
@@ -1591,6 +1601,7 @@ impl Runner {
             "FileName",
             "retentiontime",
             "ion_mobility",
+            "ln(ms1_intensity)",
             "rank",
             "z=2",
             "z=3",
@@ -1624,6 +1635,7 @@ impl Runner {
             "scored_candidates",
             "ln(-poisson)",
             "posterior_error",
+            "ln(ms2_intensity)",
             "ms2_entropy_similarity",
             "ms2_weighted_entropy_similarity",
             "ms2_heuristic_entropy_similarity",

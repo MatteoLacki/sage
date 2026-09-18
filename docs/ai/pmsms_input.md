@@ -112,3 +112,37 @@ that bit us above, for the whole run. (The high-m/z tail's apparent
 widening, by contrast, wasn't well-supported at all — driven by bins down
 to a few dozen points, noise rather than signal, not a reason to act on
 either.)
+
+## MS1 precursor intensity (optional, apex only) and MS2 intensity, 2026-09
+
+The precursors table accepts one further **optional** column: `intensity`
+(i64 in both the parquet and mmappet fixture layouts — not `uint32`, despite
+the fragment-level `pmsms.mmappet` column of the same name being genuinely
+`uint32`; the two live in different files and have never had matching
+dtypes). When present, it becomes `Precursor::intensity` →
+`Feature::ms1_intensity` → the PIN's `ln(ms1_intensity)` column; when absent,
+`ms1_intensity` reports `0.0`, same optional-column convention as
+`ppm_tol_lo`/`ppm_tol_hi` above.
+
+This is **timstofu's apex-point MS1 reading** at the precursor's selected
+(tof,urt,scan) position, not an isotope-envelope sum — `matched_intensity_pct`
+is a real sum for MS2 because deisotoping folds each isotope satellite's
+intensity into its monoisotopic root before scoring, but no equivalent
+folding happens on the MS1 side before this value is captured. It reaches the
+precursors table only because `git/mgfops`'s `cut_and_index_precursors.py`
+merges the full precursor-cluster row (every column timstofu produced,
+including its own `intensity` and `log10_intensity`) against the fragment
+index — not a deliberate export. A true envelope-summed MS1 intensity would
+need timstofu's `intensity_argmax` candidate-selection method (its
+`box_intensity` output) wired through instead; the production config
+(`correlation` method) never computes one. See `necromerge2`'s
+`plans/isotope_envelope_scoring.md` for the deferred IsoSpec-based
+envelope-comparison follow-on this is a prerequisite for.
+
+`Feature::ms2_intensity` (`summed_b + summed_y`, already isotope-summed via
+deisotoping — see above) existed on `Feature` before this work and needed no
+reader change; it was simply never written to the PIN. Now emitted as
+`ln(ms2_intensity)`, placed next to the other `ms2_*` PIN columns rather than
+next to `ln(ms1_intensity)`, which sits with the other raw precursor-signal
+columns (`retentiontime`/`ion_mobility`) instead — grouped by what each
+column describes, not by when it was added.

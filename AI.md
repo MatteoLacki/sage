@@ -50,7 +50,7 @@ lives in `docs/ai/`, one file per topic:
 
 | File | Covers |
 |------|--------|
-| `docs/ai/pmsms_input.md` | `pmsms`/precursors binary input, per-precursor ppm tolerance, per-fragment (spline) ppm tolerance |
+| `docs/ai/pmsms_input.md` | `pmsms`/precursors binary input, per-precursor ppm tolerance, per-fragment (spline) ppm tolerance, MS1/MS2 intensity PIN columns |
 | `docs/ai/predicted_rt_iim.md` | `--predicted-rt`/`--predicted-iim` hard-eviction filtering, dense peptide-index lookup, external RT/IIM as LDA features, `combined_score` soft ranking penalty |
 | `docs/ai/predicted_fragment_intensity.md` | `--predicted-fragment-intensity-*`: optional MS2 fragment-intensity reader (job-scoped pointer parquet + shared `arrays.mmappet`), feature-only (no hard filter), `ms2_entropy_similarity` |
 | `docs/ai/unimod.md` | `[UNIMOD:<id>]` modification notation support (`crates/sage/src/unimod.rs`) |

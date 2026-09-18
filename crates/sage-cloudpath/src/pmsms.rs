@@ -18,6 +18,8 @@
 //!   `isolation_window` is `None` and the run's global `precursor_tol`
 //!   applies instead — this keeps precursor tables without the columns
 //!   working unchanged.
+//!   A further column, intensity(i64), is also optional (see
+//!   docs/ai/pmsms_input.md).
 
 #![cfg(feature = "parquet")]
 
@@ -61,6 +63,7 @@ struct PrecursorRow {
     /// Per-precursor ppm tolerance bounds, present only when both
     /// `ppm_tol_lo` and `ppm_tol_hi` columns exist in the precursors table.
     ppm_tol: Option<(f32, f32)>,
+    ms1_intensity: Option<f32>,
 }
 
 /// Decode the pipeline's digit-concatenated charge encoding into individual charges.
@@ -108,6 +111,7 @@ fn read_precursors_parquet(parquet_path: &Path) -> Result<Vec<PrecursorRow>, Pms
     // global precursor_tol (see Precursor::effective_precursor_tol).
     let i_ppm_lo = col_idx("ppm_tol_lo").ok();
     let i_ppm_hi = col_idx("ppm_tol_hi").ok();
+    let i_intensity = col_idx("intensity").ok();
 
     let mut rows: Vec<PrecursorRow> = Vec::new();
 
@@ -127,6 +131,10 @@ fn read_precursors_parquet(parquet_path: &Path) -> Result<Vec<PrecursorRow>, Pms
             (Some(lo), Some(hi)) => Some((row.get_double(lo)? as f32, row.get_double(hi)? as f32)),
             _ => None,
         };
+        let ms1_intensity = match i_intensity {
+            Some(i) => Some(row.get_long(i)? as f32),
+            None => None,
+        };
 
         if frag_count == 0 {
             continue;
@@ -141,6 +149,7 @@ fn read_precursors_parquet(parquet_path: &Path) -> Result<Vec<PrecursorRow>, Pms
             frag_start,
             frag_count,
             ppm_tol,
+            ms1_intensity,
         });
     }
 
@@ -207,6 +216,7 @@ fn read_precursors_mmappet(dir: &Path) -> Result<Vec<PrecursorRow>, PmsmsError> 
     let i_count = mmappet_column_index(&schema, "fragment_event_cnt", "uint64")?;
     let i_ppm_lo = mmappet_optional_column_index(&schema, "ppm_tol_lo", "float64")?;
     let i_ppm_hi = mmappet_optional_column_index(&schema, "ppm_tol_hi", "float64")?;
+    let i_intensity = mmappet_optional_column_index(&schema, "intensity", "int64")?;
 
     // SAFETY: dtype checked against schema.txt above for each column.
     let (_m0, precursor_idx) = unsafe { mmap_as_slice::<u64>(&dir.join(format!("{i_pidx}.bin")))? };
@@ -225,6 +235,10 @@ fn read_precursors_mmappet(dir: &Path) -> Result<Vec<PrecursorRow>, PmsmsError> 
         Some(i) => Some(unsafe { mmap_as_slice::<f64>(&dir.join(format!("{i}.bin")))? }),
         None => None,
     };
+    let intensity = match i_intensity {
+        Some(i) => Some(unsafe { mmap_as_slice::<i64>(&dir.join(format!("{i}.bin")))? }),
+        None => None,
+    };
 
     let mut rows = Vec::with_capacity(precursor_idx.len());
     for i in 0..precursor_idx.len() {
@@ -235,6 +249,7 @@ fn read_precursors_mmappet(dir: &Path) -> Result<Vec<PrecursorRow>, PmsmsError> 
             (Some((_, lo)), Some((_, hi))) => Some((lo[i] as f32, hi[i] as f32)),
             _ => None,
         };
+        let ms1_intensity = intensity.as_ref().map(|(_, arr)| arr[i] as f32);
         rows.push(PrecursorRow {
             precursor_idx: precursor_idx[i],
             mz: mz[i] as f32,
@@ -244,6 +259,7 @@ fn read_precursors_mmappet(dir: &Path) -> Result<Vec<PrecursorRow>, PmsmsError> 
             frag_start: frag_start[i],
             frag_count: frag_count[i],
             ppm_tol,
+            ms1_intensity,
         });
     }
     Ok(rows)
@@ -346,7 +362,7 @@ fn parse_with<T: Send>(
             let precursors: Vec<Precursor> = if p.charges.is_empty() {
                 vec![Precursor {
                     mz: p.mz,
-                    intensity: None,
+                    intensity: p.ms1_intensity,
                     charge: None,
                     spectrum_ref: None,
                     isolation_window,
@@ -357,7 +373,7 @@ fn parse_with<T: Send>(
                     .iter()
                     .map(|&c| Precursor {
                         mz: p.mz,
-                        intensity: None,
+                        intensity: p.ms1_intensity,
                         charge: Some(c),
                         spectrum_ref: None,
                         isolation_window,
