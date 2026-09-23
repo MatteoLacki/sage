@@ -551,9 +551,22 @@ impl<'db> Scorer<'db> {
         WINDOWS_SCRATCH.with(|windows| {
             let mut windows = windows.borrow_mut();
             windows.clear();
-            for &mass in query.peaks.masses() {
-                for charge in 1..max_fragment_charge {
-                    windows.push((mass * charge as f32, self.fragment_tol));
+            for (i, &mass) in query.peaks.masses().iter().enumerate() {
+                // `mass` already has this peak's own charge baked in
+                // (`(mz-PROTON)*z`, see spectrum.rs) whenever deisotoping
+                // resolved a charge for it (`peak_charges[i] != 0` --
+                // `0` is the distinct "no envelope found" sentinel).
+                // Re-multiplying that mass by a further candidate charge
+                // tests a hypothesis already ruled out by the envelope, so
+                // only the unscaled window is meaningful for those peaks.
+                // See docs/ai/fragment_charge_hypothesis.md.
+                match query.peak_charges.get(i) {
+                    Some(&z) if z >= 1 => windows.push((mass, self.fragment_tol)),
+                    _ => {
+                        for charge in 1..max_fragment_charge {
+                            windows.push((mass * charge as f32, self.fragment_tol));
+                        }
+                    }
                 }
             }
 
@@ -1011,12 +1024,18 @@ impl<'db> Scorer<'db> {
                 // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
                 // -searched array; this is the single per-iteration query value).
                 let theoretical_mass = frag.monoisotopic_mass / charge as f32;
-                if let Some(i) = crate::spectrum::select_most_intense_peak(
+                let matched = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
                     theoretical_mass,
                     self.fragment_tol,
                     None,
-                ) {
+                )
+                // See docs/ai/fragment_charge_hypothesis.md: a peak with a
+                // resolved charge (`peak_charges[i] != 0`) already carries
+                // its true neutral mass -- only charge==1 (no further
+                // rescale) is a meaningful comparison for it.
+                .filter(|&i| charge == 1 || query.peak_charges.get(i).copied().unwrap_or(0) == 0);
+                if let Some(i) = matched {
                     to_remove.push(query.peaks.peak(i));
                 }
             }
@@ -1241,14 +1260,32 @@ impl<'db> Scorer<'db> {
 
                 let mut observed_intensity = 0f32;
 
-                if let Some(i) = crate::spectrum::select_most_intense_peak(
+                let matched = crate::spectrum::select_most_intense_peak(
                     &query.peaks,
                     theoretical_mass,
                     self.fragment_tol,
                     None,
-                ) {
+                )
+                // See docs/ai/fragment_charge_hypothesis.md: a peak with a
+                // resolved charge (`peak_charges[i] != 0`) already carries
+                // its true neutral mass -- only charge==1 (no further
+                // rescale) is a meaningful comparison for it. Rejecting
+                // here (not just skipping the bookkeeping below) keeps
+                // this structurally identical to "no match", so the
+                // has_predictions branch still pushes a real 0, not a
+                // spurious nonzero observed_intensity.
+                .filter(|&i| charge == 1 || query.peak_charges.get(i).copied().unwrap_or(0) == 0);
+
+                if let Some(i) = matched {
                     let peak = query.peaks.peak(i);
-                    let peak_charge = query.peak_charges.get(i).copied().unwrap_or(1);
+                    // `0` means "unresolved" here, not a real charge -- the
+                    // peak's mass was itself built assuming scale 1 in that
+                    // case (spectrum.rs), so that's the right divisor to
+                    // recover its real m/z below, same as pre-fix behavior.
+                    let peak_charge = match query.peak_charges.get(i).copied() {
+                        Some(0) | None => 1,
+                        Some(z) => z,
+                    };
 
                     score.ppm_difference +=
                         peak.intensity * (theoretical_mass - peak.mass).abs() * 2E6
@@ -1609,5 +1646,126 @@ mod tests {
         assert_eq!(max_fragment_charge(Some(1), 3), 2);
         assert_eq!(max_fragment_charge(Some(2), 4), 3);
         assert_eq!(max_fragment_charge(Some(4), 1), 2);
+    }
+
+    // See docs/ai/fragment_charge_hypothesis.md.
+    fn charge_hypothesis_test_db() -> IndexedDatabase {
+        let builder = crate::database::Builder {
+            bucket_size: Some(8),
+            fasta: Some("static".into()),
+            generate_decoys: Some(false),
+            ..Default::default()
+        };
+        let fasta = crate::fasta::Fasta::parse(">charge_hyp\nPEPTIDEK\n".into(), "rev_", false);
+        let mut database = builder.make_parameters().build(fasta);
+        database.ion_kinds = vec![Kind::B];
+        database
+    }
+
+    #[test]
+    fn resolved_multiply_charged_peak_only_tests_charge_one() {
+        let database = charge_hypothesis_test_db();
+        let peptide = &database[PeptideIx(0)];
+        let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
+
+        // Pretend deisotoping resolved this peak to charge 2, so its stored
+        // mass is already the true neutral mass of a charge-2 ion at b1/2 --
+        // not b1 itself. Before the fix, the charge==2 loop iteration would
+        // re-multiply this already-resolved mass (dividing b1 by 2 on the
+        // theoretical side is the same rescale) and spuriously "find" b1
+        // (theoretical_mass = b1/2 == peak.mass). Assert that no longer
+        // happens.
+        let query = ProcessedSpectrum {
+            peaks: vec![Peak {
+                mass: b1 / 2.0,
+                intensity: 10.0,
+            }]
+            .into(),
+            peak_charges: vec![2],
+            ..Default::default()
+        };
+
+        let mut scorer = mk_isotope_test_scorer(&database);
+        scorer.max_fragment_charge = Some(2);
+        let (score, _) = scorer.score_candidate(
+            &query,
+            &PreScore {
+                peptide: PeptideIx(0),
+                precursor_charge: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(score.matched_b, 0);
+    }
+
+    #[test]
+    fn confirmed_charge_one_peak_only_tests_charge_one() {
+        let database = charge_hypothesis_test_db();
+        let peptide = &database[PeptideIx(0)];
+        let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
+
+        // Same setup as resolved_multiply_charged_peak_only_tests_charge_one,
+        // but with the envelope resolved to charge 1 instead of 2 -- the
+        // exact case that used to be indistinguishable from "unresolved"
+        // (both collapsed to peak_charges[i] == 1). Now that unresolved is
+        // its own 0 sentinel, a confirmed charge-1 peak gets the same
+        // charge==1-only treatment as any other resolved charge: the
+        // charge==2 spurious match must be rejected here too.
+        let query = ProcessedSpectrum {
+            peaks: vec![Peak {
+                mass: b1 / 2.0,
+                intensity: 10.0,
+            }]
+            .into(),
+            peak_charges: vec![1],
+            ..Default::default()
+        };
+
+        let mut scorer = mk_isotope_test_scorer(&database);
+        scorer.max_fragment_charge = Some(2);
+        let (score, _) = scorer.score_candidate(
+            &query,
+            &PreScore {
+                peptide: PeptideIx(0),
+                precursor_charge: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(score.matched_b, 0);
+    }
+
+    #[test]
+    fn unresolved_peak_still_tests_multiple_fragment_charges() {
+        let database = charge_hypothesis_test_db();
+        let peptide = &database[PeptideIx(0)];
+        let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
+
+        // Same peak mass as above, but charge genuinely unresolved (the 0
+        // sentinel -- no envelope found at all, see
+        // docs/ai/fragment_charge_hypothesis.md) -- the charge==2
+        // hypothesis for this peak is still legitimate, since we genuinely
+        // don't know its real charge, so it must still match b1 at the
+        // charge==2 iteration.
+        let query = ProcessedSpectrum {
+            peaks: vec![Peak {
+                mass: b1 / 2.0,
+                intensity: 10.0,
+            }]
+            .into(),
+            peak_charges: vec![0],
+            ..Default::default()
+        };
+
+        let mut scorer = mk_isotope_test_scorer(&database);
+        scorer.max_fragment_charge = Some(2);
+        let (score, _) = scorer.score_candidate(
+            &query,
+            &PreScore {
+                peptide: PeptideIx(0),
+                precursor_charge: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(score.matched_b, 1);
     }
 }

@@ -59,6 +59,7 @@ lives in `docs/ai/`, one file per topic:
 | `docs/ai/simd.md` | Fragment-index search performance: SoA/AVX2 page scan, interleaved peptide-ID bound resolution, `bucket_size` sizing, and the F9477/F9468 benchmarks |
 | `docs/ai/reuse_index_bins.md` | `page_search_batch`: sharing one page's precursor-scoped range across a spectrum's fragment windows |
 | `docs/ai/dumped_peptides_positional_predictions.md` | `--predicted-rt`/`--predicted-iim`/`--predicted-fragment-intensity-index`: positional (`peptide_row`) instead of `sequence`-keyed, `dumped_peptides_sha256` fingerprint safety net |
+| `docs/ai/fragment_charge_hypothesis.md` | Fragment charge-loop vs. resolved (deisotoped) peak charge: why testing extra candidate charges against an already-resolved peak is meaningless, the fix in `matched_peaks_with_isotope`/`remove_matched_peaks`/`score_candidate`, and why it's dormant while every job here pins `max_fragment_charge: 1` |
 
 Check `summarise/`-style freshness only matters for the top-level monorepo;
 within this vendored fork, treat each `docs/ai/*.md` file as current unless

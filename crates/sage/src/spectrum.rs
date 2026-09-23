@@ -157,9 +157,15 @@ pub struct ProcessedSpectrum<T = PeakColumns> {
     pub precursors: Vec<Precursor>,
     /// MS peaks, sorted by mass in ascending order
     pub peaks: T,
-    /// Parallel to `peaks`. Non-empty only when deisotoping is enabled;
-    /// `peak_charges[i]` is the observed charge of `peaks[i]`.
-    /// Empty (all charges implicitly 1) when deisotope=false.
+    /// Parallel to `peaks`. Non-empty only when deisotoping is enabled.
+    /// `peak_charges[i]` is `peaks[i]`'s isotope-envelope-resolved charge,
+    /// or `0` if deisotoping found no envelope for it (charge unknown, not
+    /// "assumed 1" -- `peaks[i].mass` itself still uses scale 1 as its best
+    /// available base in that case, see `SpectrumProcessor::process_ms2`;
+    /// only this field's `0` records that the charge is actually unresolved,
+    /// distinct from a genuinely confirmed charge-1 envelope, which is
+    /// reported as `1`). Empty (all charges unknown) when deisotope=false.
+    /// See `docs/ai/fragment_charge_hypothesis.md`.
     pub peak_charges: Vec<u8>,
     /// Total ion current
     pub total_ion_current: f32,
@@ -478,15 +484,22 @@ impl SpectrumProcessor {
                 .into_iter()
                 .filter(|peak| peak.envelope.is_none())
                 .map(|peak| {
-                    // Convert from MH* to M
-                    let charge = peak.charge.unwrap_or(1);
-                    let mass = (peak.mz - PROTON) * charge as f32;
+                    // Convert from MH* to M. `mass`'s scale always defaults
+                    // to 1 when no envelope was resolved (the best available
+                    // base for scoring.rs's fragment charge-hypothesis
+                    // loop) -- but the charge *reported* below is 0 in that
+                    // case, not 1, so it stays distinguishable from a
+                    // genuinely confirmed charge-1 envelope. See
+                    // docs/ai/fragment_charge_hypothesis.md.
+                    let resolved_charge = peak.charge;
+                    let scale_charge = resolved_charge.unwrap_or(1);
+                    let mass = (peak.mz - PROTON) * scale_charge as f32;
                     (
                         Peak {
                             mass,
                             intensity: peak.intensity,
                         },
-                        charge,
+                        resolved_charge.unwrap_or(0),
                     )
                 })
                 .take(self.take_top_n)
