@@ -128,3 +128,49 @@ independently covered by a test that reaches `self.db.query(...)` -- would
 need a full precursor-tolerance-matching `IndexedDatabase` fixture; left
 uncovered by a dedicated test here as a reasonable stopping point, not
 because it's less important.
+
+## Benchmark: why `max_fragment_charge` stays at 1 in every real job (2026-09-23)
+
+Once the fix landed, the natural follow-up was whether it's now *safe* to
+raise `max_fragment_charge` above 1 in a real job -- the fix only makes the
+charge loop correct, it says nothing about whether searching wider fragment
+charges is actually a good idea on real data. Tested against the top-level
+monorepo's full F9477 best-known config (`jobs/f9477_best.toml`,
+716,614 precursors, `deisotope: true`), varying only `max_fragment_charge`,
+reusing every upstream pipeline node (precursor picking, pmsms, recalibration,
+fragment-intensity cache) via necroflow's content-addressed caching so only
+the `run_sage`->`mokapot_*` subgraph re-ran per value:
+
+| `max_fragment_charge` | final `run_sage` wall time | raw PSMs | targets | decoys | target:decoy | mean `ln(hyperscore)` tgt / decoy | mokapot |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 1 (production baseline) | 78.9s | 362,684 | 243,697 | 118,987 | 2.05:1 | 3.18 / 3.00 | succeeds |
+| 2 | 222.0s | 576,959 | 293,363 | 283,596 | 1.03:1 | 4.26 / 4.26 | **fails** |
+| 3 | 215.4s | 576,608 | 293,066 | 283,542 | 1.03:1 | 4.27 / 4.27 | **fails** |
+
+At both 2 and 3, mokapot's `_find_best_feature` raises `RuntimeError: No PSMs
+found below the 'eval_fdr'` -- none of its 38 features separates targets from
+decoys well enough to bootstrap at `train_fdr: 0.05`, in any of its 3
+cross-validation folds. Checked this wasn't a scoring bug before treating it
+as a real finding: `results.sage.pin` has zero NaN/malformed `ln(hyperscore)`
+values at either setting; the separation genuinely collapses (target/decoy
+mean score goes from a real gap at charge 1 to statistically tied at charge
+2 and 3).
+
+Two things stand out. First, **the collapse is a cliff at 1->2, not a
+gradual slide** -- charge 2 and charge 3 are within noise of each other on
+every metric (PSM count, target:decoy ratio, mean score, even wall time:
+222.0s vs 215.4s), so whatever's saturating (most real b/y fragments at this
+collision energy are genuinely singly-charged; testing charge 2/3
+hypotheses mostly just adds noise matches, symmetrically to targets and
+decoys) is already saturated by 2. Second, **this is not something the fix
+caused or could have prevented** -- it's an intrinsic property of widening
+the fragment-charge search space this much on this dataset's tolerances, and
+would be true of a mathematically perfect implementation of the same idea.
+It does explain, after the fact, why `max_fragment_charge: 1` is the
+production setting in every `jobs/*.toml` here rather than an unconsidered
+default.
+
+Benchmark job files: `jobs/f9477_max_fragment_charge_2.toml` and
+`jobs/f9477_max_fragment_charge_3.toml` in the top-level monorepo (copies of
+`f9477_best.toml` with only `max_fragment_charge` changed; not production
+configs).
