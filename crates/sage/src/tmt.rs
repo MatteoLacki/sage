@@ -198,8 +198,8 @@ pub fn find_reporter_ions(
     labels
         .iter()
         .map(|&label| {
-            spectrum::select_most_intense_peak(peaks, label, label_tolerance, Some(-PROTON))
-                .map(|i| peaks.peak(i))
+            spectrum::select_matched_peaks(peaks, label, label_tolerance, Some(-PROTON))
+                .map(|m| peaks.peak(m.most_intense))
         })
         .collect()
 }

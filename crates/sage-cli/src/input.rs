@@ -137,7 +137,7 @@ pub struct Input {
     /// debug builds alike) and panics, naming the offending scan, if that
     /// guarantee turns out false -- see `spectrum.rs`'s `is_sorted_by_mass`
     /// for why silently-broken sort order can't be allowed to pass through
-    /// (`select_most_intense_peak`'s binary search requires ascending order
+    /// (`select_matched_peaks`'s binary search requires ascending order
     /// and returns silently wrong or missing matches, not a panic,
     /// otherwise). Only takes effect on MS1 spectra and MS2 spectra with
     /// `deisotope: false` -- has no effect on MS2 spectra when

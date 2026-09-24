@@ -224,20 +224,36 @@ pub enum MS1Spectra {
     Empty,
 }
 
-/// Binary search followed by linear search to select the most intense peak within `tolerance` window
+/// The two peaks `select_matched_peaks` reports from one tolerance-window scan: the most
+/// intense peak (what Sage actually matches a theoretical fragment to), and the peak closest
+/// in mass to `center` (which may be a different, less intense peak). Named fields instead of
+/// a `(usize, usize)` tuple so call sites read `m.most_intense`/`m.closest` rather than `.0`/`.1`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PeakMatch {
+    pub most_intense: usize,
+    pub closest: usize,
+}
+
+/// Binary search followed by linear search to select, within `tolerance` of `center`, both the
+/// most intense peak and the peak closest in mass to `center` -- a single scan, since both are
+/// answered by the same tolerance window.
 /// * `offset` - this parameter allows for a static adjustment to the lower and upper bounds of the search window.
+///
+/// Tie-breaks: most-intense keeps the highest-index peak on an exact intensity tie. Closest
+/// prefers the smaller distance; on an exact distance tie, the more intense peak wins; on a tie
+/// of both, the highest-index peak wins -- consistent with the most-intense tie-break.
 ///
 /// Sage subtracts a proton (and assumes z=1) for all experimental peaks, and stores all fragments as monoisotopic
 /// masses. This simplifies downstream calculations at multiple charge states, but it also subtly changes tolerance
 /// bounds. For most applications this is completely OK to ignore - however, for exact similarity of TMT reporter ion
 /// measurements with ProteomeDiscoverer, FragPipe, etc, we need to account for this minor difference (which has an impact
 /// perhaps 0.01% of the time)
-pub fn select_most_intense_peak(
+pub fn select_matched_peaks(
     peaks: &PeakColumns,
     center: f32,
     tolerance: Tolerance,
     offset: Option<f32>,
-) -> Option<usize> {
+) -> Option<PeakMatch> {
     let (lo, hi) = tolerance.bounds(center);
     let (lo, hi) = (
         lo + offset.unwrap_or_default(),
@@ -246,8 +262,11 @@ pub fn select_most_intense_peak(
 
     let (i, j) = binary_search_slice(peaks.masses(), |mass, query| mass.total_cmp(query), lo, hi);
 
-    let mut best_idx = None;
+    let mut most_intense_idx = None;
     let mut max_int = 0.0;
+    let mut closest_idx = None;
+    let mut min_dist = f32::INFINITY;
+    let mut closest_int = 0.0;
     // `binary_search_slice`'s left bound can overshoot by one element --
     // needed for correctness when it's used on a coarse per-bucket summary
     // (e.g. `page_search`'s outer search over `min_value`), where an exact
@@ -257,12 +276,28 @@ pub fn select_most_intense_peak(
     // uniformly-safe helper instead of two near-identical variants.
     for idx in i..j {
         let mass = peaks.masses[idx];
-        if mass >= lo && mass <= hi && peaks.intensities[idx] >= max_int {
-            max_int = peaks.intensities[idx];
-            best_idx = Some(idx);
+        if mass < lo || mass > hi {
+            continue;
+        }
+        let intensity = peaks.intensities[idx];
+
+        if intensity >= max_int {
+            max_int = intensity;
+            most_intense_idx = Some(idx);
+        }
+
+        let dist = (mass - center).abs();
+        if dist < min_dist || (dist == min_dist && intensity >= closest_int) {
+            min_dist = dist;
+            closest_int = intensity;
+            closest_idx = Some(idx);
         }
     }
-    best_idx
+
+    Some(PeakMatch {
+        most_intense: most_intense_idx?,
+        closest: closest_idx?,
+    })
 }
 
 // pub fn find_spectrum_by_id(
@@ -414,7 +449,7 @@ impl<T> ProcessedSpectrum<T> {
 }
 
 /// Is `peaks` already sorted ascending by `mass`? Hard precondition for
-/// `select_most_intense_peak`'s binary search, which returns silently wrong
+/// `select_matched_peaks`'s binary search, which returns silently wrong
 /// or missing matches -- not a panic -- on unsorted input.
 fn is_sorted_by_mass(peaks: &[Peak]) -> bool {
     peaks.windows(2).all(|w| w[0].mass <= w[1].mass)
@@ -562,7 +597,7 @@ impl SpectrumProcessor {
                      mass-sorted ascending -- the caller's guarantee that \
                      upstream spectra arrive pre-sorted was violated. \
                      Continuing would silently break \
-                     `select_most_intense_peak`'s binary search precondition \
+                     `select_matched_peaks`'s binary search precondition \
                      and produce wrong or missing fragment matches downstream, \
                      so this refuses to continue instead. Set \
                      `assume_sorted_peaks: false` to sort in-process instead.",
@@ -676,27 +711,60 @@ mod test {
                         lo + offset.unwrap_or_default(),
                         hi + offset.unwrap_or_default(),
                     );
-                    let mut best = None;
-                    let mut intensity = 0.0;
+                    let mut best_intense = None;
+                    let mut max_int = 0.0;
+                    let mut best_closest = None;
+                    let mut min_dist = f32::INFINITY;
+                    let mut closest_int = 0.0;
                     for (idx, peak) in peaks.iter().enumerate() {
-                        if peak.mass >= lo && peak.mass <= hi && peak.intensity >= intensity {
-                            best = Some(idx);
-                            intensity = peak.intensity;
+                        if peak.mass < lo || peak.mass > hi {
+                            continue;
+                        }
+                        if peak.intensity >= max_int {
+                            max_int = peak.intensity;
+                            best_intense = Some(idx);
+                        }
+                        let dist = (peak.mass - center).abs();
+                        if dist < min_dist || (dist == min_dist && peak.intensity >= closest_int)
+                        {
+                            min_dist = dist;
+                            closest_int = peak.intensity;
+                            best_closest = Some(idx);
                         }
                     }
+                    let expected = match (best_intense, best_closest) {
+                        (Some(most_intense), Some(closest)) => Some(PeakMatch {
+                            most_intense,
+                            closest,
+                        }),
+                        _ => None,
+                    };
                     assert_eq!(
-                        select_most_intense_peak(&columns, center, tolerance, offset),
-                        best
+                        select_matched_peaks(&columns, center, tolerance, offset),
+                        expected
                     );
                 }
             }
         }
         assert_eq!(
-            select_most_intense_peak(&columns, 100.5, Tolerance::Da(-0.5, 0.5), None),
-            Some(3)
+            select_matched_peaks(&columns, 100.5, Tolerance::Da(-0.5, 0.5), None),
+            Some(PeakMatch {
+                most_intense: 3,
+                closest: 3
+            })
+        );
+        // Window containing the intense-but-farther 99.0 peak and the
+        // weaker-but-closer 100.0 peaks -- proves the two fields are
+        // genuinely independent, not always the same peak.
+        assert_eq!(
+            select_matched_peaks(&columns, 99.6, Tolerance::Da(-0.7, 0.7), None),
+            Some(PeakMatch {
+                most_intense: 0,
+                closest: 2
+            })
         );
         assert_eq!(
-            select_most_intense_peak(
+            select_matched_peaks(
                 &PeakColumns::default(),
                 100.0,
                 Tolerance::Da(-1.0, 1.0),

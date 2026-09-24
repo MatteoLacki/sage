@@ -251,6 +251,8 @@ pub struct Fragments {
     pub intensities: Vec<f32>,
     pub mz_calculated: Vec<f32>,
     pub mz_experimental: Vec<f32>,
+    pub closest_fragment_mz_calculated: Vec<f32>,
+    pub closest_fragment_mz_experimental: Vec<f32>,
 }
 
 static PSM_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1024,12 +1026,13 @@ impl<'db> Scorer<'db> {
                 // than the other way around (`peak.mass` is a fixed, prebuilt, repeatedly
                 // -searched array; this is the single per-iteration query value).
                 let theoretical_mass = frag.monoisotopic_mass / charge as f32;
-                let matched = crate::spectrum::select_most_intense_peak(
+                let matched = crate::spectrum::select_matched_peaks(
                     &query.peaks,
                     theoretical_mass,
                     self.fragment_tol,
                     None,
                 )
+                .map(|m| m.most_intense)
                 // See docs/ai/fragment_charge_hypothesis.md: a peak with a
                 // resolved charge (`peak_charges[i] != 0`) already carries
                 // its true neutral mass -- only charge==1 (no further
@@ -1168,10 +1171,10 @@ impl<'db> Scorer<'db> {
         for i in -1..=k {
             let mass_i = (monoisotopic_mass + i as f32 * NEUTRON) / charge as f32;
             let mut intensity = 0f32;
-            if let Some(idx) =
-                crate::spectrum::select_most_intense_peak(peaks, mass_i, self.fragment_tol, None)
+            if let Some(m) =
+                crate::spectrum::select_matched_peaks(peaks, mass_i, self.fragment_tol, None)
             {
-                intensity = peaks.intensities()[idx];
+                intensity = peaks.intensities()[m.most_intense];
             }
             out.push(intensity);
         }
@@ -1260,21 +1263,23 @@ impl<'db> Scorer<'db> {
 
                 let mut observed_intensity = 0f32;
 
-                let matched = crate::spectrum::select_most_intense_peak(
+                let peak_match = crate::spectrum::select_matched_peaks(
                     &query.peaks,
                     theoretical_mass,
                     self.fragment_tol,
                     None,
-                )
-                // See docs/ai/fragment_charge_hypothesis.md: a peak with a
-                // resolved charge (`peak_charges[i] != 0`) already carries
-                // its true neutral mass -- only charge==1 (no further
-                // rescale) is a meaningful comparison for it. Rejecting
-                // here (not just skipping the bookkeeping below) keeps
-                // this structurally identical to "no match", so the
-                // has_predictions branch still pushes a real 0, not a
-                // spurious nonzero observed_intensity.
-                .filter(|&i| charge == 1 || query.peak_charges.get(i).copied().unwrap_or(0) == 0);
+                );
+                let matched = peak_match
+                    .map(|m| m.most_intense)
+                    // See docs/ai/fragment_charge_hypothesis.md: a peak with a
+                    // resolved charge (`peak_charges[i] != 0`) already carries
+                    // its true neutral mass -- only charge==1 (no further
+                    // rescale) is a meaningful comparison for it. Rejecting
+                    // here (not just skipping the bookkeeping below) keeps
+                    // this structurally identical to "no match", so the
+                    // has_predictions branch still pushes a real 0, not a
+                    // spurious nonzero observed_intensity.
+                    .filter(|&i| charge == 1 || query.peak_charges.get(i).copied().unwrap_or(0) == 0);
 
                 if let Some(i) = matched {
                     let peak = query.peaks.peak(i);
@@ -1346,6 +1351,33 @@ impl<'db> Scorer<'db> {
                         fragments_details.mz_calculated.push(calc_mz);
                         fragments_details.fragment_ordinals.push(idx);
                         fragments_details.intensities.push(peak.intensity);
+
+                        let closest_i = peak_match
+                            .map(|m| m.closest)
+                            // Same charge-hypothesis rejection as `matched` above
+                            // (docs/ai/fragment_charge_hypothesis.md) -- a resolved-charge
+                            // peak is only a legitimate candidate for charge==1.
+                            .filter(|&ci| {
+                                charge == 1
+                                    || query.peak_charges.get(ci).copied().unwrap_or(0) == 0
+                            })
+                            .unwrap_or(i);
+                        let closest_peak = query.peaks.peak(closest_i);
+                        let closest_peak_charge = match query.peak_charges.get(closest_i).copied()
+                        {
+                            Some(0) | None => 1,
+                            Some(z) => z,
+                        };
+                        let closest_exp_mz = closest_peak.mass / closest_peak_charge as f32 + PROTON;
+                        let closest_calc_mz =
+                            frag.monoisotopic_mass / closest_peak_charge as f32 + PROTON;
+
+                        fragments_details
+                            .closest_fragment_mz_calculated
+                            .push(closest_calc_mz);
+                        fragments_details
+                            .closest_fragment_mz_experimental
+                            .push(closest_exp_mz);
                     }
                 }
 
@@ -1567,12 +1599,74 @@ mod tests {
             let fragments = fragments.unwrap();
             assert_eq!(fragments.fragment_ordinals, expected_ordinals);
             assert_eq!(fragments.kinds, expected_kinds);
+            // Peaks sit exactly on their theoretical mass -- closest and
+            // most-intense are the same peak for every fragment, so the
+            // `closest_fragment_*` columns collapse to the same values as
+            // `mz_calculated`/`mz_experimental`.
+            assert_eq!(
+                fragments.closest_fragment_mz_calculated,
+                fragments.mz_calculated
+            );
+            assert_eq!(
+                fragments.closest_fragment_mz_experimental,
+                fragments.mz_experimental
+            );
             assert_eq!(score.matched_b as usize, n);
             assert_eq!(score.matched_y as usize, n);
             assert!((score.ms2_cosine_similarity - 1.0).abs() < 1e-6);
             assert!((score.ms2_entropy_similarity - 1.0).abs() < 1e-6);
             assert!((score.ms2_pearson_corr - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn closest_and_most_intense_fragment_mz_are_independent() {
+        let database = charge_hypothesis_test_db();
+        let peptide = &database[PeptideIx(0)];
+        let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
+
+        // Two peaks in b1's tolerance window: a closer, weaker one and a
+        // farther, stronger one. Sage still matches the stronger peak
+        // (unchanged `intensities`/`mz_experimental` behavior), but
+        // `closest_fragment_mz_experimental` should track the weaker,
+        // nearer one instead of collapsing to the same value as
+        // `mz_experimental`.
+        let query = ProcessedSpectrum {
+            peaks: vec![
+                Peak {
+                    mass: b1 + 0.00002,
+                    intensity: 10.0,
+                },
+                Peak {
+                    mass: b1 + 0.00006,
+                    intensity: 100.0,
+                },
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let mut scorer = mk_isotope_test_scorer(&database);
+        scorer.annotate_matches = true;
+        scorer.max_fragment_charge = Some(1);
+        let (_, fragments) = scorer.score_candidate(
+            &query,
+            &PreScore {
+                peptide: PeptideIx(0),
+                precursor_charge: 1,
+                ..Default::default()
+            },
+        );
+        let fragments = fragments.unwrap();
+        assert_eq!(fragments.intensities, vec![100.0]);
+        assert_ne!(
+            fragments.mz_experimental[0],
+            fragments.closest_fragment_mz_experimental[0]
+        );
+        assert!(
+            (fragments.closest_fragment_mz_experimental[0] - fragments.mz_calculated[0]).abs()
+                < (fragments.mz_experimental[0] - fragments.mz_calculated[0]).abs()
+        );
     }
 
     #[test]
@@ -1767,5 +1861,59 @@ mod tests {
             },
         );
         assert_eq!(score.matched_b, 1);
+    }
+
+    #[test]
+    fn closest_fragment_mz_respects_charge_hypothesis_filter() {
+        let database = charge_hypothesis_test_db();
+        let peptide = &database[PeptideIx(0)];
+        let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
+
+        // At the charge==2 iteration: a closer peak with a *resolved*
+        // charge (invalid for this hypothesis, same rule as
+        // `resolved_multiply_charged_peak_only_tests_charge_one`) sits
+        // nearer b1/2 than the genuinely unresolved, weaker peak that Sage
+        // actually matches. The raw closest-by-mass pick would be the
+        // resolved peak, but it must be rejected and `closest_fragment_mz_*`
+        // should fall back to the same peak `mz_calculated`/`mz_experimental`
+        // report, not silently report against a charge-invalid peak.
+        let query = ProcessedSpectrum {
+            peaks: vec![
+                Peak {
+                    mass: b1 / 2.0 + 0.00002,
+                    intensity: 10.0,
+                },
+                Peak {
+                    mass: b1 / 2.0 + 0.00006,
+                    intensity: 100.0,
+                },
+            ]
+            .into(),
+            peak_charges: vec![2, 0],
+            ..Default::default()
+        };
+
+        let mut scorer = mk_isotope_test_scorer(&database);
+        scorer.annotate_matches = true;
+        scorer.max_fragment_charge = Some(2);
+        let (score, fragments) = scorer.score_candidate(
+            &query,
+            &PreScore {
+                peptide: PeptideIx(0),
+                precursor_charge: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(score.matched_b, 1);
+        let fragments = fragments.unwrap();
+        assert_eq!(fragments.intensities, vec![100.0]);
+        assert_eq!(
+            fragments.closest_fragment_mz_calculated,
+            fragments.mz_calculated
+        );
+        assert_eq!(
+            fragments.closest_fragment_mz_experimental,
+            fragments.mz_experimental
+        );
     }
 }

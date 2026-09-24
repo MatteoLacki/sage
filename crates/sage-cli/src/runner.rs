@@ -1226,6 +1226,16 @@ impl Runner {
                         .format(fragments.intensities[id])
                         .as_bytes(),
                 );
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format(fragments.closest_fragment_mz_calculated[id])
+                        .as_bytes(),
+                );
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format(fragments.closest_fragment_mz_experimental[id])
+                        .as_bytes(),
+                );
                 frag_records.push(record);
             }
         }
@@ -1339,6 +1349,8 @@ impl Runner {
             "fragment_mz_calculated",
             "fragment_mz_experimental",
             "fragment_intensity",
+            "closest_fragment_mz_calculated",
+            "closest_fragment_mz_experimental",
         ]);
 
         wtr.write_byte_record(&headers)?;
