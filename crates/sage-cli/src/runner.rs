@@ -644,6 +644,7 @@ impl Runner {
             let spectra = match sage_cloudpath::pmsms::parse_processed(
                 &paths.pmsms,
                 &paths.precursors,
+                paths.tof2mz.as_deref(),
                 chunk_idx * batch_size,
                 &sp,
             ) {

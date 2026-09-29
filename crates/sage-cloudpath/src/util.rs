@@ -21,6 +21,9 @@ pub enum FileFormat {
 pub struct PmsmsPaths {
     pub pmsms: PathBuf,
     pub precursors: PathBuf,
+    /// Optional tof -> m/z table; when set, fragment m/z is looked up from the
+    /// pmsms' `tof` column instead of read from its `mz` column.
+    pub tof2mz: Option<PathBuf>,
 }
 
 impl FileFormat {
@@ -95,6 +98,7 @@ pub fn read_pmsms<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpect
     crate::pmsms::parse(
         &local_dir.join("pmsms.mmappet"),
         &local_dir.join("precursors.parquet"),
+        None,
         file_id,
     )
     .map_err(Error::Pmsms)
@@ -115,7 +119,8 @@ pub fn read_pmsms_explicit(
     paths: &PmsmsPaths,
     file_id: usize,
 ) -> Result<Vec<RawSpectrum>, Error> {
-    crate::pmsms::parse(&paths.pmsms, &paths.precursors, file_id).map_err(Error::Pmsms)
+    crate::pmsms::parse(&paths.pmsms, &paths.precursors, paths.tof2mz.as_deref(), file_id)
+        .map_err(Error::Pmsms)
 }
 
 #[cfg(not(feature = "parquet"))]

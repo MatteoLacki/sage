@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
                 .long("pmsms")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Path to a pmsms.mmappet dataset (with an `mz` column already materialized). \
+                    "Path to a pmsms.mmappet dataset (with an `mz` column, or `tof` plus --tof2mz). \
                      Must be given together with --precursors, as an alternative to the \
                      positional spectra paths.",
                 )
@@ -47,6 +47,17 @@ fn main() -> anyhow::Result<()> {
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
                     "Path to a precursors table, .parquet or .mmappet (paired with --pmsms).",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("tof2mz")
+                .long("tof2mz")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .requires("pmsms")
+                .help(
+                    "Optional tof -> m/z table (.mmappet, float32 column `mz`). With it, \
+                     --pmsms needs a `tof` column instead of `mz` (e.g. a raw MS2 event store).",
                 )
                 .value_hint(ValueHint::FilePath),
         )

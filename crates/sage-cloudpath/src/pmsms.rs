@@ -4,7 +4,12 @@
 //! directory with fixed filenames):
 //!   pmsms.mmappet/        — schema.txt + one `<idx>.bin` file per column (see
 //!                           git/mmappet's Python writer); columns looked up by
-//!                           name. Needs `mz`(f32) and `intensity`(u32).
+//!                           name. Needs `intensity`(u32) and either `mz`(f32),
+//!                           or `tof`(u32) plus a tof2mz table (below).
+//!   tof2mz.mmappet/       — optional; one float32 column `mz` indexed by tof.
+//!                           When given, fragment m/z is `mz[tof]` instead of the
+//!                           pmsms' own `mz` column, so raw event stores without
+//!                           an `mz` column can be searched directly.
 //!   precursors, either:
 //!     .parquet            — read via the `parquet` crate
 //!     .mmappet/           — schema.txt + one `<idx>.bin` file per column (see
@@ -47,6 +52,8 @@ pub enum PmsmsError {
     MissingColumn(&'static str),
     #[error("mmappet column {0} has dtype `{1}`, expected `{2}`")]
     WrongDtype(&'static str, String, &'static str),
+    #[error("tof {0} is outside the tof2mz table (length {1})")]
+    TofOutOfRange(u32, usize),
     #[error("unrecognized precursors format (expected .parquet or .mmappet): {0}")]
     UnrecognizedPrecursorsFormat(PathBuf),
 }
@@ -296,9 +303,10 @@ unsafe fn mmap_as_slice<T: Copy>(path: &Path) -> Result<(Mmap, &'static [T]), Pm
 pub fn parse(
     pmsms_dir: &Path,
     precursors_path: &Path,
+    tof2mz_dir: Option<&Path>,
     file_id: usize,
 ) -> Result<Vec<RawSpectrum>, PmsmsError> {
-    parse_with(pmsms_dir, precursors_path, file_id, |s| RawSpectrum {
+    parse_with(pmsms_dir, precursors_path, tof2mz_dir, file_id, |s| RawSpectrum {
         file_id: s.file_id,
         ms_level: s.ms_level,
         id: s.id,
@@ -317,10 +325,11 @@ pub fn parse(
 pub fn parse_processed(
     pmsms_dir: &Path,
     precursors_path: &Path,
+    tof2mz_dir: Option<&Path>,
     file_id: usize,
     processor: &SpectrumProcessor,
 ) -> Result<Vec<ProcessedSpectrum>, PmsmsError> {
-    parse_with(pmsms_dir, precursors_path, file_id, |s| {
+    parse_with(pmsms_dir, precursors_path, tof2mz_dir, file_id, |s| {
         processor.process(s)
     })
 }
@@ -328,21 +337,18 @@ pub fn parse_processed(
 fn parse_with<T: Send>(
     pmsms_dir: &Path,
     precursors_path: &Path,
+    tof2mz_dir: Option<&Path>,
     file_id: usize,
     transform: impl for<'a> Fn(RawSpectrum<&'a [f32], &'a [u32]>) -> T + Sync,
 ) -> Result<Vec<T>, PmsmsError> {
     let precursors = read_precursors(precursors_path)?;
 
     let frag_schema = read_mmappet_schema(pmsms_dir)?;
-    let i_mz = mmappet_column_index(&frag_schema, "mz", "float32")?;
     let i_int = mmappet_column_index(&frag_schema, "intensity", "uint32")?;
-
-    // Memory-map both fragment column arrays.
-    // SAFETY: dtype checked against schema.txt above for each column.
-    let (_frag_mz_mmap, frag_mz) =
-        unsafe { mmap_as_slice::<f32>(&pmsms_dir.join(format!("{i_mz}.bin")))? };
+    // SAFETY: dtype checked against schema.txt above.
     let (_frag_int_mmap, frag_int) =
         unsafe { mmap_as_slice::<u32>(&pmsms_dir.join(format!("{i_int}.bin")))? };
+    let (fragment_mz, _fragment_mz_maps) = FragmentMz::open(pmsms_dir, &frag_schema, tof2mz_dir)?;
 
     let spectra = precursors
         .into_par_iter()
@@ -350,7 +356,17 @@ fn parse_with<T: Send>(
             let start = p.frag_start as usize;
             let end = start + p.frag_count as usize;
 
-            let mz = &frag_mz[start..end];
+            let looked_up;
+            let mz: &[f32] = match &fragment_mz {
+                FragmentMz::Column(column) => &column[start..end],
+                FragmentMz::Lookup { tof, table } => {
+                    looked_up = tof[start..end]
+                        .iter()
+                        .map(|&t| table.get(t as usize).copied().ok_or(PmsmsError::TofOutOfRange(t, table.len())))
+                        .collect::<Result<Vec<f32>, _>>()?;
+                    &looked_up
+                }
+            };
             let int_slice = &frag_int[start..end];
 
             let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
@@ -382,7 +398,7 @@ fn parse_with<T: Send>(
                     .collect()
             };
 
-            transform(RawSpectrum {
+            Ok(transform(RawSpectrum {
                 file_id,
                 ms_level: 2,
                 id: format!("precursor_idx={}", p.precursor_idx),
@@ -394,11 +410,51 @@ fn parse_with<T: Send>(
                 mz,
                 intensity: int_slice,
                 mobility: None,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<T>, PmsmsError>>()?;
 
     Ok(spectra)
+}
+
+/// Where fragment m/z comes from: the pmsms' own `mz` column, or `tof2mz[tof]`.
+enum FragmentMz {
+    Column(&'static [f32]),
+    Lookup { tof: &'static [u32], table: &'static [f32] },
+}
+
+impl FragmentMz {
+    fn open(
+        pmsms_dir: &Path,
+        frag_schema: &[(String, String)],
+        tof2mz_dir: Option<&Path>,
+    ) -> Result<(Self, Vec<Mmap>), PmsmsError> {
+        // SAFETY (all mmaps below): dtype checked against schema.txt first.
+        match tof2mz_dir {
+            None => {
+                let i_mz = mmappet_column_index(frag_schema, "mz", "float32")?;
+                let (map, mz) = unsafe { mmap_as_slice::<f32>(&pmsms_dir.join(format!("{i_mz}.bin")))? };
+                Ok((FragmentMz::Column(mz), vec![map]))
+            }
+            Some(dir) => {
+                if frag_schema.iter().any(|(_, name)| name == "mz") {
+                    log::warn!(
+                        "provided tof2mz table {}, but pmsms {} has an mz column: neglecting the latter",
+                        dir.display(),
+                        pmsms_dir.display()
+                    );
+                }
+                let i_tof = mmappet_column_index(frag_schema, "tof", "uint32")?;
+                let (tof_map, tof) =
+                    unsafe { mmap_as_slice::<u32>(&pmsms_dir.join(format!("{i_tof}.bin")))? };
+                let table_schema = read_mmappet_schema(dir)?;
+                let i_table = mmappet_column_index(&table_schema, "mz", "float32")?;
+                let (table_map, table) =
+                    unsafe { mmap_as_slice::<f32>(&dir.join(format!("{i_table}.bin")))? };
+                Ok((FragmentMz::Lookup { tof, table }, vec![tof_map, table_map]))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -414,9 +470,9 @@ mod test {
         let dir = fixture_dir();
         let pmsms_dir = dir.join("pmsms.mmappet");
 
-        let via_parquet = parse(&pmsms_dir, &dir.join("precursors.parquet"), 0)
+        let via_parquet = parse(&pmsms_dir, &dir.join("precursors.parquet"), None, 0)
             .expect("parse via parquet precursors");
-        let via_mmappet = parse(&pmsms_dir, &dir.join("precursors.mmappet"), 0)
+        let via_mmappet = parse(&pmsms_dir, &dir.join("precursors.mmappet"), None, 0)
             .expect("parse via mmappet precursors");
 
         assert!(!via_parquet.is_empty());
@@ -446,13 +502,13 @@ mod test {
             for deisotope in [false, true] {
                 for top_n in [0, 2, usize::MAX] {
                     let processor = SpectrumProcessor::new(top_n, deisotope, 0.0, false);
-                    let expected: Vec<_> = parse(&dir.join("pmsms.mmappet"), &dir.join(name), 7)
+                    let expected: Vec<_> = parse(&dir.join("pmsms.mmappet"), &dir.join(name), None, 7)
                         .unwrap()
                         .into_iter()
                         .map(|s| processor.process(s))
                         .collect();
                     let actual =
-                        parse_processed(&dir.join("pmsms.mmappet"), &dir.join(name), 7, &processor)
+                        parse_processed(&dir.join("pmsms.mmappet"), &dir.join(name), None, 7, &processor)
                             .unwrap();
                     // The reader's mappings are already closed here.
                     assert_eq!(actual.len(), expected.len());
@@ -484,7 +540,7 @@ mod test {
     fn unrecognized_precursors_format_errors() {
         let dir = fixture_dir();
         let bogus = dir.join("precursors.parquet").with_extension("txt");
-        let err = parse(&dir.join("pmsms.mmappet"), &bogus, 0).unwrap_err();
+        let err = parse(&dir.join("pmsms.mmappet"), &bogus, None, 0).unwrap_err();
         assert!(matches!(err, PmsmsError::UnrecognizedPrecursorsFormat(_)));
     }
 
@@ -564,7 +620,7 @@ mod test {
             .finish();
         let pmsms_dir = mk_pmsms_fragments_dir("pmsms_with_ppm");
 
-        let spectra = parse(&pmsms_dir, &precursors_dir, 0).expect("parse with ppm columns");
+        let spectra = parse(&pmsms_dir, &precursors_dir, None, 0).expect("parse with ppm columns");
         assert_eq!(spectra.len(), 2);
 
         match spectra[0].precursors[0].isolation_window {
@@ -602,7 +658,7 @@ mod test {
             .finish();
         let pmsms_dir = mk_pmsms_fragments_dir("pmsms_without_ppm");
 
-        let spectra = parse(&pmsms_dir, &precursors_dir, 0).expect("parse without ppm columns");
+        let spectra = parse(&pmsms_dir, &precursors_dir, None, 0).expect("parse without ppm columns");
         assert_eq!(spectra.len(), 2);
         for spectrum in &spectra {
             assert!(spectrum.precursors[0].isolation_window.is_none());
@@ -610,5 +666,58 @@ mod test {
 
         let _ = std::fs::remove_dir_all(&precursors_dir);
         let _ = std::fs::remove_dir_all(&pmsms_dir);
+    }
+
+    fn two_precursors_dir(name: &str) -> PathBuf {
+        MmappetDirBuilder::new(name)
+            .column("uint64", "precursor_idx", &[0u64, 1])
+            .column("float64", "mz", &[500.0f64, 600.0])
+            .column("float64", "rt", &[60.0f64, 120.0])
+            .column("float64", "inv_ion_mobility", &[0.9f64, 1.0])
+            .column("int64", "charges", &[2i64, 3])
+            .column("uint64", "fragment_spectrum_start", &[0u64, 1])
+            .column("uint64", "fragment_event_cnt", &[2u64, 2])
+            .finish()
+    }
+
+    #[test]
+    fn tof2mz_table_supplies_fragment_mz_from_tof() {
+        // Overlapping slices (0..2 and 1..3), as when precursors share a raw spectrum.
+        let precursors_dir = two_precursors_dir("precursors_tof2mz");
+        let events_dir = MmappetDirBuilder::new("events_tof_only")
+            .column("uint32", "tof", &[1u32, 3, 4])
+            .column("uint32", "intensity", &[10u32, 20, 30])
+            .finish();
+        let table_dir = MmappetDirBuilder::new("tof2mz_table")
+            .column("float32", "mz", &[0.0f32, 101.5, 102.5, 103.5, 104.5])
+            .finish();
+
+        let spectra = parse(&events_dir, &precursors_dir, Some(&table_dir), 0).expect("parse via tof2mz");
+        assert_eq!(spectra[0].mz, vec![101.5f32, 103.5]);
+        assert_eq!(spectra[1].mz, vec![103.5f32, 104.5]);
+        assert_eq!(spectra[1].intensity, vec![20.0f32, 30.0]);
+
+        for dir in [&precursors_dir, &events_dir, &table_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn tof_outside_tof2mz_table_errors() {
+        let precursors_dir = two_precursors_dir("precursors_tof_out_of_range");
+        let events_dir = MmappetDirBuilder::new("events_tof_out_of_range")
+            .column("uint32", "tof", &[1u32, 3, 9])
+            .column("uint32", "intensity", &[10u32, 20, 30])
+            .finish();
+        let table_dir = MmappetDirBuilder::new("short_tof2mz_table")
+            .column("float32", "mz", &[0.0f32, 101.5, 102.5, 103.5])
+            .finish();
+
+        let err = parse(&events_dir, &precursors_dir, Some(&table_dir), 0).unwrap_err();
+        assert!(matches!(err, PmsmsError::TofOutOfRange(9, 4)));
+
+        for dir in [&precursors_dir, &events_dir, &table_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

@@ -150,6 +150,9 @@ pub struct Input {
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
     pub precursors: Option<String>,
+    /// Optional tof -> m/z table (mmappet, float32 column `mz`); with it the
+    /// pmsms needs a `tof` column instead of `mz`.
+    pub tof2mz: Option<String>,
     /// Path to a parquet file of externally-predicted peptide RT (columns:
     /// sequence, rt), used to reject candidates whose predicted RT falls
     /// outside `rt_tol_sec` of the observed spectrum's RT. Requires
@@ -452,6 +455,9 @@ impl Input {
         if let Some(precursors) = matches.get_one::<String>("precursors") {
             input.precursors = Some(precursors.into());
         }
+        if let Some(tof2mz) = matches.get_one::<String>("tof2mz") {
+            input.tof2mz = Some(tof2mz.into());
+        }
         if let Some(predicted_rt) = matches.get_one::<String>("predicted-rt") {
             input.predicted_rt = Some(predicted_rt.into());
         }
@@ -672,6 +678,7 @@ impl Input {
             (Some(pmsms), Some(precursors)) => Some(PmsmsPaths {
                 pmsms: pmsms.into(),
                 precursors: precursors.into(),
+                tof2mz: self.tof2mz.as_ref().map(|p| p.into()),
             }),
             _ => None,
         };

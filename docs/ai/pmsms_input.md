@@ -6,10 +6,9 @@ directory):
 
 - `pmsms.mmappet/` — schema.txt + one `<idx>.bin` file per column (see
   `git/mmappet`'s Python writer), columns looked up by name. Needs
-  `mz`(float32) and `intensity`(uint32) — `mz` is materialized upstream by
+  `intensity`(uint32) and `mz`(float32) — `mz` is materialized upstream by
   `timstofu`'s `materialize_pmsms_mz`/`recalibrate_pmsms_mz` (see necromerge2
-  `plans/mzs_instead_tofs.md`); this crate never reads `tof` or looks up a
-  separate tof2mz table.
+  `plans/mzs_instead_tofs.md`) — unless `--tof2mz` is given (below).
 - precursors, either `.parquet` (via the `parquet` crate) or `.mmappet/`
   (schema.txt + one `<idx>.bin` file per column, columns looked up by name —
   see `git/mmappet`'s Python writer for the on-disk format). Needs 7 columns:
@@ -35,6 +34,31 @@ Two ways to pass these two paths to the `sage` CLI:
 `necromerge2`'s `run_sage` Snakemake-via-necroflow rule
 (`git/ionmaidentools/src/ionmaidentools/pipelines.py`) uses option 1 — no
 staging directory, no symlinks, no mmappet→parquet conversion needed anymore.
+
+## Optional `--tof2mz` table (2026-09)
+
+`--tof2mz <table>` (requires `--pmsms`): an mmappet with one float32 column
+`mz` indexed by tof. With it, fragment m/z is `table[tof]` from the pmsms'
+`tof`(uint32) column, so `--pmsms` needs `tof` + `intensity` and no `mz`; a tof
+outside the table is an error (`PmsmsError::TofOutOfRange`). If the pmsms also
+has an `mz` column, it is ignored and a warning is logged. `FragmentMz`
+(`pmsms.rs`) holds the choice.
+
+Why it came back: the recalibration search can run on raw MS2 spectra in place.
+A precursor's `top_probable_frame_scan` spectrum is one raw MS2 spectrum, stored
+contiguously and tof-sorted in `tdf2ms2`'s `events.ms2/data.mmappet` (tof,
+intensity only), so a precursor table whose `fragment_spectrum_start`/
+`fragment_event_cnt` point at that (frame, scan) slice, plus the dense tof -> m/z
+table `materialize_pmsms_mz` itself uses, reproduces the mkpmsms-built search
+exactly with no mkpmsms run and no m/z column (F9477: all 47,917 PSMs and 235,629
+matched fragments identical; necromerge2
+`git/pipeline_analysis/docs/ai/recalibration_paths.md`). Precursor slices may
+overlap (several precursors sharing a spectrum). The final search still needs a
+materialized `mz`, since recalibrated m/z is per peak, not a function of tof.
+
+Missing `mz` without `--tof2mz` is still only logged: the runner turns any
+pmsms read error into an empty spectrum list, so SAGE searches 0 spectra and
+exits 0.
 
 ## Borrowed fragment input and processed storage
 
