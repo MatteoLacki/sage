@@ -641,13 +641,7 @@ impl Runner {
         );
 
         if let Some(paths) = &self.parameters.pmsms_paths {
-            let spectra = match sage_cloudpath::pmsms::parse_processed(
-                &paths.pmsms,
-                &paths.precursors,
-                paths.tof2mz.as_deref(),
-                chunk_idx * batch_size,
-                &sp,
-            ) {
+            let spectra = match sage_cloudpath::pmsms::parse_processed(paths, chunk_idx * batch_size, &sp) {
                 Ok(spectra) => spectra,
                 Err(error) => {
                     log::error!("- {}: {}", paths.pmsms.display(), error);

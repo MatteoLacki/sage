@@ -9,21 +9,22 @@ pub enum FileFormat {
     MzML,
     MGF,
     TDF,
-    Pmsms,
     Unidentified,
 }
 
-/// Explicit paths to the two inputs that make up one pmsms search input, given
+/// Explicit paths to the inputs that make up one pmsms search input, given
 /// directly rather than assumed to live together in one directory with fixed
 /// filenames. Available regardless of the `parquet` feature so callers can build
-/// `Search`/`Input` unconditionally; only `read_pmsms_explicit` needs the feature.
+/// `Search`/`Input` unconditionally; only `pmsms::parse*` needs the feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PmsmsPaths {
     pub pmsms: PathBuf,
     pub precursors: PathBuf,
-    /// Optional tof -> m/z table; when set, fragment m/z is looked up from the
-    /// pmsms' `tof` column instead of read from its `mz` column.
-    pub tof2mz: Option<PathBuf>,
+    /// tof -> m/z table; fragment m/z is looked up from the pmsms' `tof` column.
+    pub tof2mz: PathBuf,
+    /// Optional fragment m/z recalibration (`.mzcalib`), applied per peak with
+    /// each precursor's `fragment_shift_ppm`.
+    pub mz_recalibration: Option<PathBuf>,
 }
 
 impl FileFormat {
@@ -37,7 +38,6 @@ impl FileFormat {
             FileFormat::MzML => false,
             FileFormat::MGF => false,
             FileFormat::TDF => true,
-            FileFormat::Pmsms => false,
             FileFormat::Unidentified => false,
         }
     }
@@ -52,8 +52,6 @@ impl From<&str> for FileFormat {
             FileFormat::TDF
         } else if path_lower.ends_with(".mzml.gz") || path_lower.ends_with(".mzml") {
             FileFormat::MzML
-        } else if path_lower.ends_with(".pmsms") {
-            FileFormat::Pmsms
         } else {
             FileFormat::Unidentified
         }
@@ -85,50 +83,8 @@ pub fn read_spectra<S: AsRef<str>>(
         FileFormat::MzML => read_mzml(path, file_id, sn),
         FileFormat::MGF => read_mgf(path, file_id),
         FileFormat::TDF => read_tdf(path, file_id, bruker_processor, requires_ms1),
-        FileFormat::Pmsms => read_pmsms(path, file_id),
         FileFormat::Unidentified => panic!("Unable to get type for '{}'", path.as_ref()),
     }
-}
-
-#[cfg(feature = "parquet")]
-pub fn read_pmsms<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
-    // SAGE passes file:// URLs; resolve to a local filesystem path.
-    let local_dir = crate::to_url(path.as_ref())
-        .and_then(|u| u.to_file_path().map_err(|_| Error::InvalidUri))?;
-    crate::pmsms::parse(
-        &local_dir.join("pmsms.mmappet"),
-        &local_dir.join("precursors.parquet"),
-        None,
-        file_id,
-    )
-    .map_err(Error::Pmsms)
-}
-
-#[cfg(not(feature = "parquet"))]
-pub fn read_pmsms<S: AsRef<str>>(path: S, _file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
-    panic!(
-        "pmsms format requires the 'parquet' feature; recompile with --features parquet (path: {})",
-        path.as_ref()
-    )
-}
-
-/// Read a pmsms search input from two explicit paths (no fixed-filename directory
-/// convention). Precursors may be `.parquet` or `.mmappet`.
-#[cfg(feature = "parquet")]
-pub fn read_pmsms_explicit(
-    paths: &PmsmsPaths,
-    file_id: usize,
-) -> Result<Vec<RawSpectrum>, Error> {
-    crate::pmsms::parse(&paths.pmsms, &paths.precursors, paths.tof2mz.as_deref(), file_id)
-        .map_err(Error::Pmsms)
-}
-
-#[cfg(not(feature = "parquet"))]
-pub fn read_pmsms_explicit(paths: &PmsmsPaths, _file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
-    panic!(
-        "pmsms format requires the 'parquet' feature; recompile with --features parquet (paths: {:?})",
-        paths
-    )
 }
 
 pub fn read_mzml<S: AsRef<str>>(
@@ -234,6 +190,5 @@ mod test {
         assert_eq!(FileFormat::from("foo.tdf"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d/"), FileFormat::TDF);
-        assert_eq!(FileFormat::from("./data/run.pmsms"), FileFormat::Pmsms);
     }
 }

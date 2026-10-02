@@ -163,9 +163,6 @@ pub enum Error {
     TDF(#[from] timsrust::TimsRustError),
     #[error("MGF error: {0}")]
     MGF(#[from] mgf::MgfError),
-    #[cfg(feature = "parquet")]
-    #[error("pmsms error: {0}")]
-    Pmsms(#[from] pmsms::PmsmsError),
 }
 
 #[cfg(test)]

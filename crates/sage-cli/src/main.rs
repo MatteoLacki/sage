@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
                 .num_args(1..)
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Paths to mzML, MGF, or .pmsms directories to process. Overrides files listed in the \
+                    "Paths to mzML or MGF files to process. Overrides files listed in the \
                      configuration file. Not used together with --pmsms/--precursors.",
                 )
                 .value_hint(ValueHint::FilePath),
@@ -35,9 +35,9 @@ fn main() -> anyhow::Result<()> {
                 .long("pmsms")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help(
-                    "Path to a pmsms.mmappet dataset (with an `mz` column, or `tof` plus --tof2mz). \
-                     Must be given together with --precursors, as an alternative to the \
-                     positional spectra paths.",
+                    "Path to a pmsms.mmappet dataset with `tof` and `intensity` columns. \
+                     Must be given together with --precursors and --tof2mz, as an alternative \
+                     to the positional spectra paths.",
                 )
                 .value_hint(ValueHint::FilePath),
         )
@@ -56,8 +56,21 @@ fn main() -> anyhow::Result<()> {
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .requires("pmsms")
                 .help(
-                    "Optional tof -> m/z table (.mmappet, float32 column `mz`). With it, \
-                     --pmsms needs a `tof` column instead of `mz` (e.g. a raw MS2 event store).",
+                    "tof -> m/z table (.mmappet, float32 column `mz`); fragment m/z is \
+                     table[tof] (paired with --pmsms).",
+                )
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("mz-recalibration")
+                .long("mz-recalibration")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .requires("pmsms")
+                .help(
+                    "Optional fragment m/z recalibration (.mzcalib with only an `mz` curve). \
+                     Each fragment m/z is divided by 1 + (bias + f_mz(mz) + \
+                     fragment_shift_ppm)*1e-6, with fragment_shift_ppm (f64) read from the \
+                     precursors table.",
                 )
                 .value_hint(ValueHint::FilePath),
         )

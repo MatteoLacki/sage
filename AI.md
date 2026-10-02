@@ -50,7 +50,7 @@ lives in `docs/ai/`, one file per topic:
 
 | File | Covers |
 |------|--------|
-| `docs/ai/pmsms_input.md` | `pmsms`/precursors binary input, per-precursor ppm tolerance, per-fragment (spline) ppm tolerance, MS1/MS2 intensity PIN columns |
+| `docs/ai/pmsms_input.md` | `pmsms`/precursors binary input (`--tof2mz` mandatory), `--mz-recalibration` with per-precursor `fragment_shift_ppm`, per-precursor ppm tolerance, per-fragment (spline) ppm tolerance, MS1/MS2 intensity PIN columns |
 | `docs/ai/predicted_rt_iim.md` | `--predicted-rt`/`--predicted-iim` hard-eviction filtering, dense peptide-index lookup, external RT/IIM as LDA features, `combined_score` soft ranking penalty |
 | `docs/ai/predicted_fragment_intensity.md` | `--predicted-fragment-intensity-*`: optional MS2 fragment-intensity reader (job-scoped pointer parquet + shared `arrays.mmappet`), feature-only (no hard filter), `ms2_entropy_similarity` |
 | `docs/ai/unimod.md` | `[UNIMOD:<id>]` modification notation support (`crates/sage/src/unimod.rs`) |
@@ -115,8 +115,9 @@ versions) used by `pmsms.rs`'s unit tests to assert both precursor formats
 parse to identical spectra. `pmsms.mmappet`'s `mz` column (index 3, added
 alongside the pre-existing `tof`/`intensity`/`score`) was back-filled by
 applying the fixture's old `tof2mz.mmappet` lookup table once, offline, to its
-`tof` column — same numeric values the old tof2mz-backed reader would have
-produced, so this fixture's removal doesn't change what the unit tests assert.
+`tof` column. The reader no longer reads `mz` (it needs `--tof2mz`), so the
+tests rebuild a dense tof2mz table from the fixture's own `tof`/`mz` pairs
+(`fixture_tof2mz_table`) and read through it.
 **This repo's `.gitignore` has blanket `data/` and `*.txt` rules** that would
 otherwise silently drop this fixture (the `.gitignore` has an explicit
 negation carve-out for `crates/sage-cloudpath/tests/data/` — if you add

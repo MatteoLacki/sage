@@ -150,9 +150,10 @@ pub struct Input {
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
     pub precursors: Option<String>,
-    /// Optional tof -> m/z table (mmappet, float32 column `mz`); with it the
-    /// pmsms needs a `tof` column instead of `mz`.
+    /// tof -> m/z table (mmappet, float32 column `mz`); required with `pmsms`.
     pub tof2mz: Option<String>,
+    /// Optional fragment m/z recalibration (`.mzcalib`) for the pmsms input.
+    pub mz_recalibration: Option<String>,
     /// Path to a parquet file of externally-predicted peptide RT (columns:
     /// sequence, rt), used to reject candidates whose predicted RT falls
     /// outside `rt_tol_sec` of the observed spectrum's RT. Requires
@@ -458,6 +459,9 @@ impl Input {
         if let Some(tof2mz) = matches.get_one::<String>("tof2mz") {
             input.tof2mz = Some(tof2mz.into());
         }
+        if let Some(mz_recalibration) = matches.get_one::<String>("mz-recalibration") {
+            input.mz_recalibration = Some(mz_recalibration.into());
+        }
         if let Some(predicted_rt) = matches.get_one::<String>("predicted-rt") {
             input.predicted_rt = Some(predicted_rt.into());
         }
@@ -490,24 +494,24 @@ impl Input {
             "`database.fasta` must be set. For more information try '--help'"
         );
 
-        let pmsms_flags_given = [&input.pmsms, &input.precursors]
+        let pmsms_flags_given = [&input.pmsms, &input.precursors, &input.tof2mz]
             .iter()
             .filter(|o| o.is_some())
             .count();
         ensure!(
-            pmsms_flags_given == 0 || pmsms_flags_given == 2,
-            "`--pmsms` and `--precursors` must be given together"
+            pmsms_flags_given == 0 || pmsms_flags_given == 3,
+            "`--pmsms`, `--precursors` and `--tof2mz` must be given together"
         );
 
         ensure!(
-            pmsms_flags_given == 2
+            pmsms_flags_given == 3
                 || input
                     .mzml_paths
                     .as_ref()
                     .map(|p| p.len())
                     .unwrap_or_default()
                     > 0,
-            "`mzml_paths` must be set, or `--pmsms`/`--precursors` given together. \
+            "`mzml_paths` must be set, or `--pmsms`/`--precursors`/`--tof2mz` given together. \
              For more information try '--help'"
         );
 
@@ -674,11 +678,12 @@ impl Input {
             self.predict_rt = Some(true);
         }
 
-        let pmsms_paths = match (&self.pmsms, &self.precursors) {
-            (Some(pmsms), Some(precursors)) => Some(PmsmsPaths {
+        let pmsms_paths = match (&self.pmsms, &self.precursors, &self.tof2mz) {
+            (Some(pmsms), Some(precursors), Some(tof2mz)) => Some(PmsmsPaths {
                 pmsms: pmsms.into(),
                 precursors: precursors.into(),
-                tof2mz: self.tof2mz.as_ref().map(|p| p.into()),
+                tof2mz: tof2mz.into(),
+                mz_recalibration: self.mz_recalibration.as_ref().map(|p| p.into()),
             }),
             _ => None,
         };

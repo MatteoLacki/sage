@@ -1,50 +1,41 @@
 # pmsms/precursors input
 
-Core reader: `crates/sage-cloudpath/src/pmsms.rs`. Two inputs, given as
-explicit paths (never assumed to live together in one fixed-filename
-directory):
+Core reader: `crates/sage-cloudpath/src/pmsms.rs`. Inputs, given as explicit
+paths (never assumed to live together in one fixed-filename directory):
 
 - `pmsms.mmappet/` — schema.txt + one `<idx>.bin` file per column (see
   `git/mmappet`'s Python writer), columns looked up by name. Needs
-  `intensity`(uint32) and `mz`(float32) — `mz` is materialized upstream by
-  `timstofu`'s `materialize_pmsms_mz`/`recalibrate_pmsms_mz` (see necromerge2
-  `plans/mzs_instead_tofs.md`) — unless `--tof2mz` is given (below).
+  `tof`(uint32) and `intensity`(uint32). An `mz` column, if present, is
+  ignored with a warning.
+- `tof2mz` table — an mmappet with one float32 column `mz` indexed by tof;
+  fragment m/z is `table[tof]`. A tof outside the table is an error
+  (`PmsmsError::TofOutOfRange`).
 - precursors, either `.parquet` (via the `parquet` crate) or `.mmappet/`
   (schema.txt + one `<idx>.bin` file per column, columns looked up by name —
   see `git/mmappet`'s Python writer for the on-disk format). Needs 7 columns:
   `precursor_idx`(u64), `mz`(f64), `rt`(f64), `inv_ion_mobility`(f64),
   `charges`(i64), `fragment_spectrum_start`(u64), `fragment_event_cnt`(u64).
+- optionally a fragment m/z recalibration, `--mz-recalibration` (below).
 
-Two ways to pass these two paths to the `sage` CLI:
+CLI: **`--pmsms <path> --precursors <path> --tof2mz <path>`**, all three
+together — validated in `crates/sage-cli/src/input.rs::Input::from_arguments`.
+Used instead of the positional spectra-paths argument; `PmsmsPaths`
+(`crates/sage-cloudpath/src/util.rs`) carries the paths through `Search`. The
+runner's `read_processed_spectra` branches on `parameters.pmsms_paths` to call
+`pmsms::parse_processed`, bypassing the normal `FileFormat`-suffix dispatch.
+`necromerge2`'s `run_sage` necroflow rule
+(`git/ionmaidentools/src/ionmaidentools/pipelines.py`) passes exactly these.
 
-1. **`--pmsms <path> --precursors <path>`** (preferred). Must be given
-   together — validated in `crates/sage-cli/src/input.rs::Input::from_arguments`.
-   Used instead of the positional spectra-paths argument; `PmsmsPaths`
-   (`crates/sage-cloudpath/src/util.rs`) carries the two paths through
-   `Search`. The runner's `read_processed_spectra` branches on
-   `parameters.pmsms_paths` to call `pmsms::parse_processed`, bypassing
-   the normal `FileFormat`-suffix dispatch.
-2. **Positional `<dir>.pmsms`** (legacy, still works, unchanged behavior) — a
-   directory whose name ends in `.pmsms`, containing `pmsms.mmappet/` and
-   `precursors.parquet` at fixed names. Detected by
-   `crates/sage-cloudpath/src/util.rs::FileFormat::from` and read via
-   `read_pmsms`, which just joins the two fixed names and calls the same
-   `pmsms::parse`.
+There used to be two more inputs, both removed 2026-10 when the search path
+stopped materializing fragment m/z (necromerge2
+`plans/fragment_mz_correction_in_sage.md`): reading the pmsms' own `mz` column
+when `--tof2mz` was absent, and a positional `<dir>.pmsms` directory with
+`pmsms.mmappet/` and `precursors.parquet` at fixed names (`read_pmsms`, plus the
+caller-less `read_pmsms_explicit`).
 
-`necromerge2`'s `run_sage` Snakemake-via-necroflow rule
-(`git/ionmaidentools/src/ionmaidentools/pipelines.py`) uses option 1 — no
-staging directory, no symlinks, no mmappet→parquet conversion needed anymore.
+## `--tof2mz` table (2026-09, mandatory since 2026-10)
 
-## Optional `--tof2mz` table (2026-09)
-
-`--tof2mz <table>` (requires `--pmsms`): an mmappet with one float32 column
-`mz` indexed by tof. With it, fragment m/z is `table[tof]` from the pmsms'
-`tof`(uint32) column, so `--pmsms` needs `tof` + `intensity` and no `mz`; a tof
-outside the table is an error (`PmsmsError::TofOutOfRange`). If the pmsms also
-has an `mz` column, it is ignored and a warning is logged. `FragmentMz`
-(`pmsms.rs`) holds the choice.
-
-Why it came back: the recalibration search can run on raw MS2 spectra in place.
+Why it was added: the recalibration search can run on raw MS2 spectra in place.
 A precursor's `top_probable_frame_scan` spectrum is one raw MS2 spectrum, stored
 contiguously and tof-sorted in `tdf2ms2`'s `events.ms2/data.mmappet` (tof,
 intensity only), so a precursor table whose `fragment_spectrum_start`/
@@ -53,19 +44,62 @@ table `materialize_pmsms_mz` itself uses, reproduces the mkpmsms-built search
 exactly with no mkpmsms run and no m/z column (F9477: all 47,917 PSMs and 235,629
 matched fragments identical; necromerge2
 `git/pipeline_analysis/docs/ai/recalibration_paths.md`). Precursor slices may
-overlap (several precursors sharing a spectrum). The final search still needs a
-materialized `mz`, since recalibrated m/z is per peak, not a function of tof.
+overlap (several precursors sharing a spectrum). Since 2026-10 the final search
+reads the pmsms the same way, with the recalibration applied in the reader (below).
 
-Missing `mz` without `--tof2mz` is still only logged: the runner turns any
-pmsms read error into an empty spectrum list, so SAGE searches 0 spectra and
-exits 0.
+Any pmsms read error (including the recalibration errors below) is only
+logged: the runner turns it into an empty spectrum list, so SAGE searches 0
+spectra and exits 0.
+
+## Fragment m/z recalibration, `--mz-recalibration` (2026-10)
+
+`--mz-recalibration <dir.mzcalib>`: timstofu's `MzRecalibration` artifact
+(`bias.mmappet` plus one `<dim>/{grid,values}.mmappet` curve per dimension), here
+with exactly one dimension, `mz`. Each fragment m/z read as `table[tof]` becomes
+
+    mz / (1 + (bias + f_mz(mz) + fragment_shift_ppm) * 1e-6)
+
+computed in f64 and rounded to f32, where `fragment_shift_ppm`(f64) is a column of
+the precursors table: one constant per precursor. `FragmentMzRecalibration`
+(`pmsms.rs`) loads and applies it per precursor in `parse_with`.
+
+Errors: a `.mzcalib` with any dimension set other than `{mz}` (e.g. a leftover `rt`
+curve, which would otherwise be silently skipped) is
+`PmsmsError::MzRecalibrationDims`; a precursors table without
+`fragment_shift_ppm` is `MissingColumn("fragment_shift_ppm")`. Without the flag
+the column is ignored.
+
+Why it is in the reader: the correction is tiny (2,000 grid points), while
+materializing it upstream meant writing a 6.5 GB `mz` column (F9477) twice per run,
+once for `table[tof]` and once recalibrated. Materialization now runs only for
+exports (mzML/MGF/the SAGE-to-pmsms mapping), in timstofu's
+`materialize_pmsms_mz --mz-recalibration ... --precursors ...`.
+
+Why the per-precursor part is a column and not a curve SAGE evaluates: the fit is
+`bias + f_mz(mz) + f_rt(precursor rt)`, and `f_rt` is constant per precursor.
+searchops' `recalibrate_pmsms_mz` evaluates it once from the precursors' raw `rt`
+and writes `fragment_shift_ppm = bias + f_rt(rt)` (the `.mzcalib` then carries
+`bias = 0`). Evaluating `f_rt` in SAGE would have been wrong in necromerge2's
+mode 3, where the RT correction overwrites the precursors' `rt` column with
+corrected RT before the final search, while `f_rt` was fitted on raw RT. The
+column also leaves the per-precursor model free to change without touching SAGE:
+e.g. a 2-D `f(rt, 1/K0)`, or a free per-precursor intercept.
+
+Bit-identity with the Python export path: `EvenlySpacedLinearSpline` mirrors
+timstofu's `EvenlySpacedLinearSpline.njit_evaluator` operation for operation
+(`spacing = (x_max - x_min) / (n - 1)`, `inv_spacing = 1 / spacing`, flat clamp,
+truncating index), and `correct` mirrors `apply_fragment_mz_recalibration_blocks`'
+`(bias + f_mz) + shift` order. SAGE's own `LinearSpline` (f32, `grid_step`) is not
+reused: it would round differently. `recalibration_matches_timstofu_bit_for_bit`
+pins both against values generated with the numba code.
 
 ## Borrowed fragment input and processed storage
 
-The explicit-path CLI input calls `parse_processed`: each precursor's mapped
-`mz: &[f32]` and `intensity: &[u32]` ranges feed `SpectrumProcessor` directly,
-in parallel, while the reader owns both mappings. No intermediate per-spectrum
-raw m/z or float-intensity vectors are allocated. Ordered parallel collection
+The explicit-path CLI input calls `parse_processed`: each precursor's m/z
+(looked up as `table[tof]` into a per-spectrum vector, then recalibrated in
+place) and mapped `intensity: &[u32]` range feed `SpectrumProcessor` directly,
+in parallel, while the reader owns the mappings. No intermediate per-spectrum
+float-intensity vectors are allocated. Ordered parallel collection
 preserves precursor order; returned processed spectra own their storage and
 remain valid after the mappings close.
 
@@ -77,8 +111,8 @@ exact retained count; observed charges remain a parallel vector when present.
 For max_peaks=800, each final column contains at most 800 entries. Temporary
 selection/deisotoping storage still scales with the raw spectrum size.
 
-`pmsms::parse`, `read_pmsms_explicit`, and positional `.pmsms` inputs retain the
-owned `RawSpectrum` API. Those compatibility paths still copy raw columns.
+`pmsms::parse` retains the owned `RawSpectrum` API (tests use it as the reference
+for `parse_processed`); it copies raw columns.
 Non-mobility processed spectra use `PeakColumns`; mobility spectra keep `Vec<IMPeak>`.
 See [F9477 measurements](simd.md) for timing and memory validation.
 
