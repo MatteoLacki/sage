@@ -150,10 +150,8 @@ pub struct Input {
     pub mzml_paths: Option<Vec<String>>,
     pub pmsms: Option<String>,
     pub precursors: Option<String>,
-    /// tof -> m/z table (mmappet, float32 column `mz`); required with `pmsms`.
+    /// tof -> m/z table (mmappet, float32 or float64 column `mz`); required with `pmsms`.
     pub tof2mz: Option<String>,
-    /// Optional fragment m/z recalibration (`.mzcalib`) for the pmsms input.
-    pub mz_recalibration: Option<String>,
     /// Path to a parquet file of externally-predicted peptide RT (columns:
     /// sequence, rt), used to reject candidates whose predicted RT falls
     /// outside `rt_tol_sec` of the observed spectrum's RT. Requires
@@ -459,9 +457,6 @@ impl Input {
         if let Some(tof2mz) = matches.get_one::<String>("tof2mz") {
             input.tof2mz = Some(tof2mz.into());
         }
-        if let Some(mz_recalibration) = matches.get_one::<String>("mz-recalibration") {
-            input.mz_recalibration = Some(mz_recalibration.into());
-        }
         if let Some(predicted_rt) = matches.get_one::<String>("predicted-rt") {
             input.predicted_rt = Some(predicted_rt.into());
         }
@@ -683,7 +678,6 @@ impl Input {
                 pmsms: pmsms.into(),
                 precursors: precursors.into(),
                 tof2mz: tof2mz.into(),
-                mz_recalibration: self.mz_recalibration.as_ref().map(|p| p.into()),
             }),
             _ => None,
         };

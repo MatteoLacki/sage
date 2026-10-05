@@ -5,13 +5,9 @@
 //!   pmsms.mmappet/        — schema.txt + one `<idx>.bin` file per column (see
 //!                           git/mmappet's Python writer); columns looked up by
 //!                           name. Needs `tof`(u32) and `intensity`(u32).
-//!   tof2mz.mmappet/       — one float32 column `mz` indexed by tof; fragment m/z
-//!                           is `mz[tof]`.
-//!   <name>.mzcalib/       — optional fragment m/z recalibration (timstofu's
-//!                           `MzRecalibration`): `bias.mmappet` plus an `mz/`
-//!                           curve. When given, each fragment m/z is divided by
-//!                           `1 + (bias + f_mz(mz) + fragment_shift_ppm)·1e-6`,
-//!                           with `fragment_shift_ppm` read per precursor.
+//!   tof2mz.mmappet/       — one float32 or float64 column `mz` indexed by tof;
+//!                           fragment m/z is `mz[tof]` (a recalibrated table
+//!                           already carries the m/z-dependent correction).
 //!   precursors, either:
 //!     .parquet            — read via the `parquet` crate
 //!     .mmappet/           — schema.txt + one `<idx>.bin` file per column (see
@@ -26,8 +22,8 @@
 //!   applies instead — this keeps precursor tables without the columns
 //!   working unchanged.
 //!   A further column, intensity(i64), is also optional (see
-//!   docs/ai/pmsms_input.md). So is fragment_shift_ppm(f64), required only
-//!   with a recalibration.
+//!   docs/ai/pmsms_input.md). So is fragment_shift_ppm(f64): when present,
+//!   each precursor's fragment m/z become `mz[tof] / (1 + fragment_shift_ppm·1e-6)`.
 
 #![cfg(feature = "parquet")]
 
@@ -59,10 +55,6 @@ pub enum PmsmsError {
     TofOutOfRange(u32, usize),
     #[error("unrecognized precursors format (expected .parquet or .mmappet): {0}")]
     UnrecognizedPrecursorsFormat(PathBuf),
-    #[error("fragment m/z recalibration {0} must have exactly one dimension, `mz`; found {1:?}")]
-    MzRecalibrationDims(PathBuf, Vec<String>),
-    #[error("fragment m/z recalibration {0}: {1}")]
-    MzRecalibrationGrid(PathBuf, &'static str),
 }
 
 struct PrecursorRow {
@@ -78,8 +70,8 @@ struct PrecursorRow {
     /// `ppm_tol_lo` and `ppm_tol_hi` columns exist in the precursors table.
     ppm_tol: Option<(f32, f32)>,
     ms1_intensity: Option<f32>,
-    /// Per-precursor fragment m/z offset (ppm) added to the recalibration's
-    /// `f_mz`; present only when the `fragment_shift_ppm` column exists.
+    /// Per-precursor fragment m/z offset (ppm) dividing out of every fragment
+    /// m/z; present only when the `fragment_shift_ppm` column exists.
     fragment_shift_ppm: Option<f64>,
 }
 
@@ -354,10 +346,7 @@ fn parse_with<T: Send>(
     transform: impl for<'a> Fn(RawSpectrum<&'a [f32], &'a [u32]>) -> T + Sync,
 ) -> Result<Vec<T>, PmsmsError> {
     let precursors = read_precursors(&paths.precursors)?;
-    let recalibration = match &paths.mz_recalibration {
-        Some(dir) => Some(FragmentMzRecalibration::load(dir)?),
-        None => None,
-    };
+    let tof2mz = read_tof2mz_table(&paths.tof2mz)?;
 
     let frag_schema = read_mmappet_schema(&paths.pmsms)?;
     if frag_schema.iter().any(|(_, name)| name == "mz") {
@@ -368,14 +357,10 @@ fn parse_with<T: Send>(
     }
     let i_int = mmappet_column_index(&frag_schema, "intensity", "uint32")?;
     let i_tof = mmappet_column_index(&frag_schema, "tof", "uint32")?;
-    let table_schema = read_mmappet_schema(&paths.tof2mz)?;
-    let i_table = mmappet_column_index(&table_schema, "mz", "float32")?;
     // SAFETY: dtypes checked against schema.txt above.
     let (_frag_int_mmap, frag_int) =
         unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_int}.bin")))? };
     let (_tof_mmap, tof) = unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_tof}.bin")))? };
-    let (_table_mmap, tof2mz) =
-        unsafe { mmap_as_slice::<f32>(&paths.tof2mz.join(format!("{i_table}.bin")))? };
 
     let spectra = precursors
         .into_par_iter()
@@ -383,13 +368,7 @@ fn parse_with<T: Send>(
             let start = p.frag_start as usize;
             let end = start + p.frag_count as usize;
 
-            let mut mz = look_up_mz(&tof[start..end], tof2mz)?;
-            if let Some(recalibration) = &recalibration {
-                let shift_ppm = p
-                    .fragment_shift_ppm
-                    .ok_or(PmsmsError::MissingColumn("fragment_shift_ppm"))?;
-                recalibration.correct(&mut mz, shift_ppm);
-            }
+            let mz = look_up_mz(&tof[start..end], &tof2mz, p.fragment_shift_ppm.unwrap_or(0.0))?;
             let int_slice = &frag_int[start..end];
 
             let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
@@ -440,118 +419,42 @@ fn parse_with<T: Send>(
     Ok(spectra)
 }
 
-fn look_up_mz(tof: &[u32], tof2mz: &[f32]) -> Result<Vec<f32>, PmsmsError> {
+/// `tof2mz[t] / (1 + shift_ppm·1e-6)` in f64, rounded to f32 — the arithmetic of
+/// timstofu's `materialize_pmsms_mz`, so exports hold the m/z SAGE searched. A zero
+/// shift leaves `tof2mz[t]` itself.
+fn look_up_mz(tof: &[u32], tof2mz: &[f64], shift_ppm: f64) -> Result<Vec<f32>, PmsmsError> {
+    let divisor = 1.0 + shift_ppm * 1e-6;
     let mut mz = Vec::with_capacity(tof.len());
     for &t in tof {
         match tof2mz.get(t as usize) {
-            Some(&value) => mz.push(value),
+            Some(&value) => mz.push((value / divisor) as f32),
             None => return Err(PmsmsError::TofOutOfRange(t, tof2mz.len())),
         }
     }
     Ok(mz)
 }
 
-/// A piecewise-linear function on an evenly spaced grid, clamped to the edge
-/// values outside it. Evaluates with the same f64 operations as timstofu's
-/// `EvenlySpacedLinearSpline.njit_evaluator`, so SAGE and the Python export
-/// path round recalibrated m/z to the same f32.
-struct EvenlySpacedLinearSpline {
-    x_min: f64,
-    inv_spacing: f64,
-    values: Vec<f64>,
-}
-
-impl EvenlySpacedLinearSpline {
-    /// `values` must hold at least two points and `x_min < x_max`.
-    fn new(x_min: f64, x_max: f64, values: Vec<f64>) -> Self {
-        let spacing = (x_max - x_min) / (values.len() - 1) as f64;
-        Self {
-            x_min,
-            inv_spacing: 1.0 / spacing,
-            values,
-        }
-    }
-
-    fn eval(&self, x: f64) -> f64 {
-        let last = self.values.len() - 1;
-        let idx_f = (x - self.x_min) * self.inv_spacing;
-        if idx_f <= 0.0 {
-            return self.values[0];
-        }
-        if idx_f >= last as f64 {
-            return self.values[last];
-        }
-        let idx = idx_f as usize;
-        let frac = idx_f - idx as f64;
-        self.values[idx] * (1.0 - frac) + self.values[idx + 1] * frac
-    }
-}
-
-/// A `.mzcalib` directory holding only the `mz` dimension: fragment ppm error
-/// `bias + f_mz(mz)`, to which each precursor adds its own `fragment_shift_ppm`.
-struct FragmentMzRecalibration {
-    bias: f64,
-    f_mz: EvenlySpacedLinearSpline,
-}
-
-impl FragmentMzRecalibration {
-    fn load(dir: &Path) -> Result<Self, PmsmsError> {
-        let dims = recalibration_dims(dir)?;
-        if dims != ["mz"] {
-            return Err(PmsmsError::MzRecalibrationDims(dir.to_path_buf(), dims));
-        }
-        let invalid = |reason| PmsmsError::MzRecalibrationGrid(dir.to_path_buf(), reason);
-
-        let bias = read_f64_column(&dir.join("bias.mmappet"), "bias")?;
-        let x_min = read_f64_column(&dir.join("mz/grid.mmappet"), "x_min")?;
-        let x_max = read_f64_column(&dir.join("mz/grid.mmappet"), "x_max")?;
-        let values = read_f64_column(&dir.join("mz/values.mmappet"), "y")?;
-        if bias.len() != 1 || x_min.len() != 1 || x_max.len() != 1 {
-            return Err(invalid("bias, x_min and x_max must each hold one value"));
-        }
-        if values.len() < 2 {
-            return Err(invalid("the mz curve needs at least two grid points"));
-        }
-        if !(x_min[0] < x_max[0]) {
-            return Err(invalid("the mz curve needs x_min < x_max"));
-        }
-        Ok(Self {
-            bias: bias[0],
-            f_mz: EvenlySpacedLinearSpline::new(x_min[0], x_max[0], values),
-        })
-    }
-
-    /// `mz / (1 + (bias + f_mz(mz) + shift_ppm)·1e-6)` in f64, rounded to f32 —
-    /// the arithmetic of timstofu's `apply_fragment_mz_recalibration_blocks`.
-    fn correct(&self, mz: &mut [f32], shift_ppm: f64) {
-        for value in mz.iter_mut() {
-            let raw = *value as f64;
-            let ppm = self.bias + self.f_mz.eval(raw) + shift_ppm;
-            *value = (raw / (1.0 + ppm * 1e-6)) as f32;
-        }
-    }
-}
-
-/// Names of the curves in a `.mzcalib` directory: its subdirectories holding a
-/// `grid.mmappet`, sorted (as timstofu's `MzRecalibration.load` finds them).
-fn recalibration_dims(dir: &Path) -> Result<Vec<String>, PmsmsError> {
-    let mut dims = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.join("grid.mmappet").is_dir() {
-            dims.push(path.file_name().unwrap_or_default().to_string_lossy().into_owned());
-        }
-    }
-    dims.sort();
-    Ok(dims)
-}
-
-fn read_f64_column(dir: &Path, name: &'static str) -> Result<Vec<f64>, PmsmsError> {
+/// The tof2mz table's `mz` column, float32 (the raw table) or float64 (a
+/// recalibrated one), as f64.
+fn read_tof2mz_table(dir: &Path) -> Result<Vec<f64>, PmsmsError> {
     let schema = read_mmappet_schema(dir)?;
-    let i = mmappet_column_index(&schema, name, "float64")?;
-    // SAFETY: dtype checked against schema.txt above.
-    let (_map, values) = unsafe { mmap_as_slice::<f64>(&dir.join(format!("{i}.bin")))? };
-    Ok(values.to_vec())
+    let i = schema
+        .iter()
+        .position(|(_, name)| name == "mz")
+        .ok_or(PmsmsError::MissingColumn("mz"))?;
+    let path = dir.join(format!("{i}.bin"));
+    // SAFETY: the dtype is matched against schema.txt before each reinterpretation.
+    match schema[i].0.as_str() {
+        "float32" => {
+            let (_map, values) = unsafe { mmap_as_slice::<f32>(&path)? };
+            Ok(values.iter().map(|&v| v as f64).collect())
+        }
+        "float64" => {
+            let (_map, values) = unsafe { mmap_as_slice::<f64>(&path)? };
+            Ok(values.to_vec())
+        }
+        other => Err(PmsmsError::WrongDtype("mz", other.to_string(), "float32 or float64")),
+    }
 }
 
 #[cfg(test)]
@@ -562,12 +465,11 @@ mod test {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/pmsms_fixture")
     }
 
-    fn pmsms_paths(pmsms: &Path, precursors: &Path, tof2mz: &Path, mz_recalibration: Option<&Path>) -> PmsmsPaths {
+    fn pmsms_paths(pmsms: &Path, precursors: &Path, tof2mz: &Path) -> PmsmsPaths {
         PmsmsPaths {
             pmsms: pmsms.to_path_buf(),
             precursors: precursors.to_path_buf(),
             tof2mz: tof2mz.to_path_buf(),
-            mz_recalibration: mz_recalibration.map(Path::to_path_buf),
         }
     }
 
@@ -596,9 +498,9 @@ mod test {
         let pmsms_dir = dir.join("pmsms.mmappet");
         let table_dir = fixture_tof2mz_table();
 
-        let via_parquet = parse(&pmsms_paths(&pmsms_dir, &dir.join("precursors.parquet"), &table_dir, None), 0)
+        let via_parquet = parse(&pmsms_paths(&pmsms_dir, &dir.join("precursors.parquet"), &table_dir), 0)
             .expect("parse via parquet precursors");
-        let via_mmappet = parse(&pmsms_paths(&pmsms_dir, &dir.join("precursors.mmappet"), &table_dir, None), 0)
+        let via_mmappet = parse(&pmsms_paths(&pmsms_dir, &dir.join("precursors.mmappet"), &table_dir), 0)
             .expect("parse via mmappet precursors");
 
         assert!(!via_parquet.is_empty());
@@ -627,7 +529,7 @@ mod test {
         let dir = fixture_dir();
         let table_dir = fixture_tof2mz_table();
         for name in ["precursors.parquet", "precursors.mmappet"] {
-            let paths = pmsms_paths(&dir.join("pmsms.mmappet"), &dir.join(name), &table_dir, None);
+            let paths = pmsms_paths(&dir.join("pmsms.mmappet"), &dir.join(name), &table_dir);
             for deisotope in [false, true] {
                 for top_n in [0, 2, usize::MAX] {
                     let processor = SpectrumProcessor::new(top_n, deisotope, 0.0, false);
@@ -669,7 +571,7 @@ mod test {
         let dir = fixture_dir();
         let table_dir = fixture_tof2mz_table();
         let bogus = dir.join("precursors.parquet").with_extension("txt");
-        let err = parse(&pmsms_paths(&dir.join("pmsms.mmappet"), &bogus, &table_dir, None), 0).unwrap_err();
+        let err = parse(&pmsms_paths(&dir.join("pmsms.mmappet"), &bogus, &table_dir), 0).unwrap_err();
         assert!(matches!(err, PmsmsError::UnrecognizedPrecursorsFormat(_)));
         let _ = std::fs::remove_dir_all(&table_dir);
     }
@@ -684,13 +586,14 @@ mod test {
 
     impl MmappetDirBuilder {
         fn new(name: &str) -> Self {
-            Self::at(temp_dir(name, "mmappet"))
-        }
-
-        /// A builder writing into `dir` (parents created), e.g. inside a `.mzcalib`.
-        fn at(dir: PathBuf) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "sage_pmsms_test_{}_{name}_{n}.mmappet",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create mmappet dir");
+            std::fs::create_dir_all(&dir).expect("create temp mmappet dir");
             Self {
                 dir,
                 schema_lines: Vec::new(),
@@ -725,15 +628,6 @@ mod test {
         }
     }
 
-    fn temp_dir(name: &str, extension: &str) -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "sage_pmsms_test_{}_{name}_{n}.{extension}",
-            std::process::id()
-        ))
-    }
-
     /// 2 precursors x 2 fragments, tofs 1..=4, with a table mapping tof t to
     /// m/z 100·t; values are arbitrary filler for tests about precursor columns.
     fn mk_pmsms_fragments_dir(name: &str) -> (PathBuf, PathBuf) {
@@ -762,7 +656,7 @@ mod test {
             .finish();
         let (pmsms_dir, table_dir) = mk_pmsms_fragments_dir("pmsms_with_ppm");
 
-        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir, None), 0)
+        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir), 0)
             .expect("parse with ppm columns");
         assert_eq!(spectra.len(), 2);
 
@@ -802,7 +696,7 @@ mod test {
             .finish();
         let (pmsms_dir, table_dir) = mk_pmsms_fragments_dir("pmsms_without_ppm");
 
-        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir, None), 0)
+        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir), 0)
             .expect("parse without ppm columns");
         assert_eq!(spectra.len(), 2);
         for spectrum in &spectra {
@@ -814,7 +708,7 @@ mod test {
         }
     }
 
-    fn two_precursors_builder(name: &str) -> MmappetDirBuilder {
+    fn two_precursors_dir(name: &str) -> PathBuf {
         MmappetDirBuilder::new(name)
             .column("uint64", "precursor_idx", &[0u64, 1])
             .column("float64", "mz", &[500.0f64, 600.0])
@@ -823,10 +717,7 @@ mod test {
             .column("int64", "charges", &[2i64, 3])
             .column("uint64", "fragment_spectrum_start", &[0u64, 1])
             .column("uint64", "fragment_event_cnt", &[2u64, 2])
-    }
-
-    fn two_precursors_dir(name: &str) -> PathBuf {
-        two_precursors_builder(name).finish()
+            .finish()
     }
 
     #[test]
@@ -841,7 +732,7 @@ mod test {
             .column("float32", "mz", &[0.0f32, 101.5, 102.5, 103.5, 104.5])
             .finish();
 
-        let spectra = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir, None), 0)
+        let spectra = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir), 0)
             .expect("parse via tof2mz");
         assert_eq!(spectra[0].mz, vec![101.5f32, 103.5]);
         assert_eq!(spectra[1].mz, vec![103.5f32, 104.5]);
@@ -863,7 +754,7 @@ mod test {
             .column("float32", "mz", &[0.0f32, 101.5, 102.5, 103.5])
             .finish();
 
-        let err = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir, None), 0).unwrap_err();
+        let err = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir), 0).unwrap_err();
         assert!(matches!(err, PmsmsError::TofOutOfRange(9, 4)));
 
         for dir in [&precursors_dir, &events_dir, &table_dir] {
@@ -871,147 +762,67 @@ mod test {
         }
     }
 
-    // Generated with timstofu's numba code (necromerge2 venvs/common):
-    // `EvenlySpacedLinearSpline(100.0, 1700.3, RECALIBRATION_CURVE).njit_evaluator()`
-    // at each `RECALIBRATION_X`, and `apply_fragment_mz_recalibration_blocks`
-    // over blocks [0, 4) and [4, 10) with shifts 1.5 and -2.25 ppm and bias 0.375.
-    const RECALIBRATION_CURVE: [f64; 7] = [1.25, -0.5, 3.0, 2.2, -1.1, 0.4, 0.9];
-    const RECALIBRATION_X_BITS: [u32; 10] = [
-        0x42480000, 0x42c80000, 0x42c80001, 0x43b75bbc, 0x43d88fcc, 0x447a0000, 0x4491dccd, 0x44bb9000,
-        0x44d4899a, 0x44e10000,
-    ];
-    const NUMBA_F_MZ_BITS: [u64; 10] = [
-        0x3ff4000000000000,
-        0x3ff4000000000000,
-        0x3ff3fffff2900148,
-        0xbfdfffff8d55603a,
-        0x3fd7c56e02e95520,
-        0x3feedde76c15d864,
-        0xbff198d4e287c368,
-        0x3fe0d072834f4db9,
-        0x3feccccccccccccd,
-        0x3feccccccccccccd,
-    ];
-    const NUMBA_CORRECTED_MZ_BITS: [u32; 10] = [
-        0x4247ffd7, 0x42c7ffd7, 0x42c7ffd8, 0x43b75bab, 0x43d88fe1, 0x447a000f, 0x4491dce9, 0x44bb9011,
-        0x44d489a8, 0x44e1000e,
-    ];
-
-    fn recalibration_x() -> Vec<f32> {
-        RECALIBRATION_X_BITS.iter().map(|&b| f32::from_bits(b)).collect()
-    }
-
-    #[test]
-    fn recalibration_matches_timstofu_bit_for_bit() {
-        let recalibration = FragmentMzRecalibration {
-            bias: 0.375,
-            f_mz: EvenlySpacedLinearSpline::new(100.0, 1700.3, RECALIBRATION_CURVE.to_vec()),
-        };
-        let x = recalibration_x();
-        for (&mz, &expected) in x.iter().zip(&NUMBA_F_MZ_BITS) {
-            assert_eq!(recalibration.f_mz.eval(mz as f64).to_bits(), expected, "f_mz({mz})");
-        }
-
-        let mut corrected = x.clone();
-        recalibration.correct(&mut corrected[..4], 1.5);
-        recalibration.correct(&mut corrected[4..], -2.25);
-        let corrected_bits: Vec<u32> = corrected.iter().map(|m| m.to_bits()).collect();
-        assert_eq!(corrected_bits, NUMBA_CORRECTED_MZ_BITS);
-    }
-
-    /// A `.mzcalib` directory in timstofu's `MzRecalibration.dump` layout, with
-    /// one curve per name in `dims`, each the `RECALIBRATION_CURVE` over [100, 1700.3].
-    fn mk_mzcalib(name: &str, bias: f64, dims: &[&str]) -> PathBuf {
-        let dir = temp_dir(name, "mzcalib");
-        MmappetDirBuilder::at(dir.join("bias.mmappet"))
-            .column("float64", "bias", &[bias])
-            .finish();
-        for dim in dims {
-            MmappetDirBuilder::at(dir.join(dim).join("grid.mmappet"))
-                .column("float64", "x_min", &[100.0f64])
-                .column("float64", "x_max", &[1700.3f64])
-                .finish();
-            MmappetDirBuilder::at(dir.join(dim).join("values.mmappet"))
-                .column("float64", "y", &RECALIBRATION_CURVE)
-                .finish();
-        }
-        dir
-    }
-
-    /// Fragments are the ten `RECALIBRATION_X` m/z, at tofs 0..10; precursor 0
-    /// owns rows 0..4 and precursor 1 rows 4..10.
-    fn mk_recalibration_inputs(name: &str) -> (PathBuf, PathBuf) {
-        let pmsms_dir = MmappetDirBuilder::new(name)
-            .column("uint32", "tof", &(0u32..10).collect::<Vec<_>>())
-            .column("uint32", "intensity", &[10u32; 10])
-            .finish();
-        let table_dir = MmappetDirBuilder::new(&format!("{name}_tof2mz"))
-            .column("float32", "mz", &recalibration_x())
-            .finish();
-        (pmsms_dir, table_dir)
-    }
-
-    fn recalibration_precursors(name: &str) -> MmappetDirBuilder {
+    fn two_precursors_with_shift(name: &str) -> PathBuf {
         MmappetDirBuilder::new(name)
             .column("uint64", "precursor_idx", &[0u64, 1])
             .column("float64", "mz", &[500.0f64, 600.0])
             .column("float64", "rt", &[60.0f64, 120.0])
             .column("float64", "inv_ion_mobility", &[0.9f64, 1.0])
             .column("int64", "charges", &[2i64, 3])
-            .column("uint64", "fragment_spectrum_start", &[0u64, 4])
-            .column("uint64", "fragment_event_cnt", &[4u64, 6])
-    }
-
-    #[test]
-    fn mz_recalibration_applies_curve_bias_and_each_precursors_shift() {
-        let (pmsms_dir, table_dir) = mk_recalibration_inputs("pmsms_recalibrated");
-        let precursors_dir = recalibration_precursors("precursors_with_shift")
+            .column("uint64", "fragment_spectrum_start", &[0u64, 2])
+            .column("uint64", "fragment_event_cnt", &[2u64, 2])
             .column("float64", "fragment_shift_ppm", &[1.5f64, -2.25])
-            .finish();
-        let mzcalib = mk_mzcalib("mz_only", 0.375, &["mz"]);
+            .finish()
+    }
 
-        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir, Some(&mzcalib)), 0)
-            .expect("parse with recalibration");
-        let corrected_bits: Vec<u32> = spectra.iter().flat_map(|s| s.mz.iter().map(|m| m.to_bits())).collect();
-        assert_eq!(corrected_bits, NUMBA_CORRECTED_MZ_BITS);
+    #[test]
+    fn fragment_shift_column_divides_each_precursors_mz() {
+        let precursors_dir = two_precursors_with_shift("precursors_with_shift");
+        let (pmsms_dir, table_dir) = mk_pmsms_fragments_dir("pmsms_shifted");
 
-        for dir in [&pmsms_dir, &table_dir, &precursors_dir, &mzcalib] {
+        let spectra = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir), 0).expect("parse with shift");
+        let expected = |mz: f64, shift_ppm: f64| (mz / (1.0 + shift_ppm * 1e-6)) as f32;
+        assert_eq!(spectra[0].mz, vec![expected(100.0, 1.5), expected(200.0, 1.5)]);
+        assert_eq!(spectra[1].mz, vec![expected(300.0, -2.25), expected(400.0, -2.25)]);
+        assert_ne!(spectra[0].mz[0], 100.0);
+
+        for dir in [&precursors_dir, &pmsms_dir, &table_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
     #[test]
-    fn mz_recalibration_without_fragment_shift_column_errors() {
-        let (pmsms_dir, table_dir) = mk_recalibration_inputs("pmsms_no_shift");
-        let precursors_dir = recalibration_precursors("precursors_without_shift").finish();
-        let mzcalib = mk_mzcalib("mz_only_no_shift", 0.0, &["mz"]);
+    fn float64_tof2mz_table_is_rounded_once_to_f32() {
+        let precursors_dir = two_precursors_dir("precursors_f64_table");
+        let events_dir = MmappetDirBuilder::new("events_f64_table")
+            .column("uint32", "tof", &[1u32, 3, 4])
+            .column("uint32", "intensity", &[10u32, 20, 30])
+            .finish();
+        let table = [0.0f64, 101.123456789, 102.5, 103.987654321, 104.000000001];
+        let table_dir = MmappetDirBuilder::new("tof2mz_f64").column("float64", "mz", &table).finish();
 
-        let err = parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir, Some(&mzcalib)), 0).unwrap_err();
-        assert!(matches!(err, PmsmsError::MissingColumn("fragment_shift_ppm")));
+        let spectra = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir), 0).expect("parse f64 table");
+        assert_eq!(spectra[0].mz, vec![table[1] as f32, table[3] as f32]);
+        assert_eq!(spectra[1].mz, vec![table[3] as f32, table[4] as f32]);
 
-        for dir in [&pmsms_dir, &table_dir, &precursors_dir, &mzcalib] {
+        for dir in [&precursors_dir, &events_dir, &table_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
     #[test]
-    fn mz_recalibration_needs_exactly_the_mz_dimension() {
-        let (pmsms_dir, table_dir) = mk_recalibration_inputs("pmsms_bad_dims");
-        let precursors_dir = recalibration_precursors("precursors_bad_dims")
-            .column("float64", "fragment_shift_ppm", &[0.0f64, 0.0])
+    fn tof2mz_table_of_another_dtype_errors() {
+        let precursors_dir = two_precursors_dir("precursors_int_table");
+        let events_dir = MmappetDirBuilder::new("events_int_table")
+            .column("uint32", "tof", &[1u32, 3, 4])
+            .column("uint32", "intensity", &[10u32, 20, 30])
             .finish();
-        for dims in [&["mz", "rt"][..], &["rt"][..]] {
-            let mzcalib = mk_mzcalib("bad_dims", 0.0, dims);
-            let err =
-                parse(&pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir, Some(&mzcalib)), 0).unwrap_err();
-            match err {
-                PmsmsError::MzRecalibrationDims(_, found) => assert_eq!(found, dims),
-                other => panic!("expected MzRecalibrationDims, got {other:?}"),
-            }
-            let _ = std::fs::remove_dir_all(&mzcalib);
-        }
+        let table_dir = MmappetDirBuilder::new("tof2mz_int").column("int64", "mz", &[0i64, 1, 2, 3, 4]).finish();
 
-        for dir in [&pmsms_dir, &table_dir, &precursors_dir] {
+        let err = parse(&pmsms_paths(&events_dir, &precursors_dir, &table_dir), 0).unwrap_err();
+        assert!(matches!(err, PmsmsError::WrongDtype("mz", _, _)));
+
+        for dir in [&precursors_dir, &events_dir, &table_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

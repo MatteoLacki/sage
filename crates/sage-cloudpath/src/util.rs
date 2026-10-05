@@ -22,9 +22,6 @@ pub struct PmsmsPaths {
     pub precursors: PathBuf,
     /// tof -> m/z table; fragment m/z is looked up from the pmsms' `tof` column.
     pub tof2mz: PathBuf,
-    /// Optional fragment m/z recalibration (`.mzcalib`), applied per peak with
-    /// each precursor's `fragment_shift_ppm`.
-    pub mz_recalibration: Option<PathBuf>,
 }
 
 impl FileFormat {

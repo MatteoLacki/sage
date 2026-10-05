@@ -7,15 +7,15 @@ paths (never assumed to live together in one fixed-filename directory):
   `git/mmappet`'s Python writer), columns looked up by name. Needs
   `tof`(uint32) and `intensity`(uint32). An `mz` column, if present, is
   ignored with a warning.
-- `tof2mz` table — an mmappet with one float32 column `mz` indexed by tof;
-  fragment m/z is `table[tof]`. A tof outside the table is an error
-  (`PmsmsError::TofOutOfRange`).
+- `tof2mz` table — an mmappet with one float32 or float64 column `mz` indexed by
+  tof, read as f64; fragment m/z is `table[tof]`, rounded to f32. A tof outside the
+  table is an error (`PmsmsError::TofOutOfRange`).
 - precursors, either `.parquet` (via the `parquet` crate) or `.mmappet/`
   (schema.txt + one `<idx>.bin` file per column, columns looked up by name —
   see `git/mmappet`'s Python writer for the on-disk format). Needs 7 columns:
   `precursor_idx`(u64), `mz`(f64), `rt`(f64), `inv_ion_mobility`(f64),
   `charges`(i64), `fragment_spectrum_start`(u64), `fragment_event_cnt`(u64).
-- optionally a fragment m/z recalibration, `--mz-recalibration` (below).
+- optionally a per-precursor `fragment_shift_ppm`(f64) column (below).
 
 CLI: **`--pmsms <path> --precursors <path> --tof2mz <path>`**, all three
 together — validated in `crates/sage-cli/src/input.rs::Input::from_arguments`.
@@ -51,53 +51,48 @@ Any pmsms read error (including the recalibration errors below) is only
 logged: the runner turns it into an empty spectrum list, so SAGE searches 0
 spectra and exits 0.
 
-## Fragment m/z recalibration, `--mz-recalibration` (2026-10)
+## Fragment m/z recalibration: a recalibrated table plus `fragment_shift_ppm` (2026-10)
 
-`--mz-recalibration <dir.mzcalib>`: timstofu's `MzRecalibration` artifact
-(`bias.mmappet` plus one `<dim>/{grid,values}.mmappet` curve per dimension), here
-with exactly one dimension, `mz`. Each fragment m/z read as `table[tof]` becomes
+The fragment correction fitted in necromerge2 (searchops' `recalibrate_pmsms_mz`) is
+`bias + f_mz(mz) + f_rt(precursor rt)` in ppm. SAGE gets it in two pieces, neither
+of which needs any model code here:
 
-    mz / (1 + (bias + f_mz(mz) + fragment_shift_ppm) * 1e-6)
+- `f_mz` depends only on m/z, which depends only on tof, so it is folded into a
+  float64 tof2mz table, `table[t] / (1 + f_mz(table[t])·1e-6)`, passed as `--tof2mz`.
+- `bias + f_rt(rt)` is constant per precursor and arrives as the precursors column
+  `fragment_shift_ppm`. When the column is present, each precursor's fragment m/z
+  are `(table[tof] / (1 + fragment_shift_ppm·1e-6)) as f32`, computed in f64
+  (`look_up_mz`); when absent, `table[tof] as f32`. No flag: like
+  `ppm_tol_lo`/`ppm_tol_hi`, the column's presence is the switch, so nothing checks
+  that a shifted precursors table is paired with the recalibrated table — the
+  pipeline wires both together.
 
-computed in f64 and rounded to f32, where `fragment_shift_ppm`(f64) is a column of
-the precursors table: one constant per precursor. `FragmentMzRecalibration`
-(`pmsms.rs`) loads and applies it per precursor in `parse_with`.
+The table is float64 because a float32 one would round each m/z twice: measured on
+F9477, that moves 25% of peaks by one float32 ulp against a single rounding, while
+float64 moves essentially none. With the raw float32 table and no column the
+arithmetic (`f32 -> f64 / 1.0 -> f32`) returns the table value exactly.
 
-Errors: a `.mzcalib` with any dimension set other than `{mz}` (e.g. a leftover `rt`
-curve, which would otherwise be silently skipped) is
-`PmsmsError::MzRecalibrationDims`; a precursors table without
-`fragment_shift_ppm` is `MissingColumn("fragment_shift_ppm")`. Without the flag
-the column is ignored.
+timstofu's `materialize_pmsms_mz <pmsms> <table> <out> --precursors <p>` performs the
+same float64 operations for exports (mzML/MGF/the SAGE-to-pmsms mapping), so exports
+hold exactly the m/z SAGE searched.
 
-Why it is in the reader: the correction is tiny (2,000 grid points), while
-materializing it upstream meant writing a 6.5 GB `mz` column (F9477) twice per run,
-once for `table[tof]` and once recalibrated. Materialization now runs only for
-exports (mzML/MGF/the SAGE-to-pmsms mapping), in timstofu's
-`materialize_pmsms_mz --mz-recalibration ... --precursors ...`.
+Why the per-precursor part is computed upstream from raw RT rather than by SAGE: in
+necromerge2's mode 3 the RT correction overwrites the precursors' `rt` column before
+the final search, while `f_rt` was fitted on raw RT. The column also leaves the
+per-precursor model free to change (e.g. a 2-D `f(rt, 1/K0)`, or a free intercept)
+without touching SAGE.
 
-Why the per-precursor part is a column and not a curve SAGE evaluates: the fit is
-`bias + f_mz(mz) + f_rt(precursor rt)`, and `f_rt` is constant per precursor.
-searchops' `recalibrate_pmsms_mz` evaluates it once from the precursors' raw `rt`
-and writes `fragment_shift_ppm = bias + f_rt(rt)` (the `.mzcalib` then carries
-`bias = 0`). Evaluating `f_rt` in SAGE would have been wrong in necromerge2's
-mode 3, where the RT correction overwrites the precursors' `rt` column with
-corrected RT before the final search, while `f_rt` was fitted on raw RT. The
-column also leaves the per-precursor model free to change without touching SAGE:
-e.g. a 2-D `f(rt, 1/K0)`, or a free per-precursor intercept.
-
-Bit-identity with the Python export path: `EvenlySpacedLinearSpline` mirrors
-timstofu's `EvenlySpacedLinearSpline.njit_evaluator` operation for operation
-(`spacing = (x_max - x_min) / (n - 1)`, `inv_spacing = 1 / spacing`, flat clamp,
-truncating index), and `correct` mirrors `apply_fragment_mz_recalibration_blocks`'
-`(bias + f_mz) + shift` order. SAGE's own `LinearSpline` (f32, `grid_step`) is not
-reused: it would round differently. `recalibration_matches_timstofu_bit_for_bit`
-pins both against values generated with the numba code.
+History: the first version (git/sage `6e06d5d`) took the `f_mz` curve itself,
+`--mz-recalibration <dir.mzcalib>`, and evaluated it per peak with an f64 copy of
+timstofu's `EvenlySpacedLinearSpline.njit_evaluator`, pinned bit for bit against
+numba-generated values, plus `.mzcalib` dimension checks. Folding `f_mz` into the
+table removed the flag, the spline, the `.mzcalib` reader and its error cases.
 
 ## Borrowed fragment input and processed storage
 
 The explicit-path CLI input calls `parse_processed`: each precursor's m/z
-(looked up as `table[tof]` into a per-spectrum vector, then recalibrated in
-place) and mapped `intensity: &[u32]` range feed `SpectrumProcessor` directly,
+(looked up as `table[tof]`, divided by the precursor's shift, into a
+per-spectrum vector) and mapped `intensity: &[u32]` range feed `SpectrumProcessor` directly,
 in parallel, while the reader owns the mappings. No intermediate per-spectrum
 float-intensity vectors are allocated. Ordered parallel collection
 preserves precursor order; returned processed spectra own their storage and

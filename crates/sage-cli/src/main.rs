@@ -56,21 +56,9 @@ fn main() -> anyhow::Result<()> {
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .requires("pmsms")
                 .help(
-                    "tof -> m/z table (.mmappet, float32 column `mz`); fragment m/z is \
-                     table[tof] (paired with --pmsms).",
-                )
-                .value_hint(ValueHint::FilePath),
-        )
-        .arg(
-            Arg::new("mz-recalibration")
-                .long("mz-recalibration")
-                .value_parser(clap::builder::NonEmptyStringValueParser::new())
-                .requires("pmsms")
-                .help(
-                    "Optional fragment m/z recalibration (.mzcalib with only an `mz` curve). \
-                     Each fragment m/z is divided by 1 + (bias + f_mz(mz) + \
-                     fragment_shift_ppm)*1e-6, with fragment_shift_ppm (f64) read from the \
-                     precursors table.",
+                    "tof -> m/z table (.mmappet, float32 or float64 column `mz`); fragment \
+                     m/z is table[tof], divided by 1 + fragment_shift_ppm*1e-6 when the \
+                     precursors table has that column (paired with --pmsms).",
                 )
                 .value_hint(ValueHint::FilePath),
         )
