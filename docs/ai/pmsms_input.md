@@ -72,9 +72,10 @@ F9477, that moves 25% of peaks by one float32 ulp against a single rounding, whi
 float64 moves essentially none. With the raw float32 table and no column the
 arithmetic (`f32 -> f64 / 1.0 -> f32`) returns the table value exactly.
 
-timstofu's `materialize_pmsms_mz <pmsms> <table> <out> --precursors <p>` performs the
-same float64 operations for exports (mzML/MGF/the SAGE-to-pmsms mapping), so exports
-hold exactly the m/z SAGE searched.
+The mzML writer (`pmsms2mzml --tof2mz`), the MGF writer (`msms2mgf --tof2mz`) and
+`sage-pmsms-mapper --tof2mz` perform the same float64 operations from `tof`, so exports
+hold exactly the m/z SAGE searched with no materialized `mz` column (necromerge2
+`plans/exports_from_tof2mz_table.md`).
 
 Why the per-precursor part is computed upstream from raw RT rather than by SAGE: in
 necromerge2's mode 3 the RT correction overwrites the precursors' `rt` column before
