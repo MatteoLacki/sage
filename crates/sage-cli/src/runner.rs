@@ -643,10 +643,7 @@ impl Runner {
         if let Some(paths) = &self.parameters.pmsms_paths {
             let spectra = match sage_cloudpath::pmsms::parse_processed(paths, chunk_idx * batch_size, &sp) {
                 Ok(spectra) => spectra,
-                Err(error) => {
-                    log::error!("- {}: {}", paths.pmsms.display(), error);
-                    Vec::new()
-                }
+                Err(error) => panic!("cannot read pmsms input {}: {}", paths.pmsms.display(), error),
             };
             info!("- file IO: {:8} ms", start.elapsed().as_millis());
             return (MS1Spectra::Empty, spectra);
@@ -911,6 +908,10 @@ impl Runner {
             "discovered {} target protein groups (supported by proteotypic peptides only) at 1% FDR",
             q_protein_group
         );
+        if self.parameters.annotate_matches {
+            self.resolve_pmsms_rows(&mut outputs.features)?;
+        }
+
         log::trace!("writing outputs");
 
         // Write either a single parquet file, or multiple tsv files
@@ -1231,6 +1232,16 @@ impl Runner {
                         .format(fragments.closest_fragment_mz_experimental[id])
                         .as_bytes(),
                 );
+                record.push_field(
+                    itoa::Buffer::new()
+                        .format(fragments.pmsms_rows.get(id).copied().unwrap_or(-1))
+                        .as_bytes(),
+                );
+                record.push_field(
+                    itoa::Buffer::new()
+                        .format(fragments.closest_pmsms_rows.get(id).copied().unwrap_or(-1))
+                        .as_bytes(),
+                );
                 frag_records.push(record);
             }
         }
@@ -1329,6 +1340,45 @@ impl Runner {
         Ok(path)
     }
 
+    /// Fill each matched fragment's `pmsms_rows`/`closest_pmsms_rows` with the input pmsms
+    /// row of its peak (`-1` when the input is not a pmsms).
+    fn resolve_pmsms_rows(&self, features: &mut [Feature]) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let resolver = match &self.parameters.pmsms_paths {
+            Some(paths) => Some(sage_cloudpath::pmsms::PmsmsRowResolver::open(paths)?),
+            None => None,
+        };
+        let unresolved = std::sync::atomic::AtomicUsize::new(0);
+        features.par_iter_mut().for_each(|feature| {
+            let spec_id = feature.spec_id.as_str();
+            if let Some(fragments) = feature.fragments.as_mut() {
+                let row = |mass: f32, charge: i32| match &resolver {
+                    Some(resolver) => resolver.row(spec_id, mass, charge).map_or_else(
+                        || {
+                            unresolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            -1
+                        },
+                        |row| row as i64,
+                    ),
+                    None => -1,
+                };
+                fragments.pmsms_rows = fragments.masses.iter().zip(&fragments.charges).map(|(&m, &z)| row(m, z)).collect();
+                fragments.closest_pmsms_rows = fragments
+                    .closest_masses
+                    .iter()
+                    .zip(&fragments.closest_charges)
+                    .map(|(&m, &z)| row(m, z))
+                    .collect();
+            }
+        });
+        let unresolved = unresolved.into_inner();
+        if unresolved > 0 {
+            log::warn!("{unresolved} matched peaks have no pmsms row with their mass (exported as -1)");
+        }
+        info!("- resolving matched peaks' pmsms rows: {:8} ms", start.elapsed().as_millis());
+        Ok(())
+    }
+
     pub fn write_fragments(&self, features: &[Feature]) -> anyhow::Result<Url> {
         let path = self.make_path("matched_fragments.sage.tsv");
 
@@ -1346,6 +1396,8 @@ impl Runner {
             "fragment_intensity",
             "closest_fragment_mz_calculated",
             "closest_fragment_mz_experimental",
+            "fragment_pmsms_row",
+            "closest_fragment_pmsms_row",
         ]);
 
         wtr.write_byte_record(&headers)?;

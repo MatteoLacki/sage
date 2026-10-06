@@ -47,9 +47,11 @@ matched fragments identical; necromerge2
 overlap (several precursors sharing a spectrum). Since 2026-10 the final search
 reads the pmsms the same way, with the recalibration applied in the reader (below).
 
-Any pmsms read error (including the recalibration errors below) is only
-logged: the runner turns it into an empty spectrum list, so SAGE searches 0
-spectra and exits 0.
+Any pmsms read error (a missing or wrong-dtype column, a tof outside the table, an
+unreadable precursors table) panics in the runner, so SAGE exits non-zero. Until
+2026-10-05 it was logged and turned into an empty spectrum list: SAGE searched 0
+spectra, wrote valid-looking empty outputs and exited 0, and the failure surfaced only
+downstream.
 
 ## Fragment m/z recalibration: a recalibrated table plus `fragment_shift_ppm` (2026-10)
 
@@ -88,6 +90,29 @@ History: the first version (git/sage `6e06d5d`) took the `f_mz` curve itself,
 timstofu's `EvenlySpacedLinearSpline.njit_evaluator`, pinned bit for bit against
 numba-generated values, plus `.mzcalib` dimension checks. Folding `f_mz` into the
 table removed the flag, the spline, the `.mzcalib` reader and its error cases.
+
+## Matched peaks' pmsms rows: `fragment_pmsms_row`, `closest_fragment_pmsms_row` (2026-10)
+
+The matched-fragments export (TSV and parquet) carries, for the matched (most intense)
+peak and the closest peak, the row of that peak in the input pmsms, so any pmsms column
+is one lookup away. `-1` when the input is not a pmsms.
+
+Processing discards a peak's input position (deisotoping, top-N selection, the mass
+sort), so the row is recovered after scoring instead of carried through it:
+`score_candidate` keeps each matched/closest peak's processed mass and charge scale in
+`Fragments`, and the runner's `resolve_pmsms_rows` asks `pmsms::PmsmsRowResolver`, which
+re-opens the pmsms `tof` column, the tof2mz table and the precursors, recomputes the
+masses of the precursor's slice with the reader's own float32 arithmetic
+(`((table[tof] / divisor) as f32 - PROTON) * charge`) and binary-searches it (the slice
+is tof-sorted, hence mass-sorted; a linear scan backs it up). Equal float32 masses
+resolve to the lowest row; a deisotoped peak resolves to its monoisotopic root, whose
+m/z deisotoping keeps.
+
+F9477: all 2,245,178 matched fragments resolved, none to `-1`, the m/z at every row
+reproducing `fragment_mz_experimental` bit for bit; 354 ms for the whole export. It
+replaced searchops' `sage-pmsms-mapper` (nearest m/z within 0.001 Da), which found the
+right rows per precursor but, sorting each PSM's m/z without its fragment indices,
+attributed 89% of them to the wrong SAGE fragment.
 
 ## Borrowed fragment input and processed storage
 

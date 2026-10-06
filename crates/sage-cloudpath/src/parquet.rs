@@ -299,6 +299,8 @@ pub fn build_matched_fragment_schema() -> parquet::errors::Result<Type> {
             required float fragment_intensity;
             required float closest_fragment_mz_calculated;
             required float closest_fragment_mz_experimental;
+            required int64 fragment_pmsms_row;
+            required int64 closest_fragment_pmsms_row;
         }
     "#;
 
@@ -470,6 +472,26 @@ pub fn serialize_matched_fragments(
             col.typed::<FloatType>()
                 .write_batch(&closest_fragment_mz_experimental, None, None)?;
             col.close()?;
+        }
+
+        for rows_of in [
+            (|f: &sage_core::scoring::Fragments| &f.pmsms_rows) as fn(&sage_core::scoring::Fragments) -> &Vec<i64>,
+            |f: &sage_core::scoring::Fragments| &f.closest_pmsms_rows,
+        ] {
+            if let Some(mut col) = rg.next_column()? {
+                let rows = features
+                    .iter()
+                    .flat_map(|f| {
+                        f.fragments.as_ref().map(|fragments| {
+                            (0..fragments.fragment_ordinals.len())
+                                .map(move |id| rows_of(fragments).get(id).copied().unwrap_or(-1))
+                        })
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>();
+                col.typed::<Int64Type>().write_batch(&rows, None, None)?;
+                col.close()?;
+            }
         }
 
         rg.close()?;

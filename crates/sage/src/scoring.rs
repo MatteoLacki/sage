@@ -253,6 +253,20 @@ pub struct Fragments {
     pub mz_experimental: Vec<f32>,
     pub closest_fragment_mz_calculated: Vec<f32>,
     pub closest_fragment_mz_experimental: Vec<f32>,
+    /// Processed mass of the matched peak, and of the closest peak with its charge: the
+    /// values a pmsms row resolver recomputes from the input to find the peaks' rows.
+    #[serde(skip_serializing)]
+    pub masses: Vec<f32>,
+    #[serde(skip_serializing)]
+    pub closest_masses: Vec<f32>,
+    #[serde(skip_serializing)]
+    pub closest_charges: Vec<i32>,
+    /// Input pmsms row of the matched / closest peak, `-1` when the input is not a pmsms;
+    /// filled after scoring by the runner.
+    #[serde(skip_serializing)]
+    pub pmsms_rows: Vec<i64>,
+    #[serde(skip_serializing)]
+    pub closest_pmsms_rows: Vec<i64>,
 }
 
 static PSM_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1351,6 +1365,7 @@ impl<'db> Scorer<'db> {
                         fragments_details.mz_calculated.push(calc_mz);
                         fragments_details.fragment_ordinals.push(idx);
                         fragments_details.intensities.push(peak.intensity);
+                        fragments_details.masses.push(peak.mass);
 
                         let closest_i = peak_match
                             .map(|m| m.closest)
@@ -1378,6 +1393,8 @@ impl<'db> Scorer<'db> {
                         fragments_details
                             .closest_fragment_mz_experimental
                             .push(closest_exp_mz);
+                        fragments_details.closest_masses.push(closest_peak.mass);
+                        fragments_details.closest_charges.push(closest_peak_charge as i32);
                     }
                 }
 

@@ -27,6 +27,7 @@
 
 #![cfg(feature = "parquet")]
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +35,7 @@ use memmap2::Mmap;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use rayon::prelude::*;
-use sage_core::mass::Tolerance;
+use sage_core::mass::{Tolerance, PROTON};
 use sage_core::spectrum::{
     Precursor, ProcessedSpectrum, RawSpectrum, Representation, SpectrumProcessor,
 };
@@ -434,6 +435,62 @@ fn look_up_mz(tof: &[u32], tof2mz: &[f64], shift_ppm: f64) -> Result<Vec<f32>, P
     Ok(mz)
 }
 
+/// Finds the input pmsms row of a matched peak. SAGE's processed peaks lose their input
+/// position (deisotoping, top-N selection, mass sort), so the row is recovered from the
+/// peak's processed mass, `(mz - PROTON) * charge`: that mass is recomputed with the
+/// reader's own f32 arithmetic for the peaks of the precursor's slice, which is tof-sorted
+/// and therefore mass-sorted, and found by binary search. Equal float32 masses resolve to
+/// the lowest row.
+pub struct PmsmsRowResolver {
+    _tof_mmap: Mmap,
+    tof: &'static [u32],
+    tof2mz: Vec<f64>,
+    /// precursor_idx -> (first row, end row, m/z divisor `1 + fragment_shift_ppm*1e-6`)
+    slices: HashMap<u64, (usize, usize, f64)>,
+}
+
+impl PmsmsRowResolver {
+    pub fn open(paths: &PmsmsPaths) -> Result<Self, PmsmsError> {
+        let precursors = read_precursors(&paths.precursors)?;
+        let tof2mz = read_tof2mz_table(&paths.tof2mz)?;
+        let schema = read_mmappet_schema(&paths.pmsms)?;
+        let i_tof = mmappet_column_index(&schema, "tof", "uint32")?;
+        // SAFETY: dtype checked against schema.txt above.
+        let (tof_mmap, tof) = unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_tof}.bin")))? };
+        let slices = precursors
+            .iter()
+            .map(|p| {
+                let start = p.frag_start as usize;
+                let divisor = 1.0 + p.fragment_shift_ppm.unwrap_or(0.0) * 1e-6;
+                (p.precursor_idx, (start, start + p.frag_count as usize, divisor))
+            })
+            .collect();
+        Ok(Self { _tof_mmap: tof_mmap, tof, tof2mz, slices })
+    }
+
+    /// The pmsms row of the peak in spectrum `spec_id` (`precursor_idx=N`) whose processed
+    /// mass at `charge` is exactly `mass`, or `None` if its slice has no such peak.
+    pub fn row(&self, spec_id: &str, mass: f32, charge: i32) -> Option<u64> {
+        let precursor_idx: u64 = spec_id.strip_prefix("precursor_idx=")?.parse().ok()?;
+        let &(start, end, divisor) = self.slices.get(&precursor_idx)?;
+        let mass_at = |row: usize| ((self.tof2mz[self.tof[row] as usize] / divisor) as f32 - PROTON) * charge as f32;
+        let (mut lo, mut hi) = (start, end);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if mass_at(mid) < mass {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < end && mass_at(lo) == mass {
+            return Some(lo as u64);
+        }
+        // A recalibrated table need not be strictly monotone everywhere.
+        (start..end).find(|&row| mass_at(row) == mass).map(|row| row as u64)
+    }
+}
+
 /// The tof2mz table's `mz` column, float32 (the raw table) or float64 (a
 /// recalibrated one), as f64.
 fn read_tof2mz_table(dir: &Path) -> Result<Vec<f64>, PmsmsError> {
@@ -806,6 +863,51 @@ mod test {
         assert_eq!(spectra[1].mz, vec![table[3] as f32, table[4] as f32]);
 
         for dir in [&precursors_dir, &events_dir, &table_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn row_resolver_finds_every_processed_peaks_input_row() {
+        // One precursor slice with an isotope pair (rows 1-2) that deisotoping merges.
+        let precursors_dir = MmappetDirBuilder::new("precursors_rows")
+            .column("uint64", "precursor_idx", &[7u64])
+            .column("float64", "mz", &[500.0f64])
+            .column("float64", "rt", &[60.0f64])
+            .column("float64", "inv_ion_mobility", &[1.0f64])
+            .column("int64", "charges", &[2i64])
+            .column("uint64", "fragment_spectrum_start", &[0u64])
+            .column("uint64", "fragment_event_cnt", &[6u64])
+            .column("float64", "fragment_shift_ppm", &[-2.75f64])
+            .finish();
+        let pmsms_dir = MmappetDirBuilder::new("pmsms_rows")
+            .column("uint32", "tof", &[0u32, 1, 2, 3, 4, 5])
+            .column("uint32", "intensity", &[50u32, 900, 400, 70, 300, 20])
+            .finish();
+        let table = [150.0423f64, 301.1418, 301.6434, 455.2271, 702.3349, 1311.6629];
+        let table_dir = MmappetDirBuilder::new("tof2mz_rows").column("float64", "mz", &table).finish();
+        let paths = pmsms_paths(&pmsms_dir, &precursors_dir, &table_dir);
+        let resolver = PmsmsRowResolver::open(&paths).unwrap();
+
+        for deisotope in [false, true] {
+            let processor = SpectrumProcessor::new(0, deisotope, 0.0, false);
+            for spectrum in parse_processed(&paths, 0, &processor).unwrap() {
+                for i in 0..spectrum.peaks.len() {
+                    let peak = spectrum.peaks.peak(i);
+                    let charge = match spectrum.peak_charges.get(i).copied() {
+                        Some(0) | None => 1,
+                        Some(z) => z as i32,
+                    };
+                    let row = resolver.row(&spectrum.id, peak.mass, charge).expect("peak has a row") as usize;
+                    let mz = (table[row] / (1.0 + -2.75 * 1e-6)) as f32;
+                    assert_eq!((mz - PROTON) * charge as f32, peak.mass);
+                }
+            }
+        }
+        assert_eq!(resolver.row("precursor_idx=7", 12345.0, 1), None);
+        assert_eq!(resolver.row("precursor_idx=8", 149.0, 1), None);
+
+        for dir in [&precursors_dir, &pmsms_dir, &table_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
