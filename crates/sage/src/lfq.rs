@@ -112,7 +112,7 @@ pub fn build_feature_map(
                     -settings.mobility_pct_tolerance,
                     settings.mobility_pct_tolerance,
                 )
-                .bounds(feat.ims);
+                .observed_range(feat.ims);
                 map.insert(
                     feat.peptide_idx,
                     PrecursorRange {
@@ -140,7 +140,7 @@ pub fn build_feature_map(
                     let mass = (range.mass_lo + isotope as f32 * NEUTRON) / charge as f32;
                     let (mass_lo, mass_hi) =
                         Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
-                            .bounds(mass);
+                            .observed_range(mass);
 
                     let fwd = PrecursorRange {
                         mass_lo,
@@ -153,7 +153,7 @@ pub fn build_feature_map(
 
                     let (mass_lo, mass_hi) =
                         Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
-                            .bounds(mass + 11.06);
+                            .observed_range(mass + 11.06);
 
                     let rev = PrecursorRange {
                         rt: (fwd.rt - RT_TOL * 2.0).max(0.0),

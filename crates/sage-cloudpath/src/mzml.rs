@@ -352,7 +352,12 @@ impl MzMLReader {
                         (Some(State::Precursor), b"precursor") => {
                             if precursor.mz != 0.0 {
                                 precursor.isolation_window = match (iso_window_lo, iso_window_hi) {
-                                    (Some(lo), Some(hi)) => Some(Tolerance::Da(-lo, hi)),
+                                    // Offsets bound the theoretical m/z to
+                                    // [target − lower, target + upper], i.e.
+                                    // observed − theoretical ∈ [−upper, lower].
+                                    (Some(lower), Some(upper)) => {
+                                        Some(Tolerance::Da(-upper, lower))
+                                    }
                                     _ => None,
                                 };
                                 spectrum.precursors.push(precursor);
@@ -510,7 +515,7 @@ mod test {
         });
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Da(-1.5, 0.75))
+            Some(Tolerance::Da(-0.75, 1.5))
         );
         assert!((s.scan_start_time - 25.066).abs() < 0.0001);
         assert_eq!(s.ion_injection_time, 0.0);
@@ -600,7 +605,7 @@ mod test {
         assert!((s.precursors[0].mz - 457.723968) < 0.0001);
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Da(-1.5, 0.75))
+            Some(Tolerance::Da(-0.75, 1.5))
         );
         assert!((s.scan_start_time - 25.066).abs() < 0.0001);
         assert_eq!(s.ion_injection_time, 0.0);
@@ -639,7 +644,7 @@ mod test {
         assert!((s.precursors[0].mz - 457.723968) < 0.0001);
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Da(-1.5, 0.75))
+            Some(Tolerance::Da(-0.75, 1.5))
         );
 
         // Check different ordering of fields in mzML
@@ -671,7 +676,7 @@ mod test {
         assert!((s.precursors[0].mz - 457.723968) < 0.0001);
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Da(-1.5, 0.75))
+            Some(Tolerance::Da(-0.75, 1.5))
         );
 
         // Check fallback keeping iso window m/z of fields in mzML
@@ -702,7 +707,7 @@ mod test {
         assert!((s.precursors[0].mz - 457.75) < 0.0001);
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Da(-1.5, 0.75))
+            Some(Tolerance::Da(-0.75, 1.5))
         );
         Ok(())
     }

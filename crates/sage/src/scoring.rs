@@ -359,8 +359,8 @@ pub struct Scorer<'db> {
     pub ranking_score: RankingScore,
 
     /// Externally-predicted RT, indexed by peptide index (`db.peptides`),
-    /// used to evict candidates whose predicted RT falls outside `rt_tol`
-    /// of the observed spectrum's RT. `rt_tol` is required (validated at
+    /// used to evict candidates whose `observed − predicted` RT falls
+    /// outside `rt_tol`. `rt_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
     /// `predicted_iim` — either, both, or neither may be set. Resolved
     /// once from a `sequence -> rt` map by `Runner::resolve_predicted_rt`
@@ -372,8 +372,8 @@ pub struct Scorer<'db> {
     /// Externally-predicted IIM, dense-indexed via [`iim_dense_slot`] (one
     /// slot per `(peptide index, charge)` combination in
     /// `[min_precursor_charge, max_precursor_charge]`), used to evict
-    /// candidates whose predicted IIM falls outside `mobility_tol` of the
-    /// observed spectrum's IIM. `mobility_tol` is required (validated at
+    /// candidates whose `observed − predicted` IIM falls outside
+    /// `mobility_tol`. `mobility_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
     /// `predicted_rt`. Resolved once by `Runner::resolve_predicted_iim`,
     /// same reasoning as `predicted_rt`. A dense array beats a
@@ -396,14 +396,14 @@ pub struct Scorer<'db> {
     /// Same as `rt_sigma`, for `predicted_iim` — unitless (1/K0), no
     /// conversion needed.
     pub iim_sigma: Option<f32>,
-    /// RT tolerance window as a function of observed `scan_start_time`,
-    /// already in minutes (converted from the config's `rt_tol_sec` at load
+    /// RT tolerance window on `observed − predicted`, as a function of
+    /// observed `scan_start_time`, already in minutes (converted from the config's `rt_tol_sec` at load
     /// time) to match `ProcessedSpectrum::scan_start_time`'s own unit. A
     /// flat window is just a 2-node spline with identical values at both
     /// nodes — there is no separate flat-tolerance representation.
     pub rt_tol: Option<crate::spline::ValueTolSpline>,
-    /// IIM tolerance window as a function of observed
-    /// `Precursor::inverse_ion_mobility`.
+    /// IIM tolerance window on `observed − predicted`, as a function of
+    /// observed `Precursor::inverse_ion_mobility`.
     pub mobility_tol: Option<crate::spline::ValueTolSpline>,
 
     /// Externally-predicted MS2 fragment intensities
@@ -634,8 +634,9 @@ impl<'db> Scorer<'db> {
         Some(peptide_idx * charge_span + (charge - min_charge) as usize)
     }
 
-    /// Evict candidates (in place) whose predicted RT and/or IIM falls
-    /// outside `rt_tol`/`mobility_tol` of `query`'s observed values. Each
+    /// Evict candidates (in place) whose `observed − predicted` RT and/or
+    /// IIM falls outside `rt_tol`/`mobility_tol` (the `Tolerance`
+    /// convention, see `mass.rs`), observed being `query`'s values. Each
     /// dimension is checked independently and only if its map
     /// (`self.predicted_rt`/`self.predicted_iim`) is configured at all — an
     /// unconfigured dimension never evicts anything. Candidates with no
@@ -650,14 +651,14 @@ impl<'db> Scorer<'db> {
         candidates: &IndexedQuery,
         hits: &mut InitialHits,
     ) {
-        let rt_bounds = self.predicted_rt.map(|_| {
+        let compatible_predicted_rt = self.predicted_rt.map(|_| {
             self.rt_tol
                 .as_ref()
                 .expect("validated at config-load time: rt_tol required with predicted_rt")
                 .tolerance_at(query.scan_start_time)
-                .bounds(query.scan_start_time)
+                .theoretical_range(query.scan_start_time)
         });
-        let iim_bounds = self.predicted_iim.and_then(|_| {
+        let compatible_predicted_iim = self.predicted_iim.and_then(|_| {
             query
                 .precursors
                 .first()
@@ -669,7 +670,7 @@ impl<'db> Scorer<'db> {
                             "validated at config-load time: mobility_tol required with predicted_iim",
                         )
                         .tolerance_at(observed)
-                        .bounds(observed)
+                        .theoretical_range(observed)
                 })
         });
 
@@ -679,12 +680,12 @@ impl<'db> Scorer<'db> {
             }
             let peptide_idx = candidates.pre_idx_lo + i;
 
-            let rt_ok = rt_bounds.map_or(true, |(lo, hi)| {
+            let rt_ok = compatible_predicted_rt.map_or(true, |(lo, hi)| {
                 self.predicted_rt
                     .and_then(|by_idx| by_idx[peptide_idx])
                     .map_or(true, |rt| rt >= lo && rt <= hi)
             });
-            let iim_ok = iim_bounds.map_or(true, |(lo, hi)| {
+            let iim_ok = compatible_predicted_iim.map_or(true, |(lo, hi)| {
                 Self::iim_dense_slot(
                     peptide_idx,
                     sc.precursor_charge,

@@ -39,7 +39,7 @@ fn check_all_ions_visited(target_fragment_mz: f32, bucket_size: usize) {
     let mut expected = vec![0usize; database.peptides.len()];
 
     let fragment_tol = Tolerance::Da(-100.0, 100.0);
-    let (frag_lo, frag_hi) = fragment_tol.bounds(target_fragment_mz);
+    let (frag_lo, frag_hi) = fragment_tol.theoretical_range(target_fragment_mz);
 
     let fragments: Vec<_> = database.fragments().collect();
     for (chunk_idx, chunk) in fragments.chunks(database.bucket_size).enumerate() {
@@ -749,4 +749,134 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
         features[0].delta_next, 0.0,
         "Hyperscore mode must ignore the RT penalty entirely -- a real tie stays a tie"
     );
+}
+
+// Asymmetric windows: every `Tolerance` is a window on `observed − theoretical`
+// (see `mass.rs`). Each test below places one candidate inside the window and
+// one at the mirrored offset, which a window applied the wrong way round would
+// swap.
+
+/// Score `TARGET_SEQUENCE`'s own fragment peaks (shifted by `peak_shift` Da)
+/// against a charge-1 precursor `precursor_ppm` away from the target's mass,
+/// observed at `rt`/`iim`; returns the target's feature, if it survives.
+fn score_target(
+    scorer: &Scorer,
+    db: &IndexedDatabase,
+    precursor_ppm: f32,
+    peak_shift: f32,
+    rt: f32,
+    iim: Option<f32>,
+) -> Option<sage_core::scoring::Feature> {
+    let (target_idx, peaks) = target_peaks(db);
+    let peaks: Vec<Peak> = peaks
+        .into_iter()
+        .map(|p| Peak {
+            mass: p.mass + peak_shift,
+            ..p
+        })
+        .collect();
+    let precursor = Precursor {
+        mz: shifted_precursor_mz(db[target_idx].monoisotopic, precursor_ppm),
+        charge: Some(1),
+        inverse_ion_mobility: iim,
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "asymmetric".into(),
+        scan_start_time: rt,
+        precursors: vec![precursor],
+        peaks: peaks.into(),
+        ..Default::default()
+    };
+    scorer
+        .score_standard(&query)
+        .into_iter()
+        .find(|f| f.peptide_idx == target_idx)
+}
+
+#[test]
+fn rt_window_is_on_observed_minus_predicted() {
+    let db = mk_ppm_window_database();
+    let (target_idx, _) = target_peaks(&db);
+    let observed_rt = 10.0;
+    for (predicted, kept) in [(9.8f32, true), (10.2f32, false)] {
+        let mut predicted_rt = vec![None; db.peptides.len()];
+        predicted_rt[target_idx.0 as usize] = Some(predicted);
+        let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
+        scorer.predicted_rt = Some(&predicted_rt);
+        scorer.rt_tol = Some(flat_value_tol_spline(-0.1, 0.3));
+        let found = score_target(&scorer, &db, 0.0, 0.0, observed_rt, None).is_some();
+        assert_eq!(
+            found,
+            kept,
+            "observed − predicted = {}",
+            observed_rt - predicted
+        );
+    }
+}
+
+#[test]
+fn iim_window_is_on_observed_minus_predicted() {
+    let db = mk_ppm_window_database();
+    let (target_idx, _) = target_peaks(&db);
+    let observed_iim = 1.0;
+    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    for (predicted, kept) in [(0.98f32, true), (1.02f32, false)] {
+        let mut predicted_iim = vec![None; db.peptides.len()];
+        predicted_iim[slot] = Some(predicted);
+        let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
+        scorer.predicted_iim = Some(&predicted_iim);
+        scorer.mobility_tol = Some(flat_value_tol_spline(-0.01, 0.03));
+        let found = score_target(&scorer, &db, 0.0, 0.0, 10.0, Some(observed_iim)).is_some();
+        assert_eq!(
+            found,
+            kept,
+            "observed − predicted = {}",
+            observed_iim - predicted
+        );
+    }
+}
+
+#[test]
+fn precursor_window_is_on_observed_minus_theoretical() {
+    let db = mk_ppm_window_database();
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 45.0));
+    for (observed_minus_theoretical_ppm, kept) in [(40.0f32, true), (-40.0f32, false)] {
+        let found = score_target(
+            &scorer,
+            &db,
+            observed_minus_theoretical_ppm,
+            0.0,
+            10.0,
+            None,
+        );
+        assert_eq!(
+            found.is_some(),
+            kept,
+            "{observed_minus_theoretical_ppm} ppm"
+        );
+        if let Some(feature) = found {
+            assert!(feature.delta_mass > 39.0 && feature.delta_mass < 41.0);
+        }
+    }
+}
+
+/// Preliminary (`page_search_batch`, keyed by observed peaks) and final
+/// (`select_matched_peaks`, keyed by theoretical fragments) matching must read
+/// the fragment window the same way round: inside it, every peak is matched;
+/// at the mirrored offset, none is.
+#[test]
+fn fragment_window_is_on_observed_minus_theoretical_in_both_stages() {
+    let db = mk_ppm_window_database();
+    let mut scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
+    let unshifted = score_target(&scorer, &db, 0.0, 0.0, 10.0, None)
+        .expect("unshifted peaks match under the symmetric default window");
+
+    scorer.fragment_tol = Tolerance::Da(-0.002, 0.02);
+    let inside = score_target(&scorer, &db, 0.0, 0.015, 10.0, None)
+        .expect("peaks at observed − theoretical = +0.015 Da are inside the window");
+    assert_eq!(inside.matched_peaks, unshifted.matched_peaks);
+
+    assert!(score_target(&scorer, &db, 0.0, -0.015, 10.0, None).is_none());
 }

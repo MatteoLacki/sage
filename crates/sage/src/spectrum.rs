@@ -234,9 +234,9 @@ pub struct PeakMatch {
     pub closest: usize,
 }
 
-/// Binary search followed by linear search to select, within `tolerance` of `center`, both the
-/// most intense peak and the peak closest in mass to `center` -- a single scan, since both are
-/// answered by the same tolerance window.
+/// Binary search followed by linear search to select, among peaks whose `observed − theoretical`
+/// lies within `tolerance`, both the most intense peak and the peak closest in mass to
+/// `theoretical` -- a single scan, since both are answered by the same tolerance window.
 /// * `offset` - this parameter allows for a static adjustment to the lower and upper bounds of the search window.
 ///
 /// Tie-breaks: most-intense keeps the highest-index peak on an exact intensity tie. Closest
@@ -250,11 +250,11 @@ pub struct PeakMatch {
 /// perhaps 0.01% of the time)
 pub fn select_matched_peaks(
     peaks: &PeakColumns,
-    center: f32,
+    theoretical: f32,
     tolerance: Tolerance,
     offset: Option<f32>,
 ) -> Option<PeakMatch> {
-    let (lo, hi) = tolerance.bounds(center);
+    let (lo, hi) = tolerance.observed_range(theoretical);
     let (lo, hi) = (
         lo + offset.unwrap_or_default(),
         hi + offset.unwrap_or_default(),
@@ -286,7 +286,7 @@ pub fn select_matched_peaks(
             most_intense_idx = Some(idx);
         }
 
-        let dist = (mass - center).abs();
+        let dist = (mass - theoretical).abs();
         if dist < min_dist || (dist == min_dist && intensity >= closest_int) {
             min_dist = dist;
             closest_int = intensity;
@@ -443,7 +443,9 @@ impl<T> ProcessedSpectrum<T> {
     }
     pub fn in_isolation_window(&self, mz: f32) -> Option<bool> {
         let precursor = self.precursors.first()?;
-        let (lo, hi) = precursor.isolation_window?.bounds(precursor.mz - PROTON);
+        let (lo, hi) = precursor
+            .isolation_window?
+            .theoretical_range(precursor.mz - PROTON);
         Some(mz >= lo && mz <= hi)
     }
 }
@@ -704,9 +706,10 @@ mod test {
                 Tolerance::Da(0.0, 0.0),
                 Tolerance::Da(-1.0, 1.0),
                 Tolerance::Ppm(-10.0, 10.0),
+                Tolerance::Da(-0.5, 2.0),
             ] {
                 for offset in [None, Some(-PROTON)] {
-                    let (lo, hi) = tolerance.bounds(center);
+                    let (lo, hi) = tolerance.observed_range(center);
                     let (lo, hi) = (
                         lo + offset.unwrap_or_default(),
                         hi + offset.unwrap_or_default(),

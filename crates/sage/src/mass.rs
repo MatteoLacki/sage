@@ -7,6 +7,10 @@ pub const PROTON: f32 = 1.0072764;
 pub const NEUTRON: f32 = 1.00335;
 pub const NH3: f32 = 17.026548;
 
+/// A window `[lo, hi]` on `observed − theoretical`, where "theoretical"
+/// is whatever the observation is compared against: a peptide or fragment
+/// mass, or an externally predicted RT/IIM. Ppm/Pct windows are relative
+/// to whichever of the two values is known.
 #[derive(Copy, Clone, Serialize, Deserialize, Debug, PartialEq, PartialOrd)]
 #[serde(rename_all = "lowercase")]
 pub enum Tolerance {
@@ -16,27 +20,25 @@ pub enum Tolerance {
 }
 
 impl Tolerance {
-    /// Compute the (`lower`, `upper`) window (in Da) for for a monoisotopic
-    /// mass and a given tolerance
-    pub fn bounds(&self, center: f32) -> (f32, f32) {
+    /// `(lo, hi)` as absolute deltas at `value`.
+    fn absolute_deltas(&self, value: f32) -> (f32, f32) {
         match self {
-            Tolerance::Ppm(lo, hi) => {
-                let delta_lo = center * lo / 1_000_000.0;
-                let delta_hi = center * hi / 1_000_000.0;
-                (center + delta_lo, center + delta_hi)
-            }
-            Tolerance::Pct(lo, hi) => {
-                let delta_lo = center * lo / 100.0;
-                let delta_hi = center * hi / 100.0;
-                (center + delta_lo, center + delta_hi)
-            }
-            Tolerance::Da(lo, hi) => (center + lo, center + hi),
+            Tolerance::Ppm(lo, hi) => (value * lo / 1_000_000.0, value * hi / 1_000_000.0),
+            Tolerance::Pct(lo, hi) => (value * lo / 100.0, value * hi / 100.0),
+            Tolerance::Da(lo, hi) => (*lo, *hi),
         }
     }
 
-    pub fn contains(&self, center: f32, rhs: f32) -> bool {
-        let (lo, hi) = self.bounds(center);
-        rhs >= lo && rhs <= hi
+    /// Theoretical values compatible with `observed`: `[observed − hi, observed − lo]`.
+    pub fn theoretical_range(&self, observed: f32) -> (f32, f32) {
+        let (lo, hi) = self.absolute_deltas(observed);
+        (observed - hi, observed - lo)
+    }
+
+    /// Observed values compatible with `theoretical`: `[theoretical + lo, theoretical + hi]`.
+    pub fn observed_range(&self, theoretical: f32) -> (f32, f32) {
+        let (lo, hi) = self.absolute_deltas(theoretical);
+        (theoretical + lo, theoretical + hi)
     }
 
     pub fn ppm_to_delta_mass(center: f32, ppm: f32) -> f32 {
@@ -143,16 +145,69 @@ mod test {
     #[test]
     fn tolerances() {
         assert_eq!(
-            Tolerance::Ppm(-10.0, 20.0).bounds(1000.0),
+            Tolerance::Ppm(-10.0, 20.0).observed_range(1000.0),
             (999.99, 1000.02)
         );
         assert_eq!(
-            Tolerance::Ppm(-10.0, 10.0).bounds(487.0),
+            Tolerance::Ppm(-10.0, 10.0).observed_range(487.0),
             (486.99513, 487.00487)
         );
         assert_eq!(
-            Tolerance::Ppm(-50.0, 50.0).bounds(1000.0),
+            Tolerance::Ppm(-50.0, 50.0).observed_range(1000.0),
             (999.95, 1000.05)
         );
+    }
+
+    #[test]
+    fn asymmetric_windows_are_on_observed_minus_theoretical() {
+        // observed − theoretical ∈ [-1, 3]
+        assert_eq!(
+            Tolerance::Da(-1.0, 3.0).theoretical_range(100.0),
+            (97.0, 101.0)
+        );
+        assert_eq!(
+            Tolerance::Da(-1.0, 3.0).observed_range(100.0),
+            (99.0, 103.0)
+        );
+        assert_eq!(
+            Tolerance::Ppm(-10.0, 20.0).theoretical_range(1000.0),
+            (999.98, 1000.01)
+        );
+        assert_eq!(
+            Tolerance::Pct(-1.0, 2.0).theoretical_range(100.0),
+            (98.0, 101.0)
+        );
+        assert_eq!(
+            Tolerance::Pct(-1.0, 2.0).observed_range(100.0),
+            (99.0, 102.0)
+        );
+    }
+
+    /// `t ∈ theoretical_range(o)` ⇔ `o ∈ observed_range(t)`: both methods
+    /// describe the same window, up to the ppm²-order difference between
+    /// scaling by `o` and by `t` (Da windows: exact up to f32 rounding).
+    #[test]
+    fn theoretical_and_observed_ranges_describe_one_window() {
+        for tol in [Tolerance::Da(-0.02, 0.05), Tolerance::Ppm(-7.0, 13.0)] {
+            let observed = 1000.0f32;
+            let (t_lo, t_hi) = tol.theoretical_range(observed);
+            for step in -30..=30 {
+                let theoretical = observed + step as f32 * 0.0025;
+                let (o_lo, o_hi) = tol.observed_range(theoretical);
+                let margin = 1e-4;
+                if theoretical > t_lo + margin && theoretical < t_hi - margin {
+                    assert!(
+                        observed >= o_lo && observed <= o_hi,
+                        "{tol:?} t={theoretical}"
+                    );
+                }
+                if theoretical < t_lo - margin || theoretical > t_hi + margin {
+                    assert!(
+                        observed < o_lo || observed > o_hi,
+                        "{tol:?} t={theoretical}"
+                    );
+                }
+            }
+        }
     }
 }

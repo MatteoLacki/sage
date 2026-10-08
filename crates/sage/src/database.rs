@@ -409,7 +409,7 @@ impl IndexedDatabase {
     /// All matches returned by the query will be within the specified tolerance
     /// parameters
     pub fn query(&self, precursor_mass: f32, precursor_tol: Tolerance) -> IndexedQuery<'_> {
-        let (precursor_lo, precursor_hi) = precursor_tol.bounds(precursor_mass);
+        let (precursor_lo, precursor_hi) = precursor_tol.theoretical_range(precursor_mass);
 
         let (pre_idx_lo, pre_idx_hi) = binary_search_slice(
             &self.peptides,
@@ -496,8 +496,9 @@ impl IndexedQuery<'_> {
         mass: f32,
         fragment_tol: Tolerance,
     ) -> impl Iterator<Item = Theoretical> + '_ {
-        let (fragment_lo, fragment_hi) = fragment_tol.bounds(mass);
-        let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
+        let (fragment_lo, fragment_hi) = fragment_tol.theoretical_range(mass);
+        let (precursor_lo, precursor_hi) =
+            self.precursor_tol.theoretical_range(self.precursor_mass);
 
         // Locate the left and right page indices that contain matching fragments
         // Note that we need to multiply by `bucket_size` to transform these into
@@ -586,7 +587,7 @@ impl IndexedQuery<'_> {
         windows: &[(f32, Tolerance)],
         mut on_match: impl FnMut(Theoretical),
     ) {
-        let (precursor_lo, _) = self.precursor_tol.bounds(self.precursor_mass);
+        let (precursor_lo, _) = self.precursor_tol.theoretical_range(self.precursor_mass);
         // binary_search_slice includes one predecessor at the lower boundary.
         // Convert to an exact half-open peptide-ID range before scanning pages.
         let exact_pre_idx_lo = self.pre_idx_lo
@@ -611,7 +612,7 @@ impl IndexedQuery<'_> {
             page_window.clear();
 
             for (wi, &(mass, fragment_tol)) in windows.iter().enumerate() {
-                let (fragment_lo, fragment_hi) = fragment_tol.bounds(mass);
+                let (fragment_lo, fragment_hi) = fragment_tol.theoretical_range(mass);
                 bounds.push((fragment_lo, fragment_hi));
 
                 let (left_page, right_page) = binary_search_slice(
@@ -879,6 +880,8 @@ mod test {
             (200.0, Tolerance::Ppm(-20.0, 20.0)),
             (1000.0, Tolerance::Da(-2000.0, 2000.0)),
             (3000.0, Tolerance::Da(0.0, 1.0)),
+            (130.0, Tolerance::Da(-1.0, 6.0)),
+            (240.0, Tolerance::Ppm(-5.0, 40_000.0)),
         ];
         for bucket_size in [1, 7, 8, 9, 31, 64, 256] {
             let mut ordered = fragments.clone();
@@ -905,11 +908,15 @@ mod test {
                 (1000.0, Tolerance::Da(-1.0, 1.0)),
                 (700.0, Tolerance::Da(-500.0, 500.0)),
                 (600.0, Tolerance::Ppm(-10.0, 10.0)),
+                // observed − theoretical windows that select the 500 (resp. 600) peptides;
+                // the mirrored window would select the other pair.
+                (550.0, Tolerance::Da(-1.0, 51.0)),
+                (550.0, Tolerance::Da(-51.0, 1.0)),
             ] {
-                let (lo, hi) = tol.bounds(mass);
+                let (lo, hi) = tol.theoretical_range(mass);
                 let mut expected = Vec::new();
                 for &(center, tolerance) in &windows {
-                    let (frag_lo, frag_hi) = tolerance.bounds(center);
+                    let (frag_lo, frag_hi) = tolerance.theoretical_range(center);
                     for f in &fragments {
                         let precursor = db[f.peptide_index].monoisotopic;
                         if precursor >= lo

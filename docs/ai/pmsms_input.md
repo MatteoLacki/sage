@@ -139,7 +139,8 @@ See [F9477 measurements](simd.md) for timing and memory validation.
 ## Per-precursor ppm tolerance
 
 The precursors table accepts two further **optional** columns: `ppm_tol_lo`,
-`ppm_tol_hi` (f64, signed — lo negative, hi positive). When both are present
+`ppm_tol_hi` (f64, signed — lo negative, hi positive; a window on
+observed − theoretical, see `docs/ai/tolerance_convention.md`). When both are present
 for a row, that precursor is searched with `Tolerance::Ppm(ppm_tol_lo,
 ppm_tol_hi)` instead of the run's global `--precursor_tol`; when either is
 missing (the common case — no upstream writer populates them yet), behavior

@@ -105,7 +105,9 @@ pub struct Search {
 /// Input search parameters deserialized from JSON file
 pub struct Input {
     pub database: Builder,
+    /// Window on `observed − theoretical` precursor mass.
     pub precursor_tol: Tolerance,
+    /// Window on `observed − theoretical` fragment mass.
     pub fragment_tol: Tolerance,
     pub report_psms: Option<usize>,
     pub chimera: Option<bool>,
@@ -153,26 +155,26 @@ pub struct Input {
     /// tof -> m/z table (mmappet, float32 or float64 column `mz`); required with `pmsms`.
     pub tof2mz: Option<String>,
     /// Path to a parquet file of externally-predicted peptide RT (columns:
-    /// sequence, rt), used to reject candidates whose predicted RT falls
-    /// outside `rt_tol_sec` of the observed spectrum's RT. Requires
+    /// sequence, rt), used to reject candidates whose `observed − predicted`
+    /// RT falls outside `rt_tol_sec`. Requires
     /// `rt_tol_sec` to be set. Independent of `predicted_iim` — either,
     /// both, or neither may be given.
     pub predicted_rt: Option<String>,
     /// Path to a parquet file of externally-predicted peptide IIM (columns:
-    /// sequence, charge, iim), used to reject candidates whose predicted
-    /// IIM falls outside `mobility_tol` of the observed spectrum's IIM.
+    /// sequence, charge, iim), used to reject candidates whose
+    /// `observed − predicted` IIM falls outside `mobility_tol`.
     /// Requires `mobility_tol` to be set. Independent of `predicted_rt`.
     pub predicted_iim: Option<String>,
-    /// RT tolerance window as a function of observed `scan_start_time`
-    /// (minutes — the spline's own grid is in that same unit, no
+    /// RT tolerance window on `observed − predicted`, as a function of
+    /// observed `scan_start_time` (minutes — the spline's own grid is in that same unit, no
     /// conversion). Spline *values* (the window width) are in **seconds**
     /// (converted to minutes internally at load time) — unit spelled out
     /// in the name since it differs from SAGE's internal minutes. A flat
     /// (value-independent) window is just a 2-node spline with identical
     /// values at both nodes — there is no separate flat-tolerance type.
     pub rt_tol_sec: Option<ValueTolSpline>,
-    /// IIM tolerance window as a function of observed
-    /// `Precursor::inverse_ion_mobility` (1/K0 — unambiguous, no unit
+    /// IIM tolerance window on `observed − predicted`, as a function of
+    /// observed `Precursor::inverse_ion_mobility` (1/K0 — unambiguous, no unit
     /// suffix needed, same unit for both the spline's grid and its values).
     pub mobility_tol: Option<ValueTolSpline>,
     /// Robust (MAD-based) scale of the `predicted_rt` residual as a
@@ -531,13 +533,6 @@ impl Input {
             }
             Tolerance::Da(lo, hi) => (*lo, *hi),
         };
-        if hi.abs() > lo.abs() {
-            log::warn!(
-                "Tolerances are applied to experimental masses, not theoretical: [{}, {}]",
-                lo,
-                hi
-            );
-        }
         if lo > 0.0 {
             log::warn!(
                 "The `left` tolerance should probably be negative, for example: [{}, {}]",

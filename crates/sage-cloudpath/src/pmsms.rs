@@ -15,7 +15,8 @@
 //!   one row per precursor with columns: precursor_idx(u64), mz(f64), rt(f64),
 //!   inv_ion_mobility(f64), charges(i64), fragment_spectrum_start(u64),
 //!   fragment_event_cnt(u64)
-//!   Two further columns, ppm_tol_lo(f64) and ppm_tol_hi(f64), are optional.
+//!   Two further columns, ppm_tol_lo(f64) and ppm_tol_hi(f64), are optional:
+//!   a window on observed − theoretical precursor mass, like `precursor_tol`.
 //!   When both are present in the schema, each row's `isolation_window` is
 //!   set to `Tolerance::Ppm(ppm_tol_lo, ppm_tol_hi)`; when either is absent,
 //!   `isolation_window` is `None` and the run's global `precursor_tol`
