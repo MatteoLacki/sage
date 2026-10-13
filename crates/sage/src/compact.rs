@@ -3,7 +3,7 @@
 //! `PeptideIx(i)` a monolithic search would assign. A full [`Peptide`] is only
 //! created on demand, by [`CompactPeptides::materialize`].
 
-use crate::database::Parameters;
+use crate::database::{IndexedDatabase, Parameters};
 use crate::enzyme::{Digest, EnzymeParameters, Position};
 use crate::fasta::Fasta;
 use crate::peptide::{Peptide, Site};
@@ -448,6 +448,43 @@ impl CompactPeptides {
         }
     }
 
+    /// `materialize` every row in `rows`, in order.
+    pub fn materialize_rows(&self, rows: std::ops::Range<usize>) -> Vec<Peptide> {
+        self.rows[rows]
+            .par_iter()
+            .map(|row| self.materialize(row))
+            .collect()
+    }
+
+    /// How many fragments `build_from_peptides` indexes for `row`: one per ion kind
+    /// per backbone cleavage, minus the first `min_ion_index` of each kind.
+    pub fn fragment_count(&self, row: &CompactPeptide) -> usize {
+        self.parameters.ion_kinds.len()
+            * (row.len().saturating_sub(1)).saturating_sub(self.parameters.min_ion_index)
+    }
+
+    /// An `IndexedDatabase` holding only `rows` (ascending), with proteins, and no
+    /// fragment index: what reporting needs once the search is over. Peptide `i` of
+    /// it is row `rows[i]`.
+    pub fn database_for_rows(&self, rows: &[usize]) -> IndexedDatabase {
+        let mut peptides: Vec<Peptide> = rows
+            .par_iter()
+            .map(|&row| self.materialize(&self.rows[row]))
+            .collect();
+        self.resolve_proteins(&mut peptides);
+        IndexedDatabase {
+            peptides,
+            fragment_mzs: Vec::new(),
+            fragment_peptide_indices: Vec::new(),
+            ion_kinds: self.parameters.ion_kinds.clone(),
+            min_value: Vec::new(),
+            potential_mods: self.parameters.variable_mod_list(),
+            bucket_size: self.parameters.bucket_size,
+            generate_decoys: self.parameters.generate_decoys,
+            decoy_tag: self.parameters.decoy_tag.clone(),
+        }
+    }
+
     /// Fill `proteins` exactly as `Parameters::digest` would: every protein whose own
     /// digest yields the peptide's target form with the same modifications.
     pub fn resolve_proteins(&self, peptides: &mut [Peptide]) {
@@ -829,6 +866,46 @@ MCQPEPTIDEK
             "generate_decoys": true,
             "decoy_tag": "rev_",
         }));
+    }
+
+    fn tryptic() -> serde_json::Value {
+        mods(serde_json::json!({
+            "enzyme": {"cleave_at": "KR", "restrict": "P", "missed_cleavages": 2, "min_len": 3, "max_len": 30},
+        }))
+    }
+
+    #[test]
+    fn fragment_count_matches_the_built_index() {
+        for config in [tryptic(), mods(serde_json::json!({"enzyme": {"cleave_at": "", "min_len": 4, "max_len": 9}}))] {
+            let fasta = Fasta::parse(FASTA.into(), "rev_", true);
+            let parameters = parameters(config);
+            let table = CompactPeptides::build(&parameters, &fasta).unwrap();
+            let counted: usize = table.rows.iter().map(|row| table.fragment_count(row)).sum();
+            let built = parameters
+                .clone()
+                .build_from_peptides(parameters.digest(&fasta))
+                .size();
+            assert_eq!(counted, built);
+        }
+    }
+
+    #[test]
+    fn database_for_rows_holds_exactly_those_rows() {
+        let fasta = Fasta::parse(FASTA.into(), "rev_", true);
+        let parameters = parameters(tryptic());
+        let expected = parameters.digest(&fasta);
+        let table = CompactPeptides::build(&parameters, &fasta).unwrap();
+        let rows: Vec<usize> = (0..table.rows.len()).step_by(3).collect();
+        let database = table.database_for_rows(&rows);
+        assert_eq!(database.peptides.len(), rows.len());
+        for (peptide, &row) in database.peptides.iter().zip(&rows) {
+            assert_eq!(
+                without_duplicate_attributes(peptide),
+                without_duplicate_attributes(&expected[row])
+            );
+        }
+        assert_eq!(database.decoy_tag, "rev_");
+        assert!(database.fragment_mzs.is_empty());
     }
 
     #[test]

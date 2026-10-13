@@ -91,6 +91,9 @@ pub struct Builder {
     pub prefilter: Option<bool>,
     /// Pre-filter the database with a minimal amount of memory at the cost of speed
     pub prefilter_low_memory: Option<bool>,
+    /// Hold the peptides as a `CompactPeptides` table and build/search the fragment
+    /// index one precursor-mass slice at a time
+    pub sliced: Option<bool>,
 }
 
 impl Builder {
@@ -112,6 +115,7 @@ impl Builder {
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
             prefilter: self.prefilter.unwrap_or(false),
             prefilter_low_memory: self.prefilter_low_memory.unwrap_or(true),
+            sliced: self.sliced.unwrap_or(false),
         }
     }
 
@@ -137,6 +141,7 @@ pub struct Parameters {
     pub prefilter_chunk_size: usize,
     pub prefilter: bool,
     pub prefilter_low_memory: bool,
+    pub sliced: bool,
 }
 
 impl Parameters {
@@ -1082,6 +1087,7 @@ mod test {
             prefilter: false,
             prefilter_chunk_size: 0,
             prefilter_low_memory: true,
+            sliced: false,
         };
 
         let peptides = params.digest(&fasta);

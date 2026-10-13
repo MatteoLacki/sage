@@ -610,6 +610,18 @@ impl Input {
                  Set `deisotope: false`, or remove `isotope_ladder`."
             );
         }
+        if database.sliced && database.prefilter {
+            anyhow::bail!(
+                "`database.sliced` and `database.prefilter` both bound the database's memory, \
+                 in incompatible ways -- set only one."
+            );
+        }
+        if database.sliced && self.wide_window.unwrap_or(false) {
+            anyhow::bail!(
+                "`database.sliced` needs narrow precursor windows: each slice is extended by \
+                 the widest window, which `wide_window` makes as wide as the isolation window."
+            );
+        }
         if self.unlimited_max_peaks.unwrap_or(false) && self.max_peaks.is_some() {
             anyhow::bail!(
                 "`unlimited_max_peaks: true` and `max_peaks` were both set -- \

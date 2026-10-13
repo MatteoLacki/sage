@@ -14,6 +14,7 @@ pub mod ms2_similarity;
 pub mod peptide;
 pub mod protein_grouping;
 pub mod scoring;
+pub mod slicing;
 pub mod spectrum;
 pub mod spline;
 pub mod tmt;

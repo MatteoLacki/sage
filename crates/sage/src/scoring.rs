@@ -325,6 +325,20 @@ impl Score {
     }
 }
 
+impl Feature {
+    /// The key `build_features` ranked this PSM by (`Score::rank_key`), rebuilt
+    /// from the RT/IIM z² terms it carries.
+    pub fn rank_key(&self, ranking_score: RankingScore) -> f64 {
+        match ranking_score {
+            RankingScore::Hyperscore => self.hyperscore,
+            RankingScore::CombinedScore => {
+                self.hyperscore
+                    - 0.5 * (self.delta_rt_z2_external as f64 + self.delta_ims_z2_external as f64)
+            }
+        }
+    }
+}
+
 pub struct Scorer<'db> {
     pub db: &'db IndexedDatabase,
     pub precursor_tol: Tolerance,
@@ -772,20 +786,18 @@ impl<'db> Scorer<'db> {
         precursor_charge: u8,
         precursor_tol: Tolerance,
     ) -> InitialHits {
-        if self.min_isotope_err != self.max_isotope_err {
-            let mut hits = (self.min_isotope_err..=self.max_isotope_err).fold(
-                InitialHits::default(),
-                |mut hits, isotope| {
-                    hits += self.matched_peaks_with_isotope(
-                        query,
-                        precursor_mass,
-                        precursor_charge,
-                        precursor_tol,
-                        isotope,
-                    );
-                    hits
-                },
-            );
+        let isotope_errors = self.searched_isotope_errors();
+        if isotope_errors.start() != isotope_errors.end() {
+            let mut hits = isotope_errors.fold(InitialHits::default(), |mut hits, isotope| {
+                hits += self.matched_peaks_with_isotope(
+                    query,
+                    precursor_mass,
+                    precursor_charge,
+                    precursor_tol,
+                    isotope,
+                );
+                hits
+            });
             self.trim_hits(&mut hits);
             hits
         } else {
@@ -794,9 +806,40 @@ impl<'db> Scorer<'db> {
                 precursor_mass,
                 precursor_charge,
                 precursor_tol,
-                0,
+                *isotope_errors.start(),
             )
         }
+    }
+
+    /// The precursor isotope errors every candidate window is searched at: the
+    /// configured range, or just 0 when that range is a single value.
+    fn searched_isotope_errors(&self) -> std::ops::RangeInclusive<i8> {
+        match self.min_isotope_err != self.max_isotope_err {
+            true => self.min_isotope_err..=self.max_isotope_err,
+            false => 0..=0,
+        }
+    }
+
+    /// The precursor charges a (non-wide-window) search tries for `precursor`.
+    pub fn candidate_charges(&self, precursor: &Precursor) -> std::ops::RangeInclusive<u8> {
+        match precursor.charge {
+            Some(charge) if !self.override_precursor_charge => charge..=charge,
+            _ => self.min_precursor_charge..=self.max_precursor_charge,
+        }
+    }
+
+    /// The monoisotopic-mass range holding every candidate a (non-wide-window)
+    /// search for `precursor` at `charge` can consider: the hull of its
+    /// isotope-error windows, computed exactly as `matched_peaks` queries them.
+    pub fn candidate_mass_window(&self, precursor: &Precursor, charge: u8) -> (f32, f32) {
+        let precursor_mass = (precursor.mz - PROTON) * charge as f32;
+        let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
+        let isotope_errors = self.searched_isotope_errors();
+        let (lowest, _) = precursor_tol
+            .theoretical_range(precursor_mass - *isotope_errors.end() as f32 * NEUTRON);
+        let (_, highest) = precursor_tol
+            .theoretical_range(precursor_mass - *isotope_errors.start() as f32 * NEUTRON);
+        (lowest, highest)
     }
 
     fn initial_hits(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> InitialHits {
@@ -818,18 +861,11 @@ impl<'db> Scorer<'db> {
                     hits
                 },
             )
-        } else if precursor.charge.is_some() && !self.override_precursor_charge {
-            let charge = precursor.charge.unwrap();
-            // Charge state is already annotated for this precusor, only search once
-            let precursor_mass = mz * charge as f32;
-            let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
-            self.matched_peaks(query, precursor_mass, charge, precursor_tol)
         } else {
-            // Not all selected ion precursors have charge states annotated (or user has set
-            // `override_precursor_charge`)
-            // assume it could be z=2, z=3, z=4 and search all three
+            // An annotated charge is searched once; an unannotated one (or any, under
+            // `override_precursor_charge`) at every charge in the configured range.
             let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
-            (self.min_precursor_charge..=self.max_precursor_charge).fold(
+            self.candidate_charges(precursor).fold(
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
                     let precursor_mass = mz * precursor_charge as f32;
@@ -1525,6 +1561,51 @@ mod tests {
         assert_eq!(run.longest, 3);
         run.matched(6);
         assert_eq!(run.length, 2);
+    }
+
+    #[test]
+    fn candidate_mass_window_holds_every_isotope_window() {
+        let database = IndexedDatabase::default();
+        for (min_isotope_err, max_isotope_err) in [(0, 3), (-1, 2), (0, 0), (2, 2)] {
+            for precursor_tol in [Tolerance::Ppm(-12.0, 12.0), Tolerance::Ppm(-3.0, 20.0), Tolerance::Da(-0.5, 0.1)] {
+                let scorer = Scorer {
+                    precursor_tol,
+                    min_isotope_err,
+                    max_isotope_err,
+                    ..mk_isotope_test_scorer(&database)
+                };
+                for mz in [400.123_f32, 777.7, 1203.95] {
+                    let precursor = Precursor {
+                        mz,
+                        charge: Some(2),
+                        ..Default::default()
+                    };
+                    let (lowest, highest) = scorer.candidate_mass_window(&precursor, 2);
+                    let precursor_mass = (mz - PROTON) * 2.0;
+                    for isotope_error in scorer.searched_isotope_errors() {
+                        let (lo, hi) = precursor_tol
+                            .theoretical_range(precursor_mass - isotope_error as f32 * NEUTRON);
+                        assert!(lowest <= lo && hi <= highest, "{lo}..{hi} outside {lowest}..{highest}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_charges_follow_annotation_and_override() {
+        let database = IndexedDatabase::default();
+        let scorer = Scorer {
+            min_precursor_charge: 2,
+            max_precursor_charge: 4,
+            ..mk_isotope_test_scorer(&database)
+        };
+        let annotated = Precursor { charge: Some(3), ..Default::default() };
+        let unannotated = Precursor::default();
+        assert_eq!(scorer.candidate_charges(&annotated), 3..=3);
+        assert_eq!(scorer.candidate_charges(&unannotated), 2..=4);
+        let overriding = Scorer { override_precursor_charge: true, ..scorer };
+        assert_eq!(overriding.candidate_charges(&annotated), 2..=4);
     }
 
     fn mk_isotope_test_scorer(database: &IndexedDatabase) -> Scorer<'_> {

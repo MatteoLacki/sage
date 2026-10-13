@@ -1,11 +1,13 @@
 use super::input::Search;
 use super::output::SageResults;
+use super::sliced_search;
 use super::telemetry;
 use anyhow::Context;
 use csv::ByteRecord;
 use log::info;
 use rayon::prelude::*;
 use sage_cloudpath::{FileFormat, Url};
+use sage_core::compact::{CompactPeptide, CompactPeptides};
 use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
@@ -25,22 +27,46 @@ use report_builder::{
     Report, ReportSection,
 };
 
+/// What a positional prediction file must match: this run's peptide row count
+/// and the `dumped_peptides_sha256` of the rows' masses (one SHA-256 pass over
+/// `monoisotopic`, no string formatting).
+struct PeptideRows {
+    count: usize,
+    fingerprint: String,
+}
+
+impl PeptideRows {
+    fn new(count: usize, masses: impl Iterator<Item = f32>) -> Self {
+        Self {
+            count,
+            fingerprint: sage_cloudpath::dumped_peptides_fingerprint::fingerprint_monoisotopic(
+                masses,
+            ),
+        }
+    }
+}
+
+/// Positional predictions resolved against this run's peptide rows: entry `i` of
+/// `rt`, and `i * charge_span + charge slot` of the others, belong to row `i`.
+#[derive(Default)]
+pub struct Predictions {
+    rt: Option<Vec<Option<f32>>>,
+    iim: Option<Vec<Option<f32>>>,
+    fragment_intensity_index: Option<Vec<Option<(u64, u64)>>>,
+}
+
 /// Verifies `(fingerprint, values)` (loaded from a positional
 /// `--predicted-rt`/`--predicted-iim`/`--predicted-fragment-intensity-index`
 /// file, see `sage_cloudpath::dumped_peptides_fingerprint`) was built
-/// against the *same* digest `db` just produced, before any of `values`'
-/// row positions are trusted as `PeptideIx`. Cheap: a single SHA-256 pass
-/// over `db.peptides`' `monoisotopic` fields, no string formatting.
+/// against the *same* digest this run's peptide `rows` come from, before any
+/// of `values`' row positions are trusted as `PeptideIx`.
 fn verify_dumped_peptides_fingerprint(
-    db: &IndexedDatabase,
+    rows: &PeptideRows,
     fingerprint: &str,
     file_label: &str,
 ) -> anyhow::Result<()> {
-    let actual = sage_cloudpath::dumped_peptides_fingerprint::fingerprint_monoisotopic(
-        db.peptides.iter().map(|p| p.monoisotopic),
-    );
     anyhow::ensure!(
-        actual == fingerprint,
+        rows.fingerprint == fingerprint,
         "{file_label} was built from a different `dumped_peptides` digest than this run's own \
          (`dumped_peptides_sha256` mismatch) -- regenerate it against this run's `--fasta` and \
          `database` config before retrying."
@@ -53,15 +79,15 @@ fn verify_dumped_peptides_fingerprint(
 /// string formatting or lookup at all -- see
 /// `docs/ai/dumped_peptides_positional_predictions.md`.
 fn resolve_predicted_rt(
-    db: &IndexedDatabase,
+    rows: &PeptideRows,
     (fingerprint, values): &(String, Vec<f32>),
 ) -> anyhow::Result<Vec<Option<f32>>> {
-    verify_dumped_peptides_fingerprint(db, fingerprint, "predicted_rt.parquet")?;
+    verify_dumped_peptides_fingerprint(rows, fingerprint, "predicted_rt.parquet")?;
     anyhow::ensure!(
-        values.len() == db.peptides.len(),
+        values.len() == rows.count,
         "predicted_rt.parquet has {} rows, expected one per peptide ({})",
         values.len(),
-        db.peptides.len()
+        rows.count
     );
     Ok(values.iter().map(|&v| Some(v)).collect())
 }
@@ -74,20 +100,20 @@ fn resolve_predicted_rt(
 /// lookup; now it's a length check and a direct copy -- see
 /// `docs/ai/dumped_peptides_positional_predictions.md`.
 fn resolve_predicted_iim(
-    db: &IndexedDatabase,
+    rows: &PeptideRows,
     (fingerprint, values): &(String, Vec<f32>),
     min_charge: u8,
     max_charge: u8,
 ) -> anyhow::Result<Vec<Option<f32>>> {
-    verify_dumped_peptides_fingerprint(db, fingerprint, "predicted_iim.parquet")?;
+    verify_dumped_peptides_fingerprint(rows, fingerprint, "predicted_iim.parquet")?;
     let charge_span = (max_charge - min_charge + 1) as usize;
     anyhow::ensure!(
-        values.len() == db.peptides.len() * charge_span,
+        values.len() == rows.count * charge_span,
         "predicted_iim.parquet has {} rows, expected {} peptides x {} charges ({})",
         values.len(),
-        db.peptides.len(),
+        rows.count,
         charge_span,
-        db.peptides.len() * charge_span
+        rows.count * charge_span
     );
     Ok(values.iter().map(|&v| Some(v)).collect())
 }
@@ -97,26 +123,29 @@ fn resolve_predicted_iim(
 /// where the shared cache has no entry for that pair -- see
 /// `docs/ai/predicted_fragment_intensity.md`).
 fn resolve_predicted_fragment_intensity(
-    db: &IndexedDatabase,
+    rows: &PeptideRows,
     (fingerprint, values): &(String, Vec<Option<(u64, u64)>>),
     min_charge: u8,
     max_charge: u8,
 ) -> anyhow::Result<Vec<Option<(u64, u64)>>> {
-    verify_dumped_peptides_fingerprint(db, fingerprint, "fragment_intensity_for_sage.parquet")?;
+    verify_dumped_peptides_fingerprint(rows, fingerprint, "fragment_intensity_for_sage.parquet")?;
     let charge_span = (max_charge - min_charge + 1) as usize;
     anyhow::ensure!(
-        values.len() == db.peptides.len() * charge_span,
+        values.len() == rows.count * charge_span,
         "fragment_intensity_for_sage.parquet has {} rows, expected {} peptides x {} charges ({})",
         values.len(),
-        db.peptides.len(),
+        rows.count,
         charge_span,
-        db.peptides.len() * charge_span
+        rows.count * charge_span
     );
     Ok(values.clone())
 }
 
 pub struct Runner {
     pub database: IndexedDatabase,
+    /// With `database.sliced`, the whole peptide table. `database` is then empty
+    /// until the search is over, and afterwards holds only the reported peptides.
+    pub compact: Option<CompactPeptides>,
     pub parameters: Search,
     /// Externally-predicted, positional (`(dumped_peptides_sha256,
     /// values)`, row `i` = `database.peptides[i]` -- see
@@ -279,6 +308,26 @@ impl Runner {
             None => None,
         };
 
+        if parameters.database.sliced {
+            let compact = CompactPeptides::build(&parameters.database, &fasta)?;
+            info!(
+                "compacted {} peptides ({:.2} GB) in {:#?}",
+                compact.rows.len(),
+                (compact.rows.len() * std::mem::size_of::<CompactPeptide>()) as f64 / 1e9,
+                start.elapsed()
+            );
+            return Ok(Self {
+                database: IndexedDatabase::default(),
+                compact: Some(compact),
+                parameters,
+                predicted_rt,
+                predicted_iim,
+                predicted_fragment_intensity_index,
+                predicted_fragment_intensity_arrays,
+                start,
+            });
+        }
+
         let database = match parameters.database.prefilter {
             false => parameters.database.clone().build(fasta),
             true => {
@@ -300,6 +349,7 @@ impl Runner {
                     // for the real search below.
                     let mini_runner = Self {
                         database: IndexedDatabase::default(),
+                        compact: None,
                         parameters: parameters.clone(),
                         predicted_rt: predicted_rt.clone(),
                         predicted_iim: predicted_iim.clone(),
@@ -321,6 +371,7 @@ impl Runner {
         );
         Ok(Self {
             database,
+            compact: None,
             parameters,
             predicted_rt,
             predicted_iim,
@@ -737,80 +788,93 @@ impl Runner {
             .collect::<SageResults>()
     }
 
-    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-        // Resolved once here, against the final `database` -- positional
-        // (row `i` = `database.peptides[i]`) since 2026-09-08, verified via
-        // a cheap `dumped_peptides_sha256` fingerprint check instead of the
-        // `Peptide::to_string()` (unimod-lookup-per-residue) + `HashMap`
-        // lookup this used to do per peptide (a real F9477 comparison found
-        // that combined RT+IIM resolution added +37%/152s to `run_sage`'s
-        // wall time). See `docs/ai/dumped_peptides_positional_predictions.md`,
-        // `evict_rt_iim_mismatches` (`scoring.rs`), and
-        // plans/rt_iim_independent_dimensions.md.
-        //
-        // `.take()`, not `.as_ref()` -- `run()` owns `self` and this is the
-        // only remaining use of the raw loaded (fingerprint, values) pairs
-        // in this call path (unlike `prefilter_peptides`, which can't use
-        // them at all -- see its own entry). Taking them here drops the
-        // source `Vec`s as soon as resolution finishes, before the long
-        // per-file search loop below runs.
-        let predicted_rt_by_idx = self
-            .predicted_rt
-            .take()
-            .map(|map| resolve_predicted_rt(&self.database, &map))
-            .transpose()?;
-        let predicted_iim_by_idx = self
-            .predicted_iim
-            .take()
-            .map(|map| {
-                resolve_predicted_iim(
-                    &self.database,
-                    &map,
-                    self.parameters.precursor_charge.0,
-                    self.parameters.precursor_charge.1,
-                )
-            })
-            .transpose()?;
-        let predicted_fragment_intensity_by_idx = self
-            .predicted_fragment_intensity_index
-            .take()
-            .map(|map| {
-                resolve_predicted_fragment_intensity(
-                    &self.database,
-                    &map,
-                    self.parameters.precursor_charge.0,
-                    self.parameters.precursor_charge.1,
-                )
-            })
-            .transpose()?;
-        // Borrowed, not taken -- `Scorer` needs `&'db [u8]`/`&'db [f16]`
-        // slices, and the owning `FragmentIntensityArrays` (with its mmap
-        // handles) must stay alive on `self` for the rest of this run.
-        let predicted_fragment_intensity_annotation_id = self
-            .predicted_fragment_intensity_arrays
-            .as_ref()
-            .map(|arrays| arrays.annotation_id);
-        let predicted_fragment_intensity_slice = self
-            .predicted_fragment_intensity_arrays
-            .as_ref()
-            .map(|arrays| arrays.predicted_intensity);
+    /// The row count and fingerprint of this run's peptide table, whichever form it is in.
+    fn peptide_rows(&self) -> PeptideRows {
+        match &self.compact {
+            Some(table) => PeptideRows::new(
+                table.rows.len(),
+                table.rows.iter().map(|row| row.monoisotopic),
+            ),
+            None => PeptideRows::new(
+                self.database.peptides.len(),
+                self.database.peptides.iter().map(|p| p.monoisotopic),
+            ),
+        }
+    }
 
-        let scorer = Scorer {
-            db: &self.database,
+    /// Resolved once, against the final peptide rows -- positional (row `i` =
+    /// `PeptideIx(i)`) since 2026-09-08, verified via a cheap
+    /// `dumped_peptides_sha256` fingerprint check instead of the
+    /// `Peptide::to_string()` (unimod-lookup-per-residue) + `HashMap` lookup this
+    /// used to do per peptide (a real F9477 comparison found that combined RT+IIM
+    /// resolution added +37%/152s to `run_sage`'s wall time). See
+    /// `docs/ai/dumped_peptides_positional_predictions.md`,
+    /// `evict_rt_iim_mismatches` (`scoring.rs`), and
+    /// plans/rt_iim_independent_dimensions.md.
+    ///
+    /// `.take()`, not `.as_ref()`: this is the only use of the raw loaded
+    /// (fingerprint, values) pairs in this call path (unlike `prefilter_peptides`,
+    /// which can't use them at all -- see its own entry), so their source `Vec`s
+    /// are dropped before the long per-file search loop runs.
+    fn resolve_predictions(&mut self) -> anyhow::Result<Predictions> {
+        let any_configured = self.predicted_rt.is_some()
+            || self.predicted_iim.is_some()
+            || self.predicted_fragment_intensity_index.is_some();
+        if !any_configured {
+            return Ok(Predictions::default());
+        }
+        let rows = self.peptide_rows();
+        let (min_charge, max_charge) = self.parameters.precursor_charge;
+        Ok(Predictions {
+            rt: self
+                .predicted_rt
+                .take()
+                .map(|map| resolve_predicted_rt(&rows, &map))
+                .transpose()?,
+            iim: self
+                .predicted_iim
+                .take()
+                .map(|map| resolve_predicted_iim(&rows, &map, min_charge, max_charge))
+                .transpose()?,
+            fragment_intensity_index: self
+                .predicted_fragment_intensity_index
+                .take()
+                .map(|map| resolve_predicted_fragment_intensity(&rows, &map, min_charge, max_charge))
+                .transpose()?,
+        })
+    }
+
+    /// A `Scorer` over `db`, whose peptide `i` is row `first_row + i` of this run's
+    /// peptide table, reading the predictions at those rows.
+    pub(crate) fn make_scorer<'a>(
+        &'a self,
+        db: &'a IndexedDatabase,
+        first_row: usize,
+        predictions: &'a Predictions,
+    ) -> Scorer<'a> {
+        let rows = first_row..first_row + db.peptides.len();
+        let (min_charge, max_charge) = self.parameters.precursor_charge;
+        let charge_span = (max_charge - min_charge + 1) as usize;
+        let charge_slots = rows.start * charge_span..rows.end * charge_span;
+        Scorer {
+            db,
             precursor_tol: self.parameters.precursor_tol,
             fragment_tol: self.parameters.fragment_tol,
             min_matched_peaks: self.parameters.min_matched_peaks,
             min_isotope_err: self.parameters.isotope_errors.0,
             max_isotope_err: self.parameters.isotope_errors.1,
-            min_precursor_charge: self.parameters.precursor_charge.0,
-            max_precursor_charge: self.parameters.precursor_charge.1,
+            min_precursor_charge: min_charge,
+            max_precursor_charge: max_charge,
             override_precursor_charge: self.parameters.override_precursor_charge,
             max_fragment_charge: self.parameters.max_fragment_charge,
             chimera: self.parameters.chimera,
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
-            predicted_rt: predicted_rt_by_idx.as_deref(),
-            predicted_iim: predicted_iim_by_idx.as_deref(),
+            predicted_rt: predictions.rt.as_deref().map(|rt| &rt[rows.clone()]),
+            predicted_iim: predictions
+                .iim
+                .as_deref()
+                .map(|iim| &iim[charge_slots.clone()]),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
             rt_sigma: self.parameters.rt_sigma.clone(),
@@ -819,13 +883,56 @@ impl Runner {
             isotope_ladder: self.parameters.isotope_ladder,
             score_type: self.parameters.score_type,
             ranking_score: self.parameters.ranking_score,
-            predicted_fragment_intensity_index: predicted_fragment_intensity_by_idx.as_deref(),
-            predicted_fragment_intensity_annotation_id,
-            predicted_fragment_intensity: predicted_fragment_intensity_slice,
-        };
+            predicted_fragment_intensity_index: predictions
+                .fragment_intensity_index
+                .as_deref()
+                .map(|index| &index[charge_slots.clone()]),
+            // Borrowed, not taken -- the owning `FragmentIntensityArrays` (with its
+            // mmap handles) must stay alive on `self` for the rest of this run.
+            predicted_fragment_intensity_annotation_id: self
+                .predicted_fragment_intensity_arrays
+                .as_ref()
+                .map(|arrays| arrays.annotation_id),
+            predicted_fragment_intensity: self
+                .predicted_fragment_intensity_arrays
+                .as_ref()
+                .map(|arrays| arrays.predicted_intensity),
+        }
+    }
+
+    fn batch_files_sliced(
+        &self,
+        table: &CompactPeptides,
+        predictions: &Predictions,
+        batch_size: usize,
+    ) -> anyhow::Result<SageResults> {
+        self.parameters
+            .mzml_paths
+            .chunks(batch_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                let features = sliced_search::search(self, table, predictions, &msn)?;
+                Ok(self.complete_features(msn, ms1, features))
+            })
+            .collect()
+    }
+
+    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        let predictions = self.resolve_predictions()?;
 
         //Collect all results into a single container
-        let mut outputs = self.batch_files(&scorer, parallel);
+        let mut outputs = match &self.compact {
+            None => {
+                let scorer = self.make_scorer(&self.database, 0, &predictions);
+                self.batch_files(&scorer, parallel)
+            }
+            Some(table) => self.batch_files_sliced(table, &predictions, parallel)?,
+        };
+        drop(predictions);
+        if let Some(table) = self.compact.take() {
+            self.database = sliced_search::reported_database(&table, &mut outputs.features);
+        }
 
         let alignments = if self.parameters.predict_rt {
             // Poisson probability is usually the best single feature for refining FDR.

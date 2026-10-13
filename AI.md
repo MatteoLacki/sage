@@ -60,6 +60,7 @@ lives in `docs/ai/`, one file per topic:
 | `docs/ai/dump_peptides.md` | `dump_peptides` binary's mass-sorted output (for a separate consumer); necroflow's structural (not content-addressed) provenance hashing |
 | `docs/ai/dump_fragment_index.md` | `dump_fragment_index` binary: ppm-binned precursor-mass x fragment-mass occupancy grid of the fragment index, mmappet flat-column output (diagnostic only) |
 | `docs/ai/database_size.md` | `database_size` binary: per-peptide-length digest+build sizing (exact sums, bounded peak RSS); unspecific human immunopeptidomics measurements (class I ~42 GB, class II ~275 GB) |
+| `docs/ai/sliced_search.md` | `database.sliced`: build and search the fragment index one precursor-mass slice of a `CompactPeptides` table at a time (`slicing.rs`, `sliced_search.rs`); why each slice reproduces the global candidate range exactly; per-charge queries for unannotated spectra; F9477/G23 exactness and scale measurements |
 | `docs/ai/compact_peptides.md` | `CompactPeptides` (`compact.rs`): 16 B rows over one proteome copy in sage's exact row order, `materialize`/`resolve_proteins` via sage's own code, per-length build + merge, arbitrary duplicate attributes, `verify_compact_peptides` results |
 | `docs/ai/simd.md` | Fragment-index search performance: SoA/AVX2 page scan, interleaved peptide-ID bound resolution, `bucket_size` sizing, and the F9477/F9468 benchmarks |
 | `docs/ai/reuse_index_bins.md` | `page_search_batch`: sharing one page's precursor-scoped range across a spectrum's fragment windows |
