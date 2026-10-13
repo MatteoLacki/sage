@@ -103,10 +103,24 @@ pub fn read_tdf<S: AsRef<str>>(
     bruker_spectrum_processor: BrukerProcessingConfig,
     requires_ms1: bool,
 ) -> Result<Vec<RawSpectrum>, Error> {
-    let res = crate::tdf::TdfReader.parse(s, file_id, bruker_spectrum_processor, requires_ms1);
+    let res = crate::tdf::TdfReader.parse(
+        local_path(s.as_ref()),
+        file_id,
+        bruker_spectrum_processor,
+        requires_ms1,
+    );
     match res {
         Ok(t) => Ok(t),
         Err(e) => Err(Error::TDF(e)),
+    }
+}
+
+/// timsrust opens filesystem paths only, while inputs arrive as URLs (`to_url`):
+/// a `file://` URL becomes its path, anything else is passed through unchanged.
+fn local_path(s: &str) -> String {
+    match crate::Url::parse(s).ok().and_then(|url| url.to_file_path().ok()) {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => s.to_string(),
     }
 }
 
@@ -187,5 +201,12 @@ mod test {
         assert_eq!(FileFormat::from("foo.tdf"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d/"), FileFormat::TDF);
+    }
+
+    #[test]
+    fn tdf_inputs_are_opened_by_local_path() {
+        assert_eq!(local_path("file:///data/run.d"), "/data/run.d");
+        assert_eq!(local_path("/data/run.d"), "/data/run.d");
+        assert_eq!(local_path("relative/run.d"), "relative/run.d");
     }
 }
