@@ -160,6 +160,22 @@ impl Parameters {
         };
     }
 
+    /// The same parameters, digesting only peptides of exactly `length` residues.
+    pub fn for_single_length(&self, length: usize) -> Parameters {
+        let mut single_length = self.clone();
+        single_length.enzyme.min_len = Some(length);
+        single_length.enzyme.max_len = Some(length);
+        single_length
+    }
+
+    /// Every (site, mass) variable modification, one entry per configured mass.
+    pub fn variable_mod_list(&self) -> Vec<(ModificationSpecificity, f32)> {
+        self.variable_mods
+            .iter()
+            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
+            .collect()
+    }
+
     pub fn digest(&self, fasta: &Fasta) -> Vec<Peptide> {
         log::trace!("digesting fasta");
         let enzyme = self.enzyme.clone().into();
@@ -176,11 +192,7 @@ impl Parameters {
             digests.len()
         );
 
-        let mods = self
-            .variable_mods
-            .iter()
-            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
-            .collect::<Vec<_>>();
+        let mods = self.variable_mod_list();
 
         let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
         digests

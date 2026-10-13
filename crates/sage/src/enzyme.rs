@@ -32,6 +32,9 @@ pub struct DigestGroup {
 
 pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
     let mut groups = Vec::new();
+    if digests.is_empty() {
+        return groups;
+    }
     digests.sort_unstable_by(|a, b| {
         a.position
             .cmp(&b.position)

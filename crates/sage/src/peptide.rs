@@ -126,14 +126,14 @@ impl Peptide {
         }
     }
 
-    fn modification_mass(&self) -> f32 {
+    pub(crate) fn modification_mass(&self) -> f32 {
         self.modifications.iter().sum::<f32>()
             + self.nterm.unwrap_or(0.0)
             + self.cterm.unwrap_or(0.0)
     }
 
     /// Apply all variable mods in `sites` to self
-    fn apply_site(&mut self, site: Site, mass: f32) {
+    pub(crate) fn apply_site(&mut self, site: Site, mass: f32) {
         match site {
             Site::Nterm => {
                 if self.nterm.is_none() {
@@ -207,7 +207,7 @@ impl Peptide {
         }
     }
 
-    fn static_mods(&mut self, target: ModificationSpecificity, mass: f32) {
+    pub(crate) fn static_mods(&mut self, target: ModificationSpecificity, mass: f32) {
         match (target, self.position) {
             (ModificationSpecificity::PeptideN(None), _) => self.apply_site(Site::Nterm, mass),
             (ModificationSpecificity::PeptideN(Some(resi)), _)
@@ -333,7 +333,7 @@ fn no_duplicates(combination: &Vec<&(Site, f32)>) -> bool {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Site {
+pub(crate) enum Site {
     Nterm,
     Cterm,
     Sequence(u32),

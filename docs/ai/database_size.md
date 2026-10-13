@@ -6,7 +6,8 @@ own `Parameters::digest` + `build_from_peptides` once per peptide length
 (`enzyme.min_len = enzyme.max_len = L`). It prints a TSV with one row per length and
 a `total` row:
 `length, target_peptides, decoy_peptides, fragments, pages, fragment_index_gb,
-peptides_gb, digest_s, build_s, peak_rss_gb`.
+peptides_gb, compact_gb, digest_s, build_s, peak_rss_gb`. `compact_gb` is the same
+peptides as 16 B `CompactPeptide` rows (`compact_peptides.md`).
 
 ## Why per length is exact
 

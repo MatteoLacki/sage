@@ -1,5 +1,7 @@
 use clap::{Arg, Command, ValueHint};
-use sage_core::database::{Builder, IndexedDatabase, Parameters};
+use sage_cli::process_memory::{peak_rss_bytes, reset_peak_rss};
+use sage_core::compact::CompactPeptide;
+use sage_core::database::{Builder, IndexedDatabase};
 use sage_core::enzyme::EnzymeParameters;
 use sage_core::peptide::Peptide;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use std::time::Instant;
 ///
 /// Prints a TSV to stdout, one row per length plus a `total` row. Byte columns
 /// are estimates from struct sizes and allocation capacities, ignoring
-/// allocator rounding. `peak_rss_gb` is the process high-water mark during
+/// allocator rounding; `compact_gb` is the same peptides as [`CompactPeptide`] rows. `peak_rss_gb` is the process high-water mark during
 /// that length's digest+build (reset between lengths via
 /// `/proc/self/clear_refs`), so it includes the FASTA held throughout.
 fn main() -> anyhow::Result<()> {
@@ -89,12 +91,12 @@ fn main() -> anyhow::Result<()> {
     let enzyme: EnzymeParameters = params.enzyme.clone().into();
 
     println!(
-        "length\ttarget_peptides\tdecoy_peptides\tfragments\tpages\tfragment_index_gb\tpeptides_gb\tdigest_s\tbuild_s\tpeak_rss_gb"
+        "length\ttarget_peptides\tdecoy_peptides\tfragments\tpages\tfragment_index_gb\tpeptides_gb\tcompact_gb\tdigest_s\tbuild_s\tpeak_rss_gb"
     );
     let mut total = LengthSize::default();
     for length in enzyme.min_len..=enzyme.max_len {
         reset_peak_rss()?;
-        let length_params = params_for_single_length(&params, length);
+        let length_params = params.for_single_length(length);
 
         let digest_start = Instant::now();
         let peptides = length_params.digest(&fasta);
@@ -111,13 +113,6 @@ fn main() -> anyhow::Result<()> {
     total.print("total");
 
     Ok(())
-}
-
-fn params_for_single_length(params: &Parameters, length: usize) -> Parameters {
-    let mut length_params = params.clone();
-    length_params.enzyme.min_len = Some(length);
-    length_params.enzyme.max_len = Some(length);
-    length_params
 }
 
 #[derive(Default)]
@@ -171,10 +166,14 @@ impl LengthSize {
         self.peak_rss_bytes = self.peak_rss_bytes.max(other.peak_rss_bytes);
     }
 
+    fn compact_bytes(&self) -> usize {
+        (self.target_peptides + self.decoy_peptides) * std::mem::size_of::<CompactPeptide>()
+    }
+
     fn print(&self, label: &str) {
         const GB: f64 = 1e9;
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.3}",
+            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.3}",
             label,
             self.target_peptides,
             self.decoy_peptides,
@@ -182,6 +181,7 @@ impl LengthSize {
             self.pages,
             self.fragment_index_bytes as f64 / GB,
             self.peptides_bytes as f64 / GB,
+            self.compact_bytes() as f64 / GB,
             self.digest_seconds,
             self.build_seconds,
             self.peak_rss_bytes as f64 / GB,
@@ -198,24 +198,4 @@ fn peptide_heap_bytes(peptide: &Peptide) -> usize {
         + peptide.sequence.len()
         + peptide.modifications.capacity() * std::mem::size_of::<f32>()
         + peptide.proteins.capacity() * std::mem::size_of::<Arc<str>>()
-}
-
-/// Linux: writing "5" to `/proc/self/clear_refs` resets `VmHWM` to the current RSS.
-fn reset_peak_rss() -> std::io::Result<()> {
-    std::fs::write("/proc/self/clear_refs", "5")
-}
-
-fn peak_rss_bytes() -> anyhow::Result<usize> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
-    let line = status
-        .lines()
-        .find(|line| line.starts_with("VmHWM:"))
-        .ok_or_else(|| anyhow::anyhow!("no VmHWM line in /proc/self/status"))?;
-    let kilobytes: usize = line
-        .trim_start_matches("VmHWM:")
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()?;
-    Ok(kilobytes * 1024)
 }
