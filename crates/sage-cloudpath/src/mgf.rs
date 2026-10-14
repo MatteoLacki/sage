@@ -330,16 +330,30 @@ impl MgfReader {
         Self { file_id }
     }
 
+    /// Every spectrum of a whole MGF document.
     pub fn parse(&self, contents: String) -> Result<Vec<RawSpectrum>, MgfError> {
+        let starts = block_starts(&contents);
+        let header_end = starts.first().copied().unwrap_or(contents.len());
+        let defaults = self.parse_header(&contents[..header_end]);
+        let ends = starts
+            .iter()
+            .skip(1)
+            .copied()
+            .chain(std::iter::once(contents.len()));
+        Ok(starts
+            .iter()
+            .zip(ends)
+            .filter_map(|(&start, end)| self.parse_block(&defaults, &contents[start..end]))
+            .collect())
+    }
+
+    /// File-level parameters (`CHARGE=`, `TOL=`, `TOLU=`) from the lines before the first
+    /// `BEGIN IONS`; they apply to every spectrum that doesn't set its own.
+    pub fn parse_header(&self, header: &str) -> DefaultParams {
         let default_parsers = DefaultParser.get_parsers();
-        let query_parsers = QueryParser.get_parsers();
-
         let mut default_params = DefaultParams::default_with_file_id(self.file_id);
-        let mut lines = contents.as_str().lines();
-
-        // embedded parameters
-        while !default_params.is_query_start {
-            let line = lines.next().unwrap().trim();
+        for line in header.lines() {
+            let line = line.trim();
             for parser in &default_parsers {
                 match parser(line, &mut default_params) {
                     Ok(true) => break,
@@ -348,11 +362,17 @@ impl MgfReader {
                 }
             }
         }
+        default_params
+    }
 
-        let mut query_data = QueryData::default_with_params(default_params);
-
-        // query
-        for line in lines {
+    /// The spectrum of the `BEGIN IONS` block that starts `block`, or `None` if it is
+    /// malformed. Text after its `END IONS` is ignored, so `block` may run up to the next
+    /// block's start.
+    pub fn parse_block(&self, defaults: &DefaultParams, block: &str) -> Option<RawSpectrum> {
+        let query_parsers = QueryParser.get_parsers();
+        let mut query_data = QueryData::default_with_params(defaults.clone());
+        query_data.init();
+        for line in block.lines() {
             if line.is_empty() {
                 continue;
             }
@@ -364,9 +384,30 @@ impl MgfReader {
                     Err(err) => eprintln!("{}", err),
                 }
             }
+            if line.starts_with("END IONS") {
+                break;
+            }
         }
-        Ok(query_data.spectra)
+        query_data.spectra.pop()
     }
+}
+
+/// Whether `line` opens a spectrum.
+pub fn is_block_start(line: &str) -> bool {
+    line.trim_start().starts_with("BEGIN IONS")
+}
+
+/// Byte offsets of the lines of `text` that open a spectrum.
+fn block_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if is_block_start(line) {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -451,6 +492,29 @@ mod test {
         let s = spectra.pop().unwrap();
 
         run_asserts_for_spectrum_0(&s);
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_parse_alone_as_in_their_file() -> Result<(), MgfError> {
+        let content = "COM=header\nCHARGE=3+\n\
+BEGIN IONS\nTITLE=first\nPEPMASS=500.25\n100.5 10\n200.5 20\nEND IONS\n\
+BEGIN IONS\nTITLE=second\nPEPMASS=600.25\nCHARGE=2+\n150.5 15\nEND IONS\n";
+        let reader = MgfReader::with_file_id(0);
+        let whole = reader.parse(content.to_string())?;
+
+        assert_eq!(whole.len(), 2);
+        // File-level CHARGE= reaches the first spectrum too.
+        assert_eq!(whole[0].precursors[0].charge, Some(3));
+        assert_eq!(whole[1].precursors[0].charge, Some(2));
+
+        let header_end = content.find("BEGIN IONS").unwrap();
+        let second_start = content.rfind("BEGIN IONS").unwrap();
+        let defaults = reader.parse_header(&content[..header_end]);
+        let first = reader.parse_block(&defaults, &content[header_end..second_start]);
+        let second = reader.parse_block(&defaults, &content[second_start..]);
+        assert_eq!(format!("{:?}", first.unwrap()), format!("{:?}", whole[0]));
+        assert_eq!(format!("{:?}", second.unwrap()), format!("{:?}", whole[1]));
         Ok(())
     }
 

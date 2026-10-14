@@ -7,6 +7,7 @@ use anyhow::Context;
 use csv::ByteRecord;
 use log::info;
 use rayon::prelude::*;
+use sage_cloudpath::text_spectra::{TextFormat, TextReader, TextSpectra};
 use sage_cloudpath::{FileFormat, Url};
 use sage_core::compact::{CompactPeptide, CompactPeptides};
 use sage_core::database::{IndexedDatabase, Parameters};
@@ -234,27 +235,56 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
 enum IndexedSpectra {
     Pmsms(sage_cloudpath::pmsms::PmsmsSpectra),
     Tdf(sage_cloudpath::tdf::TdfSpectra),
+    /// mzML or MGF, plain or gzipped.
+    Text(TextSpectra),
     /// A file that failed to open; logged, and searched as empty like the batch reader does.
     Unreadable,
 }
+
+/// One thread's state for reading `IndexedSpectra`: text files keep a buffer and a gzip
+/// decompressor that moves forward through the thread's run of indices.
+type IndexedReader<'a> = Option<TextReader<'a>>;
 
 impl IndexedSpectra {
     fn len(&self) -> usize {
         match self {
             Self::Pmsms(spectra) => spectra.len(),
             Self::Tdf(spectra) => spectra.len(),
+            Self::Text(spectra) => spectra.len(),
             Self::Unreadable => 0,
         }
     }
 
+    fn reader(&self) -> IndexedReader<'_> {
+        match self {
+            Self::Text(spectra) => Some(spectra.reader()),
+            _ => None,
+        }
+    }
+
     /// Spectrum `index`, processed; `None` for one the batch reader skips as well.
-    fn processed(&self, index: usize, processor: &SpectrumProcessor) -> Option<ProcessedSpectrum> {
+    fn processed<'a>(
+        &'a self,
+        index: usize,
+        processor: &SpectrumProcessor,
+        reader: &mut IndexedReader<'a>,
+    ) -> Option<ProcessedSpectrum> {
         match self {
             Self::Pmsms(spectra) => match spectra.read(index, |raw| processor.process(raw)) {
                 Ok(spectrum) => Some(spectrum),
                 Err(error) => panic!("cannot read pmsms spectrum {index}: {error}"),
             },
             Self::Tdf(spectra) => spectra.read(index).map(|raw| processor.process(raw)),
+            Self::Text(spectra) => {
+                let reader = reader.as_mut().expect("text files read through a TextReader");
+                match spectra.read(index, reader) {
+                    Ok(spectrum) => spectrum.map(|raw| processor.process(raw)),
+                    Err(error) => {
+                        log::error!("cannot read spectrum {index}: {error}");
+                        None
+                    }
+                }
+            }
             Self::Unreadable => None,
         }
     }
@@ -739,11 +769,28 @@ impl Runner {
                 Err(error) => panic!("cannot read pmsms input {}: {}", paths.pmsms.display(), error),
             };
         }
-        if FileFormat::from(file.as_str()) != FileFormat::TDF {
-            return None;
-        }
-        match sage_cloudpath::util::open_tdf_spectra(file.as_str(), file_id, self.parameters.bruker_config) {
-            Ok(spectra) => Some(IndexedSpectra::Tdf(spectra)),
+        let text_format = match FileFormat::from(file.as_str()) {
+            FileFormat::TDF => {
+                return match sage_cloudpath::util::open_tdf_spectra(
+                    file.as_str(),
+                    file_id,
+                    self.parameters.bruker_config,
+                ) {
+                    Ok(spectra) => Some(IndexedSpectra::Tdf(spectra)),
+                    Err(error) => {
+                        log::error!("- {}: {}", file, error);
+                        Some(IndexedSpectra::Unreadable)
+                    }
+                };
+            }
+            FileFormat::MzML => TextFormat::MzML,
+            FileFormat::MGF => TextFormat::Mgf,
+            FileFormat::Unidentified => return None,
+        };
+        // Remote (cloud) files keep the batch reader, which streams them.
+        let path = file.to_file_path().ok()?;
+        match TextSpectra::open(&path, file_id, text_format) {
+            Ok(spectra) => Some(IndexedSpectra::Text(spectra)),
             Err(error) => {
                 log::error!("- {}: {}", file, error);
                 Some(IndexedSpectra::Unreadable)
@@ -790,13 +837,16 @@ impl Runner {
         let start = Instant::now();
         let features_by_spectrum: Vec<Vec<Feature>> = (0..spectra.len())
             .into_par_iter()
-            .map(|index| match spectra.processed(index, processor) {
-                Some(spectrum) if self.is_searched(&spectrum) => {
-                    searched.fetch_add(1, Ordering::Relaxed);
-                    scorer.score(&spectrum)
-                }
-                _ => Vec::new(),
-            })
+            .map_init(
+                || spectra.reader(),
+                |reader, index| match spectra.processed(index, processor, reader) {
+                    Some(spectrum) if self.is_searched(&spectrum) => {
+                        searched.fetch_add(1, Ordering::Relaxed);
+                        scorer.score(&spectrum)
+                    }
+                    _ => Vec::new(),
+                },
+            )
             .collect();
         let duration = start.elapsed().as_millis() as usize;
         let rate = searched.into_inner() * 1000 / (duration + 1);

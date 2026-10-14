@@ -104,3 +104,84 @@ Verified:
   intensities and m/z alike (short: 2,498 spectra, 6.6M peaks; long: 137,411 spectra,
   367.6M peaks; m/z difference 0 ppm: pmsms2mzml's optimal fixed point round-trips every
   f32).
+
+## Stage 2b: one-spectrum parsers
+
+- **mzML:** the parser's state lives in a `SpectrumBuilder` fed XML events. The async
+  whole-document `MzMLReader::parse` (still used for LFQ, TMT and remote files) and the
+  new synchronous `parse_spectrum(&[u8])` (one `<spectrum>` element; text after its
+  `</spectrum>` ignored) drive the same builder. zlib is inflated with synchronous
+  `flate2` (already in the build through `async-compression`).
+- **MGF:** `MgfReader::parse_header` (the lines before the first `BEGIN IONS`) and
+  `parse_block` (one `BEGIN IONS` … `END IONS`); `parse` is header plus blocks.
+
+Both used to leak state from one spectrum into the next; per-spectrum parsing can't
+reproduce that, so every spectrum now starts clean in both paths:
+- **mzML:** isolation-window offsets, the compression flag, the float width and an
+  unpushed precursor (selected-ion m/z 0) carried over. A spectrum without an isolation
+  window inherited the previous one's.
+- **MGF:** the file-level `CHARGE=`/`TOL=`/`TOLU=` never reached the first spectrum (its
+  query state was not initialised from them), and lines between `END IONS` and the next
+  `BEGIN IONS` went into the next spectrum.
+
+Unit tests pin both (`spectra_parse_alone_as_in_their_file`,
+`blocks_parse_alone_as_in_their_file`). SAGE ignores mzML `referenceableParamGroup`s, so
+mzML needs no file-level context.
+
+## Stage 2c: mzML and MGF read by index
+
+`text_spectra::TextSpectra` opens a local mzML or MGF file and records where each
+spectrum's text starts (`<spectrum` followed by whitespace or `>`; `BEGIN IONS` first on
+its line). Spectrum `i` is the text from start `i` to start `i + 1` (or the end),
+parsed by the one-spectrum parsers. mzML is read with an MS-level filter of 2, so MS1
+spectra are skipped before their arrays are decoded.
+
+- **Plain files:** memory-mapped; the starts are found by a parallel `memchr::memmem`
+  search over 8 MB ranges.
+- **Gzipped files** (`gzip_index.rs`): one sequential decompression pass finds the starts
+  in the stream and records access points every 4 MB of output, checking every member's
+  CRC-32 and length. zlib's zran method resumes with `inflatePrime` and
+  `inflateSetDictionary`; the build has no C zlib, only `flate2`'s backend
+  `miniz_oxide`, whose `DecompressorOxide` is `Clone`: an access point is a clone of it
+  (bit buffer included) plus its 32 KB output ring, ~43 KB. A read resumes from the
+  last point before its offset; each rayon task (`map_init`) keeps a cursor that just
+  inflates forward to its next spectrum. Multi-member files (`pigz`, `bgzip`) are
+  followed across members.
+- **Remote URLs** (S3, Azure) keep the batch reader, which streams them.
+
+`memchr`, `crc32fast` and `miniz_oxide` were already in the build; they are now direct
+dependencies of `sage-cloudpath`, with no new crate.
+
+The cursor keeps its inflater between reads and serves a read's start from the 32 KB
+output ring when it lies there: a read inflates in chunks of up to 32 KB, so it runs past
+its end, and the next spectrum starts inside those bytes. Without that, every spectrum
+restarted from an access point (long gzipped MGF: 100 s of search instead of 19 s);
+`consecutive_reads_continue_without_jumping` pins it.
+
+### Verification (Stage 2 against `56ae675`)
+
+Same comparison as Stage 1; scripts `temp/streaming/verify_stage.sh`,
+`verify_stage2.sh`, `verify_gzip.sh` (necromerge2 root):
+- **F9477 both passes, G23 `.d`, every pmsms input:** identical.
+- **mzML zlib and uncompressed, plain and `.gz`; short MGF, plain and `.gz`:** identical,
+  now read by index.
+- **Long MGF, plain and `.gz`:** only `posterior_error` and the q-values differ, SAGE's
+  own run-to-run LDA noise on this input (see Stage 1).
+- **Numpress mzML, plain and `.gz`, short and long:** newly readable; identical to
+  `56ae675`'s search of the zlib mzML of the same spectra.
+- **Whole-file parsers** (LFQ run, short zlib mzML and MGF): identical.
+
+Long test inputs (137,411 spectra), `56ae675` against Stage 2:
+
+| input | peak anonymous | wall (search only, when measured) |
+|---|---|---|
+| MGF | 12.12 → 5.33 GB | 106.8 → 29.1 s |
+| zlib mzML | 8.75 → 5.17 GB | 69.0 → 26.7 s |
+| MGF `.gz` | | 80 → 47 s (search 18.6 s; plain 14.3 s) |
+| zlib mzML `.gz` | | 73 → 36 s |
+| uncompressed mzML `.gz` | | 73 → 43 s |
+| numpress mzML `.gz` | | crashed → 36 s |
+
+The `.gz` walls are from runs that also annotate fragments and write the PIN (the
+`sage_checks.sh` settings), on both sides. What's left of the anonymous peak is the
+database and predictions (~4.2 GB) plus the results.

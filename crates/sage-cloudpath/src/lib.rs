@@ -6,10 +6,12 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader};
 
 pub use url::Url;
 
+pub mod gzip_index;
 pub mod mgf;
 pub mod mzml;
 pub mod numpress;
 pub mod tdf;
+pub mod text_spectra;
 pub mod util;
 pub use util::FileFormat;
 
