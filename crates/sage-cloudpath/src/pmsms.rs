@@ -391,26 +391,20 @@ impl PmsmsSpectra {
         self.precursors.is_empty()
     }
 
-    /// Spectrum `index`, borrowing its mapped intensities, handed to `transform`.
-    pub fn read<T>(
-        &self,
-        index: usize,
-        transform: impl for<'a> FnOnce(RawSpectrum<&'a [f32], &'a [u32]>) -> T,
-    ) -> Result<T, PmsmsError> {
-        let p = &self.precursors[index];
-        let start = p.frag_start as usize;
-        let end = start + p.frag_count as usize;
+    /// Spectrum `index`'s first precursor: all a sliced search needs to plan its queries.
+    pub fn first_precursor(&self, index: usize) -> Precursor {
+        Self::precursors(&self.precursors[index])
+            .into_iter()
+            .next()
+            .expect("a pmsms spectrum has at least one precursor")
+    }
 
-        let mz = look_up_mz(&self.tof[start..end], &self.tof2mz, p.fragment_shift_ppm.unwrap_or(0.0))?;
-        let int_slice = &self.intensity[start..end];
-
-        let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
-
+    fn precursors(p: &PrecursorRow) -> Vec<Precursor> {
         let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
 
         // One Precursor per charge state — mirrors how the MGF parser handles
         // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
-        let precursors: Vec<Precursor> = if p.charges.is_empty() {
+        if p.charges.is_empty() {
             vec![Precursor {
                 mz: p.mz,
                 intensity: p.ms1_intensity,
@@ -431,7 +425,25 @@ impl PmsmsSpectra {
                     inverse_ion_mobility: Some(p.iim),
                 })
                 .collect()
-        };
+        }
+    }
+
+    /// Spectrum `index`, borrowing its mapped intensities, handed to `transform`.
+    pub fn read<T>(
+        &self,
+        index: usize,
+        transform: impl for<'a> FnOnce(RawSpectrum<&'a [f32], &'a [u32]>) -> T,
+    ) -> Result<T, PmsmsError> {
+        let p = &self.precursors[index];
+        let start = p.frag_start as usize;
+        let end = start + p.frag_count as usize;
+
+        let mz = look_up_mz(&self.tof[start..end], &self.tof2mz, p.fragment_shift_ppm.unwrap_or(0.0))?;
+        let int_slice = &self.intensity[start..end];
+
+        let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
+
+        let precursors = Self::precursors(p);
 
         Ok(transform(RawSpectrum {
             file_id: self.file_id,

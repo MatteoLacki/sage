@@ -79,6 +79,17 @@ impl SlicePlan {
     }
 }
 
+/// The rows a slice must hold for queries whose windows reach from `low` (their lowest
+/// window start) to `high` (their highest window end): any of those windows finds the
+/// same rows in them as in all of `rows`, the padding row below it included.
+pub fn rows_reaching<T>(rows: &[T], mass: impl Fn(&T) -> f32, low: f32, high: f32) -> Range<usize> {
+    let start = rows
+        .partition_point(|row| mass(row) < low)
+        .saturating_sub(1);
+    let end = rows.partition_point(|row| mass(row) <= high);
+    start..end.max(start)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -144,6 +155,42 @@ mod test {
                     "window {low}..{high} in slice {:?}",
                     slice.rows
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_find_their_global_rows_inside_the_rows_their_slice_reaches() {
+        let mut random = Lcg(13);
+        for (count, budget) in [(2_000, 37), (5_000, 400), (1_000, 10_000)] {
+            let masses = sorted_masses_with_duplicates(&mut random, count);
+            let widest_window = 3.1;
+            let plan = SlicePlan::new(&masses, |m| *m, |_| 1, budget, widest_window);
+            let mut windows_by_slice = vec![Vec::new(); plan.slices.len()];
+            for _ in 0..3_000 {
+                let low = 590.0 + random.next() * 420.0;
+                let window = (low, low + random.next() * widest_window);
+                windows_by_slice[plan.slice_for(low)].push(window);
+            }
+            for (slice, windows) in plan.slices.iter().zip(&windows_by_slice) {
+                if windows.is_empty() {
+                    continue;
+                }
+                let low = windows.iter().map(|w| w.0).fold(f32::INFINITY, f32::min);
+                let high = windows
+                    .iter()
+                    .map(|w| w.1)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let reach = rows_reaching(&masses, |m| *m, low, high);
+                assert!(slice.rows.start <= reach.start && reach.end <= slice.rows.end);
+                for &(low, high) in windows {
+                    let (left, right) = global_range(&masses, low, high);
+                    let (local_left, local_right) = global_range(&masses[reach.clone()], low, high);
+                    assert_eq!(
+                        (local_left + reach.start, local_right + reach.start),
+                        (left, right)
+                    );
+                }
             }
         }
     }

@@ -185,3 +185,39 @@ Long test inputs (137,411 spectra), `56ae675` against Stage 2:
 The `.gz` walls are from runs that also annotate fragments and write the PIN (the
 `sage_checks.sh` settings), on both sides. What's left of the anonymous peak is the
 database and predictions (~4.2 GB) plus the results.
+
+## Stage 3: sliced search on indexed sources
+
+`sliced_search::search` takes the input files as `IndexedSpectra`
+(`sage-cli/src/indexed_spectra.rs`, now shared with the monolithic path; an `InMemory`
+variant wraps the batch reader's spectra for TMT, LFQ and remote files). See
+`sliced_search.md` for planning from headers, `min_peaks` at scoring, narrowed slice
+rows and per-slice CPU logs.
+
+### Verification (Stage 3 against `56ae675`)
+
+Scripts `temp/streaming/verify_stage3.sh` (necromerge2 root), every sliced run
+compared with a monolithic one:
+- **F9477 final pass, sliced** (`SAGE_SLICE_FRAGMENTS=20000000`, 10 slices; and the
+  automatic budget, 1 slice): identical to the production node. Peak anonymous 3.47 GB
+  with 10 slices (monolithic: 14.92 GB on `56ae675`, 6.65 GB after Stage 2), same wall
+  time (136 s).
+- **G23 `.d`, 10 slices:** identical; 0.85 GB peak anonymous.
+- **G23 with `override_precursor_charge`** (the several-charge merge): identical to
+  `56ae675`'s sliced run.
+- **Test inputs, 10 slices** (pmsms, zlib mzML plain and `.gz`, MGF `.gz`, numpress
+  `.gz`; short and long): identical to `56ae675` non-sliced, the long MGF apart (its LDA
+  noise).
+- **Unspecific human class I and II on F9477:** identical to `56ae675`'s sliced runs.
+
+Class I measured directly (quiet machine): wall 385 s against 386 s, peak anonymous
+34.5 GB against 41.4 GB, 0.8 GB read from storage against 3.5 GB. Searches ran at 88–90%
+CPU, builds at 59–63%. Class II (through a wrapper, busier machine): 1,434 s against
+1,375 s, identical results; peak RSS 50.2 against 45.3 GB, because with the spectra no
+longer held, half of `MemAvailable` at search start is a bigger slice budget.
+
+Narrowing slices to their queries' reach (`rows_reaching`) removes little: even in
+class II's heaviest slices (12–22, 2–4k queries each) the ~3 Da windows overlap enough to
+cover the whole mass axis (100% of 3,500–4,000 Da from 3,774 windows), so every row is a
+candidate and the build (~19 s each) is real work. A union-of-windows subset was
+considered and dropped for the same reason.

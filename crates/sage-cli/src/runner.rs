@@ -1,3 +1,4 @@
+use super::indexed_spectra::IndexedSpectra;
 use super::input::Search;
 use super::output::SageResults;
 use super::process_memory::log_memory;
@@ -7,7 +8,7 @@ use anyhow::Context;
 use csv::ByteRecord;
 use log::info;
 use rayon::prelude::*;
-use sage_cloudpath::text_spectra::{TextFormat, TextReader, TextSpectra};
+use sage_cloudpath::text_spectra::{TextFormat, TextSpectra};
 use sage_cloudpath::{FileFormat, Url};
 use sage_core::compact::{CompactPeptide, CompactPeptides};
 use sage_core::database::{IndexedDatabase, Parameters};
@@ -228,65 +229,6 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
             RawSpectrumAccumulator::default(),
             RawSpectrumAccumulator::fold_op,
         )
-    }
-}
-
-/// One input file's MS2 spectra, read one at a time by index.
-enum IndexedSpectra {
-    Pmsms(sage_cloudpath::pmsms::PmsmsSpectra),
-    Tdf(sage_cloudpath::tdf::TdfSpectra),
-    /// mzML or MGF, plain or gzipped.
-    Text(TextSpectra),
-    /// A file that failed to open; logged, and searched as empty like the batch reader does.
-    Unreadable,
-}
-
-/// One thread's state for reading `IndexedSpectra`: text files keep a buffer and a gzip
-/// decompressor that moves forward through the thread's run of indices.
-type IndexedReader<'a> = Option<TextReader<'a>>;
-
-impl IndexedSpectra {
-    fn len(&self) -> usize {
-        match self {
-            Self::Pmsms(spectra) => spectra.len(),
-            Self::Tdf(spectra) => spectra.len(),
-            Self::Text(spectra) => spectra.len(),
-            Self::Unreadable => 0,
-        }
-    }
-
-    fn reader(&self) -> IndexedReader<'_> {
-        match self {
-            Self::Text(spectra) => Some(spectra.reader()),
-            _ => None,
-        }
-    }
-
-    /// Spectrum `index`, processed; `None` for one the batch reader skips as well.
-    fn processed<'a>(
-        &'a self,
-        index: usize,
-        processor: &SpectrumProcessor,
-        reader: &mut IndexedReader<'a>,
-    ) -> Option<ProcessedSpectrum> {
-        match self {
-            Self::Pmsms(spectra) => match spectra.read(index, |raw| processor.process(raw)) {
-                Ok(spectrum) => Some(spectrum),
-                Err(error) => panic!("cannot read pmsms spectrum {index}: {error}"),
-            },
-            Self::Tdf(spectra) => spectra.read(index).map(|raw| processor.process(raw)),
-            Self::Text(spectra) => {
-                let reader = reader.as_mut().expect("text files read through a TextReader");
-                match spectra.read(index, reader) {
-                    Ok(spectrum) => spectrum.map(|raw| processor.process(raw)),
-                    Err(error) => {
-                        log::error!("cannot read spectrum {index}: {error}");
-                        None
-                    }
-                }
-            }
-            Self::Unreadable => None,
-        }
     }
 }
 
@@ -737,7 +679,7 @@ impl Runner {
         results
     }
 
-    fn spectrum_processor(&self) -> SpectrumProcessor {
+    pub(crate) fn spectrum_processor(&self) -> SpectrumProcessor {
         let min_deisotope_mz = match &self.parameters.quant.tmt {
             Some(i) => match self.parameters.quant.tmt_settings.level {
                 2 => i.reporter_masses().last().map(|x| x * (1.0 + 20E-6)),
@@ -753,13 +695,13 @@ impl Runner {
         )
     }
 
-    fn is_searched(&self, spectrum: &ProcessedSpectrum) -> bool {
+    pub(crate) fn is_searched(&self, spectrum: &ProcessedSpectrum) -> bool {
         spectrum.peaks.len() >= self.parameters.min_peaks && spectrum.level == 2
     }
 
     /// `file`'s MS2 spectra to read one at a time, or `None` when this run reads it
     /// whole: its format has no index, or TMT/LFQ still need the batch reader.
-    fn open_indexed_spectra(&self, file: &Url, file_id: usize) -> Option<IndexedSpectra> {
+    pub(crate) fn open_indexed_spectra(&self, file: &Url, file_id: usize) -> Option<IndexedSpectra> {
         if self.parameters.quant.tmt.is_some() || self.parameters.quant.lfq {
             return None;
         }
@@ -1091,6 +1033,16 @@ impl Runner {
         predictions: &Predictions,
         batch_size: usize,
     ) -> anyhow::Result<SageResults> {
+        let processor = self.spectrum_processor();
+        if let Some(files) = self.open_all_indexed_spectra() {
+            info!("slicing over all {} files, reading spectra by index", files.len());
+            let features = sliced_search::search(self, table, predictions, &files, &processor)?;
+            log_memory("searched");
+            return Ok(SageResults {
+                features,
+                ..SageResults::default()
+            });
+        }
         self.parameters
             .mzml_paths
             .chunks(batch_size)
@@ -1098,12 +1050,26 @@ impl Runner {
             .map(|(chunk_idx, chunk)| {
                 let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
                 log_spectra_held(&msn);
-                let features = sliced_search::search(self, table, predictions, &msn)?;
+                let files = [IndexedSpectra::InMemory(msn)];
+                let features = sliced_search::search(self, table, predictions, &files, &processor)?;
                 log_memory("searched");
+                let [IndexedSpectra::InMemory(msn)] = files else {
+                    unreachable!("built above")
+                };
                 let results = self.complete_features(msn, ms1, features);
                 log_memory("spectra dropped");
                 Ok(results)
             })
+            .collect()
+    }
+
+    /// Every input file to read by index, or `None` when any of them is read whole.
+    fn open_all_indexed_spectra(&self) -> Option<Vec<IndexedSpectra>> {
+        self.parameters
+            .mzml_paths
+            .iter()
+            .enumerate()
+            .map(|(file_id, file)| self.open_indexed_spectra(file, file_id))
             .collect()
     }
 

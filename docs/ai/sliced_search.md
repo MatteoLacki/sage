@@ -43,6 +43,15 @@ preliminary order. So a slice must reproduce that exact range, shifted. `SlicePl
 random windows and on windows starting exactly on core boundaries: the local
 `binary_search_slice` equals the global one, shifted.
 
+Since Stage 3 of `plans/streaming_spectra.md` (necromerge2 root) a slice is built over
+fewer rows: `slicing::rows_reaching` takes, for the queries actually assigned to it,
+from one row below their lowest window start to the first row above their highest
+window end (both widened by the 0.01 Da margin). Any window of those queries finds the
+same `binary_search_slice` range in those rows as in the whole table, padding row
+included, and they lie inside the planned slice above
+(`windows_find_their_global_rows_inside_the_rows_their_slice_reaches`). The cores, and
+so which queries share a slice, are unchanged.
+
 Inside a slice, peptide `i` is table row `first_row + i`. Several things hold under
 that shift:
 - **`PreScore` order is unchanged:** it orders by matched count first, then
@@ -99,10 +108,19 @@ reported peptides or writes raw `PeptideIx`.
 
 A core's cost is about 200 B per row (its materialized `Peptide`) plus 16 B per
 fragment (the index entry plus the sort and unzip copies while building). Cores are
-filled up to half of `MemAvailable`, measured after the spectra are read.
+filled up to half of `MemAvailable`, measured when the search starts.
 `SAGE_SLICE_FRAGMENTS=<n>` caps fragments per core instead, for tests. Slices with no
-queries are never built. Files are searched in SAGE's batches, and the slices are
-rebuilt per batch; a pmsms run is one file.
+queries are never built.
+
+Since Stage 3 of `plans/streaming_spectra.md`, when every input can be read by index
+(`indexed_spectra.rs`: pmsms, TDF, local mzML and MGF; not with TMT or LFQ) all files
+are planned together and each slice is built once per run. Planning reads only each
+spectrum's header (MS level, first precursor; pmsms from its precursor table); the
+`min_peaks` check moved from planning to scoring, where a spectrum below it yields no
+features either way. A slice reads the spectra of its queries when it is searched, one
+read per spectrum even when several of its charges land there. Otherwise files are
+read whole in SAGE's batches, and slices are rebuilt per batch. Each slice logs its
+build and search time with the share of the cores each kept busy.
 
 ## Verification
 
