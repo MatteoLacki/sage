@@ -221,3 +221,22 @@ class II's heaviest slices (12–22, 2–4k queries each) the ~3 Da windows over
 cover the whole mass axis (100% of 3,500–4,000 Da from 3,774 windows), so every row is a
 candidate and the build (~19 s each) is real work. A union-of-windows subset was
 considered and dropped for the same reason.
+
+Class II measured directly as well (quiet machine): Stage 3 1,350 s, peak anonymous
+43.5 GB, 5.2 GB read from storage (`56ae675`, through the wrapper: 1,375 s).
+
+### Overlapping builds with searches: measured, not kept
+
+Builds run at ~60% CPU, so the plan's last item built slice k + 1 while slice k was
+searched (`rayon::join`, same pool). Two slices alive at once halve each slice's
+budget (a quarter of `MemAvailable`), so there are twice as many slices. Measured
+directly against Stage 3, outputs identical:
+
+| run | Stage 3 | overlapped |
+|---|---|---|
+| class I | 384.5 s, 34.5 GB anonymous, 3 slices | 372.7 s, 32.2 GB, 5 slices |
+| class II | 1,349.9 s, 43.5 GB, 5.2 GB read, 22 slices | 1,380.6 s, 44.7 GB, 30.4 GB read, 44 slices |
+| F9477 final pass, 10 slices | 136 s | 144 s |
+
+The smaller slices mean more builds and more page-cache churn of the input, which
+cancels what the overlap hides; not kept.
