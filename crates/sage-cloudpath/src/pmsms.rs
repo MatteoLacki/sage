@@ -342,83 +342,123 @@ pub fn parse_processed(
     parse_with(paths, file_id, |s| processor.process(s))
 }
 
+/// A pmsms input read one spectrum at a time: the precursor table in memory, the
+/// fragment columns memory-mapped. Spectrum `index` is precursor row `index`.
+pub struct PmsmsSpectra {
+    _intensity_mmap: Mmap,
+    intensity: &'static [u32],
+    _tof_mmap: Mmap,
+    tof: &'static [u32],
+    tof2mz: Vec<f64>,
+    precursors: Vec<PrecursorRow>,
+    file_id: usize,
+}
+
+impl PmsmsSpectra {
+    pub fn open(paths: &PmsmsPaths, file_id: usize) -> Result<Self, PmsmsError> {
+        let precursors = read_precursors(&paths.precursors)?;
+        let tof2mz = read_tof2mz_table(&paths.tof2mz)?;
+
+        let frag_schema = read_mmappet_schema(&paths.pmsms)?;
+        if frag_schema.iter().any(|(_, name)| name == "mz") {
+            log::warn!(
+                "pmsms {} has an mz column: ignored, fragment m/z is read as tof2mz[tof]",
+                paths.pmsms.display()
+            );
+        }
+        let i_int = mmappet_column_index(&frag_schema, "intensity", "uint32")?;
+        let i_tof = mmappet_column_index(&frag_schema, "tof", "uint32")?;
+        // SAFETY: dtypes checked against schema.txt above.
+        let (intensity_mmap, intensity) =
+            unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_int}.bin")))? };
+        let (tof_mmap, tof) = unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_tof}.bin")))? };
+        Ok(Self {
+            _intensity_mmap: intensity_mmap,
+            intensity,
+            _tof_mmap: tof_mmap,
+            tof,
+            tof2mz,
+            precursors,
+            file_id,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.precursors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.precursors.is_empty()
+    }
+
+    /// Spectrum `index`, borrowing its mapped intensities, handed to `transform`.
+    pub fn read<T>(
+        &self,
+        index: usize,
+        transform: impl for<'a> FnOnce(RawSpectrum<&'a [f32], &'a [u32]>) -> T,
+    ) -> Result<T, PmsmsError> {
+        let p = &self.precursors[index];
+        let start = p.frag_start as usize;
+        let end = start + p.frag_count as usize;
+
+        let mz = look_up_mz(&self.tof[start..end], &self.tof2mz, p.fragment_shift_ppm.unwrap_or(0.0))?;
+        let int_slice = &self.intensity[start..end];
+
+        let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
+
+        let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
+
+        // One Precursor per charge state — mirrors how the MGF parser handles
+        // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
+        let precursors: Vec<Precursor> = if p.charges.is_empty() {
+            vec![Precursor {
+                mz: p.mz,
+                intensity: p.ms1_intensity,
+                charge: None,
+                spectrum_ref: None,
+                isolation_window,
+                inverse_ion_mobility: Some(p.iim),
+            }]
+        } else {
+            p.charges
+                .iter()
+                .map(|&c| Precursor {
+                    mz: p.mz,
+                    intensity: p.ms1_intensity,
+                    charge: Some(c),
+                    spectrum_ref: None,
+                    isolation_window,
+                    inverse_ion_mobility: Some(p.iim),
+                })
+                .collect()
+        };
+
+        Ok(transform(RawSpectrum {
+            file_id: self.file_id,
+            ms_level: 2,
+            id: format!("precursor_idx={}", p.precursor_idx),
+            precursors,
+            representation: Representation::Centroid,
+            scan_start_time: p.rt_minutes,
+            ion_injection_time: 0.0,
+            total_ion_current,
+            mz: &mz,
+            intensity: int_slice,
+            mobility: None,
+        }))
+    }
+}
+
 fn parse_with<T: Send>(
     paths: &PmsmsPaths,
     file_id: usize,
     transform: impl for<'a> Fn(RawSpectrum<&'a [f32], &'a [u32]>) -> T + Sync,
 ) -> Result<Vec<T>, PmsmsError> {
-    let precursors = read_precursors(&paths.precursors)?;
-    let tof2mz = read_tof2mz_table(&paths.tof2mz)?;
-
-    let frag_schema = read_mmappet_schema(&paths.pmsms)?;
-    if frag_schema.iter().any(|(_, name)| name == "mz") {
-        log::warn!(
-            "pmsms {} has an mz column: ignored, fragment m/z is read as tof2mz[tof]",
-            paths.pmsms.display()
-        );
-    }
-    let i_int = mmappet_column_index(&frag_schema, "intensity", "uint32")?;
-    let i_tof = mmappet_column_index(&frag_schema, "tof", "uint32")?;
-    // SAFETY: dtypes checked against schema.txt above.
-    let (_frag_int_mmap, frag_int) =
-        unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_int}.bin")))? };
-    let (_tof_mmap, tof) = unsafe { mmap_as_slice::<u32>(&paths.pmsms.join(format!("{i_tof}.bin")))? };
-
-    let spectra = precursors
+    let spectra = PmsmsSpectra::open(paths, file_id)?;
+    (0..spectra.len())
         .into_par_iter()
-        .map(|p| {
-            let start = p.frag_start as usize;
-            let end = start + p.frag_count as usize;
-
-            let mz = look_up_mz(&tof[start..end], &tof2mz, p.fragment_shift_ppm.unwrap_or(0.0))?;
-            let int_slice = &frag_int[start..end];
-
-            let total_ion_current = int_slice.iter().map(|&i| i as f32).sum();
-
-            let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
-
-            // One Precursor per charge state — mirrors how the MGF parser handles
-            // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
-            let precursors: Vec<Precursor> = if p.charges.is_empty() {
-                vec![Precursor {
-                    mz: p.mz,
-                    intensity: p.ms1_intensity,
-                    charge: None,
-                    spectrum_ref: None,
-                    isolation_window,
-                    inverse_ion_mobility: Some(p.iim),
-                }]
-            } else {
-                p.charges
-                    .iter()
-                    .map(|&c| Precursor {
-                        mz: p.mz,
-                        intensity: p.ms1_intensity,
-                        charge: Some(c),
-                        spectrum_ref: None,
-                        isolation_window,
-                        inverse_ion_mobility: Some(p.iim),
-                    })
-                    .collect()
-            };
-
-            Ok(transform(RawSpectrum {
-                file_id,
-                ms_level: 2,
-                id: format!("precursor_idx={}", p.precursor_idx),
-                precursors,
-                representation: Representation::Centroid,
-                scan_start_time: p.rt_minutes,
-                ion_injection_time: 0.0,
-                total_ion_current,
-                mz: &mz,
-                intensity: int_slice,
-                mobility: None,
-            }))
-        })
-        .collect::<Result<Vec<T>, PmsmsError>>()?;
-
-    Ok(spectra)
+        .map(|index| spectra.read(index, &transform))
+        .collect()
 }
 
 /// `tof2mz[t] / (1 + shift_ppm·1e-6)` in f64, rounded to f32 — the arithmetic of

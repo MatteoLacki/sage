@@ -39,11 +39,11 @@ impl TdfReader {
         config: BrukerProcessingConfig,
         requires_ms1: bool,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let spectrum_reader = timsrust::readers::SpectrumReader::build()
-            .with_path(path_name.as_ref())
-            .with_config(config.ms2)
-            .finalize()?;
-        let mut spectra = self.read_msn_spectra(file_id, &spectrum_reader)?;
+        let msn = TdfSpectra::open(&path_name, file_id, config)?;
+        let mut spectra: Vec<RawSpectrum> = (0..msn.len())
+            .into_par_iter()
+            .filter_map(|index| msn.read(index))
+            .collect();
         if requires_ms1 {
             let ms1s = self.read_ms1_spectra(&path_name, file_id, config.ms1)?;
             spectra.extend(ms1s);
@@ -116,44 +116,6 @@ impl TdfReader {
         Ok(ms1_spectra)
     }
 
-    fn read_msn_spectra(
-        &self,
-        file_id: usize,
-        spectrum_reader: &SpectrumReader,
-    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let spectra: Vec<RawSpectrum> = (0..spectrum_reader.len())
-            .into_par_iter()
-            .filter_map(|index| match spectrum_reader.get(index) {
-                Ok(dda_spectrum) => match dda_spectrum.precursor {
-                    Some(dda_precursor) => {
-                        let mut precursor = Self::parse_precursor(dda_precursor);
-                        precursor.isolation_window = Option::from(Tolerance::Da(
-                            -dda_spectrum.isolation_width as f32 / 2.0,
-                            dda_spectrum.isolation_width as f32 / 2.0,
-                        ));
-                        let spectrum: RawSpectrum = RawSpectrum {
-                            file_id,
-                            precursors: vec![precursor],
-                            representation: Representation::Centroid,
-                            scan_start_time: dda_precursor.rt as f32 / 60.0,
-                            ion_injection_time: dda_precursor.rt as f32,
-                            total_ion_current: 0.0,
-                            mz: dda_spectrum.mz_values.iter().map(|&x| x as f32).collect(),
-                            ms_level: 2,
-                            id: dda_spectrum.index.to_string(),
-                            intensity: dda_spectrum.intensities.iter().map(|&x| x as f32).collect(),
-                            mobility: None,
-                        };
-                        Some(spectrum)
-                    }
-                    None => None,
-                },
-                Err(_) => None,
-            })
-            .collect();
-        Ok(spectra)
-    }
-
     fn parse_precursor(dda_precursor: timsrust::Precursor) -> Precursor {
         let mut precursor: Precursor = Precursor::default();
         precursor.mz = dda_precursor.mz as f32;
@@ -162,6 +124,65 @@ impl TdfReader {
         precursor.spectrum_ref = Option::from(dda_precursor.frame_index.to_string());
         precursor.inverse_ion_mobility = Option::from(dda_precursor.im as f32);
         precursor
+    }
+}
+
+/// A Bruker `.d`'s MS2 spectra read one at a time, by timsrust's spectrum index.
+pub struct TdfSpectra {
+    reader: SpectrumReader,
+    file_id: usize,
+}
+
+impl TdfSpectra {
+    pub fn open(
+        path_name: impl AsRef<str>,
+        file_id: usize,
+        config: BrukerProcessingConfig,
+    ) -> Result<Self, timsrust::TimsRustError> {
+        let reader = SpectrumReader::build()
+            .with_path(path_name.as_ref())
+            .with_config(config.ms2)
+            .finalize()?;
+        Ok(Self { reader, file_id })
+    }
+
+    pub fn len(&self) -> usize {
+        self.reader.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reader.len() == 0
+    }
+
+    /// Spectrum `index`; `None` when it has no precursor or timsrust can't read it.
+    pub fn read(&self, index: usize) -> Option<RawSpectrum> {
+        match self.reader.get(index) {
+            Ok(dda_spectrum) => match dda_spectrum.precursor {
+                Some(dda_precursor) => {
+                    let mut precursor = TdfReader::parse_precursor(dda_precursor);
+                    precursor.isolation_window = Option::from(Tolerance::Da(
+                        -dda_spectrum.isolation_width as f32 / 2.0,
+                        dda_spectrum.isolation_width as f32 / 2.0,
+                    ));
+                    let spectrum: RawSpectrum = RawSpectrum {
+                        file_id: self.file_id,
+                        precursors: vec![precursor],
+                        representation: Representation::Centroid,
+                        scan_start_time: dda_precursor.rt as f32 / 60.0,
+                        ion_injection_time: dda_precursor.rt as f32,
+                        total_ion_current: 0.0,
+                        mz: dda_spectrum.mz_values.iter().map(|&x| x as f32).collect(),
+                        ms_level: 2,
+                        id: dda_spectrum.index.to_string(),
+                        intensity: dda_spectrum.intensities.iter().map(|&x| x as f32).collect(),
+                        mobility: None,
+                    };
+                    Some(spectrum)
+                }
+                None => None,
+            },
+            Err(_) => None,
+        }
     }
 }
 

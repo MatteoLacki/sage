@@ -1,5 +1,6 @@
 use super::input::Search;
 use super::output::SageResults;
+use super::process_memory::log_memory;
 use super::sliced_search;
 use super::telemetry;
 use anyhow::Context;
@@ -227,6 +228,46 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
             RawSpectrumAccumulator::fold_op,
         )
     }
+}
+
+/// One input file's MS2 spectra, read one at a time by index.
+enum IndexedSpectra {
+    Pmsms(sage_cloudpath::pmsms::PmsmsSpectra),
+    Tdf(sage_cloudpath::tdf::TdfSpectra),
+    /// A file that failed to open; logged, and searched as empty like the batch reader does.
+    Unreadable,
+}
+
+impl IndexedSpectra {
+    fn len(&self) -> usize {
+        match self {
+            Self::Pmsms(spectra) => spectra.len(),
+            Self::Tdf(spectra) => spectra.len(),
+            Self::Unreadable => 0,
+        }
+    }
+
+    /// Spectrum `index`, processed; `None` for one the batch reader skips as well.
+    fn processed(&self, index: usize, processor: &SpectrumProcessor) -> Option<ProcessedSpectrum> {
+        match self {
+            Self::Pmsms(spectra) => match spectra.read(index, |raw| processor.process(raw)) {
+                Ok(spectrum) => Some(spectrum),
+                Err(error) => panic!("cannot read pmsms spectrum {index}: {error}"),
+            },
+            Self::Tdf(spectra) => spectra.read(index).map(|raw| processor.process(raw)),
+            Self::Unreadable => None,
+        }
+    }
+}
+
+fn log_spectra_held(spectra: &[ProcessedSpectrum]) {
+    let bytes: usize = spectra.par_iter().map(ProcessedSpectrum::owned_bytes).sum();
+    info!(
+        "- holding {} processed spectra: {:.2} GB",
+        spectra.len(),
+        bytes as f64 / 1e9
+    );
+    log_memory("spectra read");
 }
 
 impl Runner {
@@ -591,7 +632,7 @@ impl Runner {
 
         let features: Vec<_> = msn_spectra
             .par_iter()
-            .filter(|spec| spec.peaks.len() >= self.parameters.min_peaks && spec.level == 2)
+            .filter(|spectrum| self.is_searched(spectrum))
             .map(|x| {
                 let prev = counter.fetch_add(1, Ordering::Relaxed);
                 if prev > 0 && prev % 10_000 == 0 {
@@ -650,9 +691,117 @@ impl Runner {
         chunk_idx: usize,
         batch_size: usize,
     ) -> SageResults {
+        if let Some(features) = self.search_chunk_by_index(scorer, chunk, chunk_idx, batch_size) {
+            log_memory("searched");
+            return SageResults {
+                features,
+                ..SageResults::default()
+            };
+        }
         let spectra = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+        log_spectra_held(&spectra.1);
         let features = self.search_processed_spectra(scorer, &spectra.1);
-        self.complete_features(spectra.1, spectra.0, features)
+        log_memory("searched");
+        let results = self.complete_features(spectra.1, spectra.0, features);
+        log_memory("spectra dropped");
+        results
+    }
+
+    fn spectrum_processor(&self) -> SpectrumProcessor {
+        let min_deisotope_mz = match &self.parameters.quant.tmt {
+            Some(i) => match self.parameters.quant.tmt_settings.level {
+                2 => i.reporter_masses().last().map(|x| x * (1.0 + 20E-6)),
+                _ => None,
+            },
+            None => None,
+        };
+        SpectrumProcessor::new(
+            self.parameters.max_peaks,
+            self.parameters.deisotope,
+            min_deisotope_mz.unwrap_or(0.0),
+            self.parameters.assume_sorted_peaks,
+        )
+    }
+
+    fn is_searched(&self, spectrum: &ProcessedSpectrum) -> bool {
+        spectrum.peaks.len() >= self.parameters.min_peaks && spectrum.level == 2
+    }
+
+    /// `file`'s MS2 spectra to read one at a time, or `None` when this run reads it
+    /// whole: its format has no index, or TMT/LFQ still need the batch reader.
+    fn open_indexed_spectra(&self, file: &Url, file_id: usize) -> Option<IndexedSpectra> {
+        if self.parameters.quant.tmt.is_some() || self.parameters.quant.lfq {
+            return None;
+        }
+        if let Some(paths) = &self.parameters.pmsms_paths {
+            return match sage_cloudpath::pmsms::PmsmsSpectra::open(paths, file_id) {
+                Ok(spectra) => Some(IndexedSpectra::Pmsms(spectra)),
+                Err(error) => panic!("cannot read pmsms input {}: {}", paths.pmsms.display(), error),
+            };
+        }
+        if FileFormat::from(file.as_str()) != FileFormat::TDF {
+            return None;
+        }
+        match sage_cloudpath::util::open_tdf_spectra(file.as_str(), file_id, self.parameters.bruker_config) {
+            Ok(spectra) => Some(IndexedSpectra::Tdf(spectra)),
+            Err(error) => {
+                log::error!("- {}: {}", file, error);
+                Some(IndexedSpectra::Unreadable)
+            }
+        }
+    }
+
+    /// Searches `chunk` one spectrum at a time when every file in it can be read by
+    /// index, so no file's spectra are ever all in memory; `None` otherwise.
+    fn search_chunk_by_index(
+        &self,
+        scorer: &Scorer,
+        chunk: &[Url],
+        chunk_idx: usize,
+        batch_size: usize,
+    ) -> Option<Vec<Feature>> {
+        let files: Vec<IndexedSpectra> = chunk
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| self.open_indexed_spectra(file, chunk_idx * batch_size + idx))
+            .collect::<Option<_>>()?;
+        info!(
+            "searching files {} .. {} one spectrum at a time",
+            batch_size * chunk_idx,
+            batch_size * chunk_idx + chunk.len()
+        );
+        let processor = self.spectrum_processor();
+        let mut features = Vec::new();
+        for spectra in &files {
+            features.extend(self.search_indexed_spectra(scorer, spectra, &processor));
+        }
+        Some(features)
+    }
+
+    /// Reads, processes and scores each spectrum within one parallel task, in index order.
+    fn search_indexed_spectra(
+        &self,
+        scorer: &Scorer,
+        spectra: &IndexedSpectra,
+        processor: &SpectrumProcessor,
+    ) -> Vec<Feature> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let searched = AtomicUsize::new(0);
+        let start = Instant::now();
+        let features_by_spectrum: Vec<Vec<Feature>> = (0..spectra.len())
+            .into_par_iter()
+            .map(|index| match spectra.processed(index, processor) {
+                Some(spectrum) if self.is_searched(&spectrum) => {
+                    searched.fetch_add(1, Ordering::Relaxed);
+                    scorer.score(&spectrum)
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let duration = start.elapsed().as_millis() as usize;
+        let rate = searched.into_inner() * 1000 / (duration + 1);
+        info!("- search:  {:8} ms ({} spectra/s)", duration, rate);
+        features_by_spectrum.into_iter().flatten().collect()
     }
 
     fn read_processed_spectra(
@@ -675,21 +824,7 @@ impl Runner {
             .tmt_settings
             .sn
             .then_some(self.parameters.quant.tmt_settings.level);
-
-        let min_deisotope_mz = match &self.parameters.quant.tmt {
-            Some(i) => match self.parameters.quant.tmt_settings.level {
-                2 => i.reporter_masses().last().map(|x| x * (1.0 + 20E-6)),
-                _ => None,
-            },
-            None => None,
-        };
-
-        let sp = SpectrumProcessor::new(
-            self.parameters.max_peaks,
-            self.parameters.deisotope,
-            min_deisotope_mz.unwrap_or(0.0),
-            self.parameters.assume_sorted_peaks,
-        );
+        let sp = self.spectrum_processor();
 
         if let Some(paths) = &self.parameters.pmsms_paths {
             let spectra = match sage_cloudpath::pmsms::parse_processed(paths, chunk_idx * batch_size, &sp) {
@@ -912,14 +1047,19 @@ impl Runner {
             .enumerate()
             .map(|(chunk_idx, chunk)| {
                 let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                log_spectra_held(&msn);
                 let features = sliced_search::search(self, table, predictions, &msn)?;
-                Ok(self.complete_features(msn, ms1, features))
+                log_memory("searched");
+                let results = self.complete_features(msn, ms1, features);
+                log_memory("spectra dropped");
+                Ok(results)
             })
             .collect()
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
         let predictions = self.resolve_predictions()?;
+        log_memory("database and predictions ready");
 
         //Collect all results into a single container
         let mut outputs = match &self.compact {

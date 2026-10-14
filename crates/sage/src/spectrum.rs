@@ -37,6 +37,9 @@ impl PeakColumns {
             .zip(&self.intensities)
             .map(|(&mass, &intensity)| Peak { mass, intensity })
     }
+    pub fn heap_bytes(&self) -> usize {
+        (self.masses.capacity() + self.intensities.capacity()) * std::mem::size_of::<f32>()
+    }
 }
 
 impl From<Vec<Peak>> for PeakColumns {
@@ -169,6 +172,24 @@ pub struct ProcessedSpectrum<T = PeakColumns> {
     pub peak_charges: Vec<u8>,
     /// Total ion current
     pub total_ion_current: f32,
+}
+
+impl ProcessedSpectrum {
+    /// This spectrum's size plus everything it owns on the heap.
+    pub fn owned_bytes(&self) -> usize {
+        let precursor_refs: usize = self
+            .precursors
+            .iter()
+            .filter_map(|precursor| precursor.spectrum_ref.as_ref())
+            .map(String::capacity)
+            .sum();
+        std::mem::size_of::<Self>()
+            + self.id.capacity()
+            + self.precursors.capacity() * std::mem::size_of::<Precursor>()
+            + precursor_refs
+            + self.peaks.heap_bytes()
+            + self.peak_charges.capacity()
+    }
 }
 
 #[derive(Default, Debug, Clone)]

@@ -124,6 +124,16 @@ fn local_path(s: &str) -> String {
     }
 }
 
+/// A Bruker `.d`'s MS2 spectra, to read one at a time.
+pub fn open_tdf_spectra<S: AsRef<str>>(
+    s: S,
+    file_id: usize,
+    bruker_spectrum_processor: BrukerProcessingConfig,
+) -> Result<crate::tdf::TdfSpectra, Error> {
+    crate::tdf::TdfSpectra::open(local_path(s.as_ref()), file_id, bruker_spectrum_processor)
+        .map_err(Error::TDF)
+}
+
 pub fn read_mgf<S: AsRef<str>>(path: S, file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
     read_and_execute(path, |mut bf| async move {
         let mut contents = String::new();
