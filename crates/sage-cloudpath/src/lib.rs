@@ -8,6 +8,7 @@ pub use url::Url;
 
 pub mod mgf;
 pub mod mzml;
+pub mod numpress;
 pub mod tdf;
 pub mod util;
 pub use util::FileFormat;

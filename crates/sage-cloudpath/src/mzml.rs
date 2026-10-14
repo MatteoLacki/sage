@@ -1,4 +1,5 @@
 use async_compression::tokio::bufread::ZlibDecoder;
+use crate::numpress::{NumpressCodec, NumpressError};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use sage_core::spectrum::{Precursor, Representation};
@@ -32,6 +33,12 @@ enum Dtype {
 // MUST supply only one of the following
 const ZLIB_COMPRESSION: &[u8] = b"MS:1000574";
 const NO_COMPRESSION: &[u8] = b"MS:1000576";
+const NUMPRESS_LINEAR: &[u8] = b"MS:1002312";
+const NUMPRESS_PIC: &[u8] = b"MS:1002313";
+const NUMPRESS_SLOF: &[u8] = b"MS:1002314";
+const NUMPRESS_LINEAR_ZLIB: &[u8] = b"MS:1002746";
+const NUMPRESS_PIC_ZLIB: &[u8] = b"MS:1002747";
+const NUMPRESS_SLOF_ZLIB: &[u8] = b"MS:1002748";
 
 // MUST supply only one of the following
 const INTENSITY_ARRAY: &[u8] = b"MS:1000515";
@@ -118,6 +125,7 @@ impl MzMLReader {
         let mut output_buffer = Vec::with_capacity(4096);
         let mut binary_dtype = Dtype::F64;
         let mut binary_array = None;
+        let mut numpress: Option<NumpressCodec> = None;
 
         let mut spectrum = RawSpectrum::default_with_file_id(self.file_id);
         let mut precursor = Precursor::default();
@@ -152,7 +160,10 @@ impl MzMLReader {
                     state = match (ev.name().into_inner(), state) {
                         (b"spectrum", _) => Some(State::Spectrum),
                         (b"scan", Some(State::Spectrum)) => Some(State::Scan),
-                        (b"binaryDataArray", Some(State::Spectrum)) => Some(State::BinaryDataArray),
+                        (b"binaryDataArray", Some(State::Spectrum)) => {
+                            numpress = None;
+                            Some(State::BinaryDataArray)
+                        }
                         (b"binary", Some(State::BinaryDataArray)) => Some(State::Binary),
                         (b"precursor", Some(State::Spectrum)) => Some(State::Precursor),
                         (b"selectedIon", Some(State::Precursor)) => Some(State::SelectedIon),
@@ -180,6 +191,21 @@ impl MzMLReader {
                         match accession.as_ref() {
                             ZLIB_COMPRESSION => compression = true,
                             NO_COMPRESSION => compression = false,
+                            NUMPRESS_LINEAR => numpress = Some(NumpressCodec::Linear),
+                            NUMPRESS_PIC => numpress = Some(NumpressCodec::PositiveInteger),
+                            NUMPRESS_SLOF => numpress = Some(NumpressCodec::ShortLoggedFloat),
+                            NUMPRESS_LINEAR_ZLIB => {
+                                numpress = Some(NumpressCodec::Linear);
+                                compression = true;
+                            }
+                            NUMPRESS_PIC_ZLIB => {
+                                numpress = Some(NumpressCodec::PositiveInteger);
+                                compression = true;
+                            }
+                            NUMPRESS_SLOF_ZLIB => {
+                                numpress = Some(NumpressCodec::ShortLoggedFloat);
+                                compression = true;
+                            }
                             FLOAT_64 => binary_dtype = Dtype::F64,
                             FLOAT_32 => binary_dtype = Dtype::F32,
                             INTENSITY_ARRAY => binary_array = Some(BinaryKind::Intensity),
@@ -303,8 +329,13 @@ impl MzMLReader {
                             }
                         };
 
-                        let array = match binary_dtype {
-                            Dtype::F32 => {
+                        let array = match (numpress, binary_dtype) {
+                            (Some(codec), _) => {
+                                let mut values = Vec::new();
+                                codec.decode(bytes, &mut values)?;
+                                values
+                            }
+                            (None, Dtype::F32) => {
                                 let mut buf: [u8; 4] = [0; 4];
                                 bytes
                                     .chunks(4)
@@ -315,7 +346,7 @@ impl MzMLReader {
                                     })
                                     .collect::<Vec<f32>>()
                             }
-                            Dtype::F64 => {
+                            (None, Dtype::F64) => {
                                 let mut buf: [u8; 8] = [0; 8];
                                 bytes
                                     .chunks(8)
@@ -426,6 +457,8 @@ pub enum MzMLError {
     IntError(#[from] std::num::ParseIntError),
     #[error("error decoding base64: {0}")]
     Base64Error(#[from] base64::DecodeError),
+    #[error("error decoding numpress: {0}")]
+    NumpressError(#[from] NumpressError),
 }
 
 #[cfg(test)]
@@ -433,6 +466,32 @@ mod test {
     use sage_core::{mass::Tolerance, spectrum::Representation};
 
     use super::{MzMLError, MzMLReader};
+
+    /// Real-data check of numpress decoding: `SAGE_NUMPRESS_PAIR=<numpress.mzML>,<zlib.mzML>`
+    /// (the same spectra written both ways, e.g. by pmsms2mzml). Intensities must match
+    /// exactly (pic stores integers), m/z within numpress' linear-prediction rounding.
+    #[test]
+    #[ignore]
+    fn numpress_mzml_matches_its_zlib_twin() {
+        let pair = std::env::var("SAGE_NUMPRESS_PAIR").expect("SAGE_NUMPRESS_PAIR=<numpress>,<zlib>");
+        let (numpress, zlib) = pair.split_once(',').expect("two comma-separated paths");
+        let numpress = crate::util::read_mzml(numpress, 0, None).expect("numpress mzML");
+        let zlib = crate::util::read_mzml(zlib, 0, None).expect("zlib mzML");
+        assert_eq!(numpress.len(), zlib.len());
+        let mut max_ppm = 0f64;
+        let mut peaks = 0usize;
+        for (a, b) in numpress.iter().zip(&zlib) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.intensity, b.intensity, "intensities of {}", a.id);
+            assert_eq!(a.mz.len(), b.mz.len());
+            for (&x, &y) in a.mz.iter().zip(&b.mz) {
+                max_ppm = max_ppm.max(((x as f64 - y as f64) / y as f64).abs() * 1e6);
+            }
+            peaks += a.mz.len();
+        }
+        eprintln!("{} spectra, {peaks} peaks, max m/z difference {max_ppm:.6} ppm", numpress.len());
+        assert!(max_ppm < 0.01, "max m/z difference {max_ppm} ppm");
+    }
 
     #[tokio::test]
     async fn parse_spectrum_issue_78() -> Result<(), MzMLError> {

@@ -73,3 +73,34 @@ The long MGF difference is SAGE's own run-to-run noise: `56ae675` run on the pla
 the gzipped file (identical spectra) differs in the same columns
 (`sage_discriminant_score`, `posterior_error`, every q-value); scores, features and
 fragments are identical. On F9477's pmsms the same LDA noise never reaches the q-values.
+
+## Stage 2a: MS-Numpress decoding
+
+The pipeline's only mzML flavour (`pmsms2mzml --numpress`) crashed SAGE: the numpress
+cvParam was unknown, the bytes were read as float64, and `copy_from_slice` panicked on
+the remainder. `sage-cloudpath/src/numpress.rs` decodes the three codecs in safe Rust:
+a bounds-checked half-byte reader, `decode_linear` (m/z), `decode_pic` and
+`decode_slof` (intensities), appending f32 to a reused buffer; corrupt or truncated
+input is an error, never a panic (the linear predictor's i64 arithmetic is checked
+too: the reference overflows silently).
+
+No external crate: `numpress` 1.1.0 has the linear codec only; `numpress-rs` 1.1.1 (what
+`mzdata` uses, via `mzdata-bindata`) is raw-pointer unsafe code that panics on arrays
+under 8 bytes, over-reserves `decode_pic` 40 bytes per input byte and returns `Ok(0)`
+from it, and `shrink_to_fit`s every call.
+
+The mzML reader maps MS:1002312/1002746 to linear, MS:1002313/1002747 to pic,
+MS:1002314/1002748 to slof; the 10027xx terms ("followed by zlib") also set the zlib
+flag, so zlib is inflated once even where it is also declared as MS:1000574 (as
+`pmsms2mzml --numpress` does). The codec resets at each `binaryDataArray` and
+overrides the float-width term.
+
+Verified:
+- **Reference vectors:** arrays encoded and decoded by the reference C++ (vendored in
+  `git/pmsms2mzml`) decode to the same f32 bits; every truncated prefix errors or decodes
+  a prefix of the values; random bytes never panic.
+- **Real data** (`numpress_mzml_matches_its_zlib_twin`, ignored test, `SAGE_NUMPRESS_PAIR`):
+  the numpress and zlib mzML of `temp/streaming_test_data` decode to identical arrays,
+  intensities and m/z alike (short: 2,498 spectra, 6.6M peaks; long: 137,411 spectra,
+  367.6M peaks; m/z difference 0 ppm: pmsms2mzml's optimal fixed point round-trips every
+  f32).
