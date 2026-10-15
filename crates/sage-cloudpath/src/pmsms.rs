@@ -17,9 +17,9 @@
 //!   fragment_event_cnt(u64)
 //!   Two further columns, ppm_tol_lo(f64) and ppm_tol_hi(f64), are optional:
 //!   a window on observed − theoretical precursor mass, like `precursor_tol`.
-//!   When both are present in the schema, each row's `isolation_window` is
+//!   When both are present in the schema, each row's `precursor_tol` is
 //!   set to `Tolerance::Ppm(ppm_tol_lo, ppm_tol_hi)`; when either is absent,
-//!   `isolation_window` is `None` and the run's global `precursor_tol`
+//!   `precursor_tol` is `None` and the run's global `precursor_tol`
 //!   applies instead — this keeps precursor tables without the columns
 //!   working unchanged.
 //!   A further column, intensity(i64), is also optional (see
@@ -398,7 +398,7 @@ impl PmsmsSpectra {
     }
 
     fn precursors(p: &PrecursorRow) -> Vec<Precursor> {
-        let isolation_window = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
+        let precursor_tol = p.ppm_tol.map(|(lo, hi)| Tolerance::Ppm(lo, hi));
 
         // One Precursor per charge state — mirrors how the MGF parser handles
         // CHARGE=234+ (regex extracts digits 2, 3, 4 as separate Precursor entries).
@@ -408,7 +408,8 @@ impl PmsmsSpectra {
                 intensity: p.ms1_intensity,
                 charge: None,
                 spectrum_ref: None,
-                isolation_window,
+                isolation_window: None,
+                precursor_tol,
                 inverse_ion_mobility: Some(p.iim),
             }]
         } else {
@@ -419,7 +420,8 @@ impl PmsmsSpectra {
                     intensity: p.ms1_intensity,
                     charge: Some(c),
                     spectrum_ref: None,
-                    isolation_window,
+                    isolation_window: None,
+                    precursor_tol,
                     inverse_ion_mobility: Some(p.iim),
                 })
                 .collect()
@@ -625,8 +627,8 @@ mod test {
                 assert_eq!(pa.inverse_ion_mobility, pb.inverse_ion_mobility);
                 // Fixture has no ppm_tol_lo/ppm_tol_hi columns in either format —
                 // both readers must fall back to `None` (run's global precursor_tol).
-                assert!(pa.isolation_window.is_none());
-                assert!(pb.isolation_window.is_none());
+                assert!(pa.precursor_tol.is_none());
+                assert!(pb.precursor_tol.is_none());
             }
         }
         let _ = std::fs::remove_dir_all(&table_dir);
@@ -665,7 +667,7 @@ mod test {
                             assert_eq!(pa.intensity, pb.intensity);
                             assert_eq!(pa.spectrum_ref, pb.spectrum_ref);
                             assert_eq!(pa.inverse_ion_mobility, pb.inverse_ion_mobility);
-                            assert_eq!(pa.isolation_window, pb.isolation_window);
+                            assert_eq!(pa.precursor_tol, pb.precursor_tol);
                         }
                     }
                 }
@@ -750,7 +752,7 @@ mod test {
     }
 
     #[test]
-    fn ppm_tol_columns_present_set_isolation_window() {
+    fn ppm_tol_columns_present_set_precursor_tol() {
         let precursors_dir = MmappetDirBuilder::new("precursors_with_ppm")
             .column("uint64", "precursor_idx", &[0u64, 1])
             .column("float64", "mz", &[500.0f64, 600.0])
@@ -768,14 +770,14 @@ mod test {
             .expect("parse with ppm columns");
         assert_eq!(spectra.len(), 2);
 
-        match spectra[0].precursors[0].isolation_window {
+        match spectra[0].precursors[0].precursor_tol {
             Some(Tolerance::Ppm(lo, hi)) => {
                 assert_eq!(lo, -10.0);
                 assert_eq!(hi, 10.0);
             }
             other => panic!("expected Some(Ppm(-10, 10)), got {other:?}"),
         }
-        match spectra[1].precursors[0].isolation_window {
+        match spectra[1].precursors[0].precursor_tol {
             Some(Tolerance::Ppm(lo, hi)) => {
                 assert_eq!(lo, -20.0);
                 assert_eq!(hi, 20.0);
@@ -789,10 +791,10 @@ mod test {
     }
 
     #[test]
-    fn ppm_tol_columns_absent_isolation_window_is_none() {
+    fn ppm_tol_columns_absent_precursor_tol_is_none() {
         // Same shape as above, but the ppm_tol_lo/ppm_tol_hi columns are
         // omitted entirely — this must parse exactly like today's real
-        // pmsms tables (no error, isolation_window falls back to None).
+        // pmsms tables (no error, precursor_tol falls back to None).
         let precursors_dir = MmappetDirBuilder::new("precursors_without_ppm")
             .column("uint64", "precursor_idx", &[0u64, 1])
             .column("float64", "mz", &[500.0f64, 600.0])
@@ -808,7 +810,7 @@ mod test {
             .expect("parse without ppm columns");
         assert_eq!(spectra.len(), 2);
         for spectrum in &spectra {
-            assert!(spectrum.precursors[0].isolation_window.is_none());
+            assert!(spectrum.precursors[0].precursor_tol.is_none());
         }
 
         for dir in [&precursors_dir, &pmsms_dir, &table_dir] {

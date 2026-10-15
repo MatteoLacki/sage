@@ -128,19 +128,22 @@ pub struct Precursor {
     pub charge: Option<u8>,
     // pub scan: Option<usize>,
     pub spectrum_ref: Option<String>,
+    /// The instrument's isolation window around `mz` as the raw data give it (TDF
+    /// isolation width, mzML isolation-window offsets, MGF `TOL=`): what a `wide_window`
+    /// search searches, never the precursor mass tolerance.
     pub isolation_window: Option<Tolerance>,
+    /// A precursor mass tolerance for this precursor alone (pmsms `ppm_tol_lo`/
+    /// `ppm_tol_hi`), instead of the configured `precursor_tol`.
+    pub precursor_tol: Option<Tolerance>,
     pub inverse_ion_mobility: Option<f32>,
 }
 
 impl Precursor {
-    /// This precursor's own tolerance if it has one, otherwise `default`.
-    ///
-    /// Lets individual precursors override the run-global precursor
-    /// tolerance (e.g. per-precursor ppm bounds sourced from the pmsms
-    /// precursors table) while falling back to existing behavior when
-    /// `isolation_window` is unset.
+    /// This precursor's own mass tolerance if it has one, otherwise `default` (the
+    /// configured `precursor_tol`). The raw data's isolation window is not a mass
+    /// tolerance and never used here.
     pub fn effective_precursor_tol(&self, default: Tolerance) -> Tolerance {
-        self.isolation_window.unwrap_or(default)
+        self.precursor_tol.unwrap_or(default)
     }
 }
 
@@ -833,9 +836,10 @@ mod test {
     }
 
     #[test]
-    fn effective_precursor_tol_uses_own_window_when_set() {
+    fn effective_precursor_tol_uses_own_tolerance_when_set() {
         let p = Precursor {
-            isolation_window: Some(Tolerance::Ppm(-5.0, 5.0)),
+            precursor_tol: Some(Tolerance::Ppm(-5.0, 5.0)),
+            isolation_window: Some(Tolerance::Da(-1.5, 1.5)),
             ..Default::default()
         };
         let default = Tolerance::Ppm(-20.0, 20.0);
@@ -849,9 +853,9 @@ mod test {
     }
 
     #[test]
-    fn effective_precursor_tol_falls_back_to_default_when_unset() {
+    fn effective_precursor_tol_ignores_the_isolation_window() {
         let p = Precursor {
-            isolation_window: None,
+            isolation_window: Some(Tolerance::Da(-1.5, 1.5)),
             ..Default::default()
         };
         let default = Tolerance::Ppm(-20.0, 20.0);

@@ -187,10 +187,37 @@ fn candidate_unreachable_without_custom_window() {
     );
 }
 
+#[test]
+fn raw_isolation_window_is_not_a_precursor_tolerance() {
+    let db = mk_ppm_window_database();
+    let (_, peaks) = target_peaks(&db);
+    let target_mass = db[target_peaks(&db).0].monoisotopic;
+    let precursor = Precursor {
+        mz: shifted_precursor_mz(target_mass, 30.0),
+        charge: Some(1),
+        // A DDA isolation window (e.g. TDF's ±1.5 Da) reaches far beyond 30 ppm, but it
+        // is the instrument's window, not a mass tolerance.
+        isolation_window: Some(Tolerance::Da(-1.5, 1.5)),
+        ..Default::default()
+    };
+    let query = ProcessedSpectrum {
+        level: 2,
+        id: "raw-isolation-window".into(),
+        precursors: vec![precursor],
+        peaks: peaks.into(),
+        ..Default::default()
+    };
+    let scorer = mk_scorer(&db, Tolerance::Ppm(-5.0, 5.0));
+    assert!(
+        scorer.score_standard(&query).is_empty(),
+        "the configured 5 ppm, not the isolation window, bounds the candidates"
+    );
+}
+
 /// The same candidate as above IS reachable once the precursor carries its
-/// own wide `isolation_window`, even though the run-global `precursor_tol`
+/// own wide `precursor_tol`, even though the run-global `precursor_tol`
 /// is unchanged (and still too narrow on its own) — this exercises the
-/// per-precursor ppm override added on top of `Precursor::isolation_window`.
+/// per-precursor ppm override `Precursor::precursor_tol`.
 #[test]
 fn candidate_reachable_with_wide_custom_window() {
     let db = mk_ppm_window_database();
@@ -203,7 +230,7 @@ fn candidate_reachable_with_wide_custom_window() {
     let precursor = Precursor {
         mz,
         charge: Some(1),
-        isolation_window: Some(Tolerance::Ppm(-50.0, 50.0)), // custom per-precursor override
+        precursor_tol: Some(Tolerance::Ppm(-50.0, 50.0)), // custom per-precursor override
         ..Default::default()
     };
     let query = ProcessedSpectrum {

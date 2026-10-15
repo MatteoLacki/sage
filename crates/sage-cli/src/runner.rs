@@ -146,6 +146,9 @@ fn resolve_predicted_fragment_intensity(
 
 pub struct Runner {
     pub database: IndexedDatabase,
+    /// Searched spectra whose raw data give a precursor isolation window or tolerance,
+    /// which the search doesn't use (see `note_raw_precursor_window`).
+    raw_precursor_windows: std::sync::atomic::AtomicUsize,
     /// With `database.sliced`, the whole peptide table. `database` is then empty
     /// until the search is over, and afterwards holds only the reported peptides.
     pub compact: Option<CompactPeptides>,
@@ -330,6 +333,7 @@ impl Runner {
                 start.elapsed()
             );
             return Ok(Self {
+                raw_precursor_windows: Default::default(),
                 database: IndexedDatabase::default(),
                 compact: Some(compact),
                 parameters,
@@ -361,6 +365,7 @@ impl Runner {
                     // never needed here, regardless of whether it's configured
                     // for the real search below.
                     let mini_runner = Self {
+                        raw_precursor_windows: Default::default(),
                         database: IndexedDatabase::default(),
                         compact: None,
                         parameters: parameters.clone(),
@@ -383,6 +388,7 @@ impl Runner {
             (start.elapsed())
         );
         Ok(Self {
+            raw_precursor_windows: Default::default(),
             database,
             compact: None,
             parameters,
@@ -605,6 +611,7 @@ impl Runner {
         let features: Vec<_> = msn_spectra
             .par_iter()
             .filter(|spectrum| self.is_searched(spectrum))
+            .inspect(|spectrum| self.note_raw_precursor_window(spectrum))
             .map(|x| {
                 let prev = counter.fetch_add(1, Ordering::Relaxed);
                 if prev > 0 && prev % 10_000 == 0 {
@@ -699,6 +706,34 @@ impl Runner {
         spectrum.peaks.len() >= self.parameters.min_peaks && spectrum.level == 2
     }
 
+    /// Counts a searched spectrum whose raw data give its precursor an isolation window or
+    /// tolerance (TDF isolation width, mzML isolation window, MGF `TOL=`): the configured
+    /// `precursor_tol` is searched instead, and `run` says so once.
+    pub(crate) fn note_raw_precursor_window(&self, spectrum: &ProcessedSpectrum) {
+        let has_raw_window = spectrum
+            .precursors
+            .first()
+            .is_some_and(|precursor| precursor.isolation_window.is_some());
+        if has_raw_window && !self.parameters.wide_window {
+            self.raw_precursor_windows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn log_unused_raw_precursor_windows(&self) {
+        let spectra = self
+            .raw_precursor_windows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if spectra > 0 {
+            log::warn!(
+                "{spectra} searched spectra carry a precursor isolation window or tolerance from the \
+                 raw data (TDF isolation width, mzML isolation window, MGF TOL=); it is not used: \
+                 the configured precursor_tol {:?} is (wide_window searches isolation windows)",
+                self.parameters.precursor_tol
+            );
+        }
+    }
+
     /// `file`'s MS2 spectra to read one at a time, or `None` when this run reads it
     /// whole: its format has no index, or TMT/LFQ still need the batch reader.
     pub(crate) fn open_indexed_spectra(&self, file: &Url, file_id: usize) -> Option<IndexedSpectra> {
@@ -783,6 +818,7 @@ impl Runner {
                 || spectra.reader(),
                 |reader, index| match spectra.processed(index, processor, reader) {
                     Some(spectrum) if self.is_searched(&spectrum) => {
+                        self.note_raw_precursor_window(&spectrum);
                         searched.fetch_add(1, Ordering::Relaxed);
                         scorer.score(&spectrum)
                     }
@@ -1085,6 +1121,7 @@ impl Runner {
             }
             Some(table) => self.batch_files_sliced(table, &predictions, parallel)?,
         };
+        self.log_unused_raw_precursor_windows();
         drop(predictions);
         if let Some(table) = self.compact.take() {
             self.database = sliced_search::reported_database(&table, &mut outputs.features);

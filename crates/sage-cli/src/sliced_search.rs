@@ -297,6 +297,12 @@ fn score_spectrum<'a>(
 ) -> Vec<(usize, Vec<Feature>)> {
     let first = &queries[run[0]];
     let spectrum = files[first.file].processed(first.spectrum, processor, &mut readers[first.file]);
+    if let Some(spectrum) = spectrum
+        .as_ref()
+        .filter(|spectrum| runner.is_searched(spectrum))
+    {
+        runner.note_raw_precursor_window(spectrum);
+    }
     run.iter()
         .map(|&index| {
             let features = match &spectrum {

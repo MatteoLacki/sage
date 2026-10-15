@@ -147,11 +147,19 @@ missing (the common case — no upstream writer populates them yet), behavior
 is unchanged from before this existed. Design/history:
 `necromerge2`'s `plans/per_precursor_ppm_tolerance.md`.
 
-This rides on `Precursor::isolation_window: Option<Tolerance>`
-(`crates/sage/src/spectrum.rs`), which pre-existing wide-window/DIA search
-already used per-spectrum; `Precursor::effective_precursor_tol` is the
-`unwrap_or`-onto-global-tol helper, used by both the wide-window and
-standard search branches in `crates/sage/src/scoring.rs::initial_hits`.
+This lives in `Precursor::precursor_tol: Option<Tolerance>`
+(`crates/sage/src/spectrum.rs`); `Precursor::effective_precursor_tol` is the
+`unwrap_or`-onto-global-tol helper the standard search uses
+(`crates/sage/src/scoring.rs::initial_hits`, `candidate_mass_window`).
+
+Until 2026-10-15 it rode on `Precursor::isolation_window` instead, which the TDF,
+mzML and MGF readers fill with the instrument's isolation window (TDF isolation
+width, mzML isolation-window offsets, MGF `TOL=`) for `wide_window` searches. So
+every DDA search used its isolation window (G23: about ±3 Da) as the precursor
+tolerance and ignored `precursor_tol`. The two are separate fields now: the
+configured `precursor_tol` (or a pmsms row's own) is the search tolerance; the raw
+data's isolation window is only searched by `wide_window`, and when a search ignores
+it SAGE warns once with the number of spectra that carried one.
 Column reading lives in `crates/sage-cloudpath/src/pmsms.rs` (parquet and
 mmappet paths both use an *optional* column lookup — missing column is
 `None`, not an error, unlike the 7 required columns).
