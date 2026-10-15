@@ -23,10 +23,10 @@ pub enum IndexedSpectra {
 /// decompressor that moves forward through the thread's run of indices.
 pub type IndexedReader<'a> = Option<TextReader<'a>>;
 
-/// What planning a sliced search needs of a spectrum: its MS level and first precursor.
+/// What planning a sliced search needs of a spectrum: its MS level and precursors.
 pub struct SpectrumHeader {
     pub level: u8,
-    pub precursor: Option<Precursor>,
+    pub precursors: Vec<Precursor>,
 }
 
 impl IndexedSpectra {
@@ -58,34 +58,28 @@ impl IndexedSpectra {
         index: usize,
         reader: &mut IndexedReader<'a>,
     ) -> Option<SpectrumHeader> {
-        let first_precursor = |level, precursors: Vec<Precursor>| SpectrumHeader {
-            level,
-            precursor: precursors.into_iter().next(),
-        };
+        let header = |level, precursors| SpectrumHeader { level, precursors };
         match self {
-            Self::Pmsms(spectra) => Some(SpectrumHeader {
-                level: 2,
-                precursor: Some(spectra.first_precursor(index)),
-            }),
+            Self::Pmsms(spectra) => Some(header(2, spectra.precursors_of(index))),
             Self::Tdf(spectra) => spectra
                 .read(index)
-                .map(|raw| first_precursor(raw.ms_level, raw.precursors)),
+                .map(|raw| header(raw.ms_level, raw.precursors)),
             Self::Text(spectra) => {
                 let reader = reader
                     .as_mut()
                     .expect("text files read through a TextReader");
                 match spectra.read(index, reader) {
-                    Ok(raw) => raw.map(|raw| first_precursor(raw.ms_level, raw.precursors)),
+                    Ok(raw) => raw.map(|raw| header(raw.ms_level, raw.precursors)),
                     Err(error) => {
                         log::error!("cannot read spectrum {index}: {error}");
                         None
                     }
                 }
             }
-            Self::InMemory(spectra) => Some(SpectrumHeader {
-                level: spectra[index].level,
-                precursor: spectra[index].precursors.first().cloned(),
-            }),
+            Self::InMemory(spectra) => Some(header(
+                spectra[index].level,
+                spectra[index].precursors.clone(),
+            )),
             Self::Unreadable => None,
         }
     }

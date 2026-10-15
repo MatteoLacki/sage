@@ -13,7 +13,7 @@ use sage_core::compact::{drop_in_parallel, CompactPeptide, CompactPeptides};
 use sage_core::database::{IndexedDatabase, PeptideIx};
 use sage_core::scoring::{Feature, RankingScore, Scorer};
 use sage_core::slicing::{rows_reaching, SlicePlan};
-use sage_core::spectrum::{ProcessedSpectrum, SpectrumProcessor};
+use sage_core::spectrum::{Precursor, ProcessedSpectrum, SpectrumProcessor};
 use std::time::Instant;
 
 /// While a slice's index is built, a row costs its `Peptide` plus, per fragment,
@@ -34,8 +34,8 @@ struct Query {
     /// Lowest candidate mass; decides the slice.
     window_low: f32,
     window_high: f32,
-    /// The spectrum's own precursor isn't annotated with `charge`, so it is scored
-    /// through a copy that is.
+    /// The spectrum as read would search other charges too (or not this one), so it is
+    /// scored through a copy whose only precursor carries `charge`.
     needs_annotation: bool,
 }
 
@@ -265,18 +265,19 @@ fn plan_queries(planner: &Scorer, files: &[IndexedSpectra]) -> Vec<Query> {
             let Some(header) = header.filter(|header| header.level == 2) else {
                 continue;
             };
-            let precursor = header.precursor.unwrap_or_else(|| {
+            let Some(precursor) = header.precursors.first() else {
                 panic!("missing MS1 precursor for spectrum {index} of file {file}");
-            });
-            for charge in planner.candidate_charges(&precursor) {
-                let (window_low, window_high) = planner.candidate_mass_window(&precursor, charge);
+            };
+            let charges = planner.candidate_charges(&header.precursors);
+            for charge in charges.iter() {
+                let (window_low, window_high) = planner.candidate_mass_window(precursor, charge);
                 queries.push(Query {
                     file,
                     spectrum: index,
                     charge,
                     window_low,
                     window_high,
-                    needs_annotation: precursor.charge != Some(charge),
+                    needs_annotation: !charges.is_only(charge),
                 });
             }
         }
@@ -314,7 +315,10 @@ fn score_query(scorer: &Scorer, spectrum: &ProcessedSpectrum, query: &Query) -> 
         return scorer.score(spectrum);
     }
     let mut annotated = spectrum.clone();
-    annotated.precursors[0].charge = Some(query.charge);
+    annotated.precursors = vec![Precursor {
+        charge: Some(query.charge),
+        ..spectrum.precursors[0].clone()
+    }];
     scorer.score(&annotated)
 }
 

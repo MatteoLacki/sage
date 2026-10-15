@@ -460,6 +460,61 @@ fn max_fragment_charge(max_fragment_charge: Option<u8>, precursor_charge: u8) ->
         .max(2)
 }
 
+/// Precursor charges are listed as single decimal digits (pmsms `charges`, MGF
+/// `CHARGE=`), so one ion has at most nine.
+const MAX_LISTED_CHARGES: usize = 9;
+
+/// The precursor charges a search tries for one spectrum, in search order: those listed
+/// for its ion, or the configured range for an ion without a charge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateCharges {
+    listed: [u8; MAX_LISTED_CHARGES],
+    listed_len: usize,
+    range: Option<std::ops::RangeInclusive<u8>>,
+}
+
+impl CandidateCharges {
+    fn listed() -> Self {
+        Self {
+            listed: [0; MAX_LISTED_CHARGES],
+            listed_len: 0,
+            range: None,
+        }
+    }
+
+    fn range(range: std::ops::RangeInclusive<u8>) -> Self {
+        Self {
+            range: Some(range),
+            ..Self::listed()
+        }
+    }
+
+    /// Adds a listed charge unless it is listed already.
+    fn add(&mut self, charge: u8) {
+        if self.listed[..self.listed_len].contains(&charge) {
+            return;
+        }
+        assert!(
+            self.listed_len < MAX_LISTED_CHARGES,
+            "an ion lists more than {MAX_LISTED_CHARGES} charges"
+        );
+        self.listed[self.listed_len] = charge;
+        self.listed_len += 1;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        self.listed[..self.listed_len]
+            .iter()
+            .copied()
+            .chain(self.range.clone().into_iter().flatten())
+    }
+
+    /// Whether `charge` is the only charge tried.
+    pub fn is_only(&self, charge: u8) -> bool {
+        self.iter().eq(std::iter::once(charge))
+    }
+}
+
 impl<'db> Scorer<'db> {
     /// Perform a quick first-pass scoring, where we consider a peptide "identified"
     /// if it meets the following criterion:
@@ -820,12 +875,24 @@ impl<'db> Scorer<'db> {
         }
     }
 
-    /// The precursor charges a (non-wide-window) search tries for `precursor`.
-    pub fn candidate_charges(&self, precursor: &Precursor) -> std::ops::RangeInclusive<u8> {
-        match precursor.charge {
-            Some(charge) if !self.override_precursor_charge => charge..=charge,
-            _ => self.min_precursor_charge..=self.max_precursor_charge,
+    /// The precursor charges a (non-wide-window) search tries for a spectrum with
+    /// `precursors`: every charge listed for its first precursor's ion (precursors sharing
+    /// its m/z, e.g. a pmsms precursor with charges 2/3 or an MGF `CHARGE=2+ and 3+`),
+    /// searched together; the configured range when that ion has no charge, or under
+    /// `override_precursor_charge`.
+    pub fn candidate_charges(&self, precursors: &[Precursor]) -> CandidateCharges {
+        let first = &precursors[0];
+        if first.charge.is_none() || self.override_precursor_charge {
+            return CandidateCharges::range(self.min_precursor_charge..=self.max_precursor_charge);
         }
+        let mut charges = CandidateCharges::listed();
+        let same_ion = precursors
+            .iter()
+            .filter(|precursor| precursor.mz.to_bits() == first.mz.to_bits());
+        for charge in same_ion.filter_map(|precursor| precursor.charge) {
+            charges.add(charge);
+        }
+        charges
     }
 
     /// The monoisotopic-mass range holding every candidate a (non-wide-window)
@@ -862,10 +929,9 @@ impl<'db> Scorer<'db> {
                 },
             )
         } else {
-            // An annotated charge is searched once; an unannotated one (or any, under
-            // `override_precursor_charge`) at every charge in the configured range.
+            // Every candidate charge feeds one pool of hits, trimmed together.
             let precursor_tol = precursor.effective_precursor_tol(self.precursor_tol);
-            self.candidate_charges(precursor).fold(
+            self.candidate_charges(&query.precursors).iter().fold(
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
                     let precursor_mass = mz * precursor_charge as f32;
@@ -1600,12 +1666,25 @@ mod tests {
             max_precursor_charge: 4,
             ..mk_isotope_test_scorer(&database)
         };
-        let annotated = Precursor { charge: Some(3), ..Default::default() };
-        let unannotated = Precursor::default();
-        assert_eq!(scorer.candidate_charges(&annotated), 3..=3);
-        assert_eq!(scorer.candidate_charges(&unannotated), 2..=4);
+        let at = |mz: f32, charge: Option<u8>| Precursor { mz, charge, ..Default::default() };
+        let annotated = [at(500.0, Some(3))];
+        let unannotated = [at(500.0, None)];
+        let charges = |scorer: &Scorer, precursors: &[Precursor]| {
+            scorer.candidate_charges(precursors).iter().collect::<Vec<u8>>()
+        };
+        assert_eq!(charges(&scorer, &annotated), [3]);
+        assert!(scorer.candidate_charges(&annotated).is_only(3));
+        assert_eq!(charges(&scorer, &unannotated), [2, 3, 4]);
+        // One ion listed at several charges (pmsms charges 23, MGF CHARGE=2+ and 3+).
+        let listed = [at(500.0, Some(2)), at(500.0, Some(3)), at(500.0, Some(2))];
+        assert_eq!(charges(&scorer, &listed), [2, 3]);
+        assert!(!scorer.candidate_charges(&listed).is_only(2));
+        // Another ion (chimeric mzML) doesn't add its charge.
+        let chimeric = [at(500.0, Some(2)), at(612.5, Some(3))];
+        assert_eq!(charges(&scorer, &chimeric), [2]);
         let overriding = Scorer { override_precursor_charge: true, ..scorer };
-        assert_eq!(overriding.candidate_charges(&annotated), 2..=4);
+        assert_eq!(charges(&overriding, &annotated), [2, 3, 4]);
+        assert_eq!(charges(&overriding, &listed), [2, 3, 4]);
     }
 
     fn mk_isotope_test_scorer(database: &IndexedDatabase) -> Scorer<'_> {

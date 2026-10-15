@@ -66,15 +66,16 @@ that shift:
 
 ## Charges
 
-`plan_queries` makes one query per charge `initial_hits` would try for
-`precursors.first()`. That keeps the existing behaviour for multi-charge pmsms
-precursors (charges 23, 24, 34, 234): only the first charge is searched. That is 26%
-of F9477's precursors.
+`plan_queries` makes one query per charge `initial_hits` would try
+(`Scorer::candidate_charges`): every charge listed for the first precursor's ion,
+including multi-charge pmsms precursors (charges 23, 24, 34, 234: 26% of F9477's
+precursors), which until 2026-10-15 were searched at their first charge only (see
+`multi_charge_precursors.md`).
 
 A spectrum searched at one charge is fully exact. A spectrum searched at several
-(unannotated, or `override_precursor_charge`) becomes one query per charge, scored
-on a copy annotated with that charge (slice scorers run with
-`override_precursor_charge = false`). Those queries can land in different slices, so
+(listed charges, unannotated, or `override_precursor_charge`) becomes one query per
+charge, scored on a copy whose only precursor carries that charge (slice scorers run
+with `override_precursor_charge = false`). Those queries can land in different slices, so
 `rank_across_charges` merges them:
 - **Re-ranked together:** the best `report_psms` by rank key, with `rank` and
   `delta_best` recomputed. `delta_next` is taken against the next reported PSM or

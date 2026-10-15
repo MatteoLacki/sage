@@ -391,12 +391,10 @@ impl PmsmsSpectra {
         self.precursors.is_empty()
     }
 
-    /// Spectrum `index`'s first precursor: all a sliced search needs to plan its queries.
-    pub fn first_precursor(&self, index: usize) -> Precursor {
+    /// Spectrum `index`'s precursors, without reading its fragments: all a sliced search
+    /// needs to plan its queries.
+    pub fn precursors_of(&self, index: usize) -> Vec<Precursor> {
         Self::precursors(&self.precursors[index])
-            .into_iter()
-            .next()
-            .expect("a pmsms spectrum has at least one precursor")
     }
 
     fn precursors(p: &PrecursorRow) -> Vec<Precursor> {
