@@ -19,6 +19,11 @@ use std::time::Instant;
 /// peptide merged from several digests keeps an arbitrary duplicate's `position`,
 /// `semi_enzymatic` and `missed_cleavages`, so those are counted, not failed.
 ///
+/// With `--direct` (non-specific digests), first build the table with
+/// `CompactPeptides::build_nonspecific`, then require it to equal the per-length
+/// table row for row: mass bits, length, decoy flag, variable sites and the residues
+/// at `start`. Differing `start` offsets and `position`s are counted, not failed.
+///
 /// Prints a TSV per length to stdout and `#`-prefixed summary lines; exits
 /// non-zero on any mismatch.
 fn main() -> anyhow::Result<()> {
@@ -74,11 +79,18 @@ fn main() -> anyhow::Result<()> {
                 .action(ArgAction::SetTrue)
                 .help("Also compare against the whole database digested at once"),
         )
+        .arg(
+            Arg::new("direct")
+                .long("direct")
+                .action(ArgAction::SetTrue)
+                .help("Also build the table directly (non-specific digests) and compare"),
+        )
         .get_matches();
 
     let fasta_path = matches.get_one::<String>("fasta").unwrap();
     let protein_check_every = (*matches.get_one::<usize>("protein-check-every").unwrap()).max(1);
     let full = matches.get_flag("full");
+    let direct = matches.get_flag("direct");
 
     // Must happen before parsing --config below: overrides the embedded
     // default table `static_mods`/`variable_mods`'s `UNIMOD:<id>`
@@ -101,6 +113,24 @@ fn main() -> anyhow::Result<()> {
 
     let fasta =
         sage_cloudpath::util::read_fasta(&params.fasta, &params.decoy_tag, params.generate_decoys)?;
+
+    let direct_table = match direct {
+        true => {
+            reset_peak_rss()?;
+            let start = Instant::now();
+            let direct_table = CompactPeptides::build_nonspecific(&params, &fasta)?;
+            println!(
+                "# direct build: {} rows ({:.3} GB) in {:.2} s, {} adjacent rows out of sage's order, peak rss {:.3} GB",
+                direct_table.rows.len(),
+                compact_gb(direct_table.rows.len()),
+                start.elapsed().as_secs_f64(),
+                direct_table.row_order_violations(),
+                peak_rss_bytes()? as f64 / 1e9,
+            );
+            Some(direct_table)
+        }
+        false => None,
+    };
 
     let mut table = CompactPeptides::new(&params, &fasta)?;
     println!(
@@ -159,6 +189,11 @@ fn main() -> anyhow::Result<()> {
         peak_rss_bytes()? as f64 / 1e9,
     );
     failures += order_violations;
+
+    if let Some(direct_table) = &direct_table {
+        failures += direct_table.row_order_violations();
+        failures += compare_with_direct_build(&table, direct_table);
+    }
 
     if full {
         failures += compare_with_full_digest(&table, &params.digest(&fasta));
@@ -252,6 +287,42 @@ fn compare_with_full_digest(table: &CompactPeptides, expected: &[Peptide]) -> us
         start.elapsed().as_secs_f64(),
     );
     field_mismatches
+}
+
+/// Row-for-row comparison of the per-length table with the direct build. Returns
+/// the failure count; `start` (same residues, another occurrence) and `position`
+/// differences are reported, not failures.
+fn compare_with_direct_build(by_length: &CompactPeptides, direct: &CompactPeptides) -> usize {
+    if by_length.rows.len() != direct.rows.len() {
+        println!(
+            "# direct build: {} rows, per-length {} rows",
+            direct.rows.len(),
+            by_length.rows.len()
+        );
+        return 1;
+    }
+    let (mismatches, other_starts, other_positions) = by_length
+        .rows
+        .par_iter()
+        .zip(&direct.rows)
+        .map(|(a, b)| {
+            let same = a.monoisotopic.to_bits() == b.monoisotopic.to_bits()
+                && by_length.same_row_apart_from_occurrence(a, direct, b);
+            (
+                !same as usize,
+                (a.start() != b.start()) as usize,
+                (a.position() != b.position()) as usize,
+            )
+        })
+        .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+    println!(
+        "# direct build vs per-length: {} rows, {} mismatches; start at another occurrence {}, position differing {}",
+        direct.rows.len(),
+        mismatches,
+        other_starts,
+        other_positions,
+    );
+    mismatches
 }
 
 /// The attributes a peptide merged from several digests takes from whichever

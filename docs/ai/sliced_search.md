@@ -164,3 +164,19 @@ The 42 GB peak follows from the budget: the slices are sized to half the memory
 available when slicing starts (about 30 GB), and glibc keeps the compact build's freed
 heap mapped. Fewer, larger slices search faster; `SAGE_SLICE_FRAGMENTS` trades speed
 for a lower peak.
+
+Since 2026-10-15 a non-specific table is generated directly (`compact_peptides.md`).
+F9477 class I, same binary otherwise (`70017ca` against the direct build):
+
+| | per-length build | direct build |
+|---|---:|---:|
+| compact table | 144.0 s | 7.7 s |
+| anonymous memory when slicing starts | 11.8 GB | 2.4 GB |
+| slices (fragments in the largest) | 3 (926M) | 3 (1,100M) |
+| sliced search | 233.1 s | 234.5 s |
+| whole run | 394 s | 259 s |
+| peak anonymous / RSS | 35.4 / 46.3 GB | 41.5 / 52.5 GB |
+
+Output identical (484,051 PSMs, 3,308,239 fragments). The higher peak is the budget:
+no freed digest heap is left mapped, so more memory is available when slicing starts
+and the slices come out larger; search time did not change.

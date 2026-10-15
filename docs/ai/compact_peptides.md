@@ -2,14 +2,14 @@
 
 `crates/sage/src/compact.rs` is Stage 1 of `plans/sliced_search.md` (necromerge2 root):
 a peptide database small enough to hold whole for unspecific immunopeptidomics
-digests. Nothing in the search uses it yet.
+digests. The sliced search (`sliced_search.md`) builds its slices from it.
 
 ## Layout
 
 - **`Proteome`:** every target protein's residues concatenated (`u8`), plus
   `protein_starts: Vec<u32>` and the accessions. Human: 11.5 MB.
-- **`CompactPeptide`:** 16 B (`f32` mass, `u32` proteome offset of the target
-  sequence, `u8` length, `u8` flags, two `(u8 position, u8 mass id)` variable-mod
+- **`CompactPeptide`:** 16 B (`f32` mass, `u32` proteome offset of one occurrence of
+  the target sequence, `u8` length, `u8` flags, two `(u8 position, u8 mass id)` variable-mod
   sites, padded from 14 to 16 by alignment).
   - The flags hold decoy, semi-enzymatic, `Position` and missed cleavages (4 bits).
   - Decoys are not stored as sequences. A decoy row points at its target window and
@@ -35,7 +35,89 @@ same modifications. That reproduces both `group_digests`' grouping and
 
 ## Building
 
-`CompactPeptides::build` takes four steps:
+`CompactPeptides::build` generates a non-specific digest (`cleave_at = ""`) directly
+from the proteome (`build_nonspecific`, `compact/nonspecific.rs`). An enzymatic
+digest goes one length at a time through sage's own digest (`build_by_length`), which
+also stays the reference the direct build is checked against.
+
+### Non-specific digests: generated directly (2026-10-15)
+
+Necromerge2 plan: `plans/compact_direct_build.md`. No `Peptide` is ever built. The
+generator replays sage's digest rules on stack scratch space:
+- **Windows:** every substring of each protein, lengths `min_len..=max_len`.
+- **Mass:** per start position, a running f32 sum from `H2O`, one residue added per
+  length. That is `Peptide::try_from`'s own order, so the bits match. Prefix-sum
+  differences would not be bit-identical, and in f32 they lose the mass entirely
+  (titin's running sum reaches ~3.8 MDa, where f32 resolves 0.25 Da). A residue of
+  mass 0 ends the start position's windows.
+- **Modifications:** `ModifiedForm` replays `push_resi` sites, `apply_site`,
+  `static_mods` and `modification_mass` on a stack array. Combinations of at most
+  `max_variable_mods` sites, sites distinct. Variable sites are recorded exactly as
+  `compress_peptide` records them.
+- **First occurrence per protein:** `EnzymeParameters::digest` keeps a sequence once
+  per protein, at its first start, with that start's `Position`. The generator emits
+  every occurrence except two cases whose rows could differ from the first one's:
+  - the protein's N-terminal window repeated later;
+  - the C-terminal window when it occurs earlier in the protein.
+
+  A later internal occurrence of an internal first one yields identical rows, which
+  the merge below drops. Without these two cases, protein-terminal mods produce rows
+  sage never makes: the `[`/`]` edge-case test fails.
+- **Decoys:** the row with the decoy flag, same mass and sites. Dropped, as in
+  `Parameters::digest`, when its sequence (interior reversed) equals some target
+  window: `DecoyFilter` holds one bit per (length, start), filled per length from an
+  open-addressing set of target window offsets (`WindowSet`, keyed by residues,
+  claimed with compare-and-swap).
+
+Rows are placed without a global sort or a second buffer:
+1. **Count:** generate every row and count it per 0.01 Da mass bin (atomic counters).
+   Equal masses share a bin, so duplicates never straddle two.
+2. **Place:** group the fine bins into placement bins of about 65k rows, laid out in
+   mass order in the final `Vec`. Generate every row again (cheap) and claim a slot in
+   its bin with `fetch_add` on the bin's cursor. Each slot is claimed once; an assert
+   catches a bin receiving more rows than counted, and every cursor must end exactly at
+   its bin's end.
+3. **Sort and merge each bin** in parallel (disjoint `&mut` slices): sage's order
+   (mass, sequence, modification vector, N-term, C-term), then `start`, then flags, so
+   the result does not depend on placement order. `reorder_peptides`' dedup keeps the
+   first of each group: the smallest `start`, the first occurrence in the first
+   protein holding it, one of sage's own duplicates.
+4. **Squeeze** the bins left in place over the merged rows' gaps.
+
+`start` is the smallest offset among the occurrences that yield that exact row. The
+per-length build stores the smallest offset of the sequence anywhere. They differ
+only for rows a later occurrence cannot yield (protein-terminal mods), and point at
+the same residues.
+
+| | class I 8–12 aa | class II 9–25 aa |
+|---|---:|---:|
+| rows generated / kept | 161.2M / 148.9M | 654.4M / 620.3M |
+| decoy filter | 1.3 s | 4.7 s |
+| count / place | 0.7 s / 1.3 s | 3.3 s / 5.8 s |
+| sort and merge | 3.8 s | 15.8 s |
+| **direct build** | **7.1 s, 2.6 GB peak RSS** | **29.6 s, 10.5 GB peak RSS** |
+| per-length build | 144 s, ~15 GB | 564 s, 38.2 GB |
+
+Human FASTA, the immunopeptidomics config of `database_size.md`, 16 cores. The class I
+per-length peak was measured as 17.7 GB with the 2.4 GB direct table also resident.
+
+Checked with `verify_compact_peptides --direct` (direct build first, then the
+per-length build with its own checks against sage, then row for row):
+- **class I:** 148,914,339 rows, 0 mismatches in mass bits, length, decoy flag,
+  variable sites or residues; `start` at another occurrence on 794 rows (protein
+  N-terminal acetyl rows), `position` differing on 3,756 and 3,785 in two runs (an
+  arbitrary duplicate attribute, below: sage's own survivor comes from an unstable
+  sort).
+- **class II:** 620,286,533 rows, 0 mismatches; 1,870 and 12,922.
+- **Unit tests** (`cargo test -p sage-core --lib compact`): the non-specific configs
+  against `Parameters::digest` on the main and an edge-case FASTA, with the
+  `[`/`]` protein-terminal and mass-window configs, and the direct build against the
+  per-length build. Disabling the first-occurrence rule or the decoy filter fails
+  them.
+
+### Enzymatic digests: one length at a time
+
+`CompactPeptides::build_by_length` takes four steps:
 1. **Digest each length** with sage's own `Parameters::digest`
    (`Parameters::for_single_length`). This is exact for the reason in
    `database_size.md`: lengths never interact.

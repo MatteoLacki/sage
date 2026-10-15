@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+mod nonspecific;
+
 /// Residue indices share a `u8` with the two peptide-terminus codes.
 const MAX_PEPTIDE_LENGTH: usize = VarSite::NTERM as usize;
 const MAX_VARIABLE_MODS: usize = 2;
@@ -235,13 +237,7 @@ impl CompactPeptide {
         if target.missed_cleavages > MAX_MISSED_CLEAVAGES {
             return Err(CompactError::TooManyMissedCleavages(target.missed_cleavages));
         }
-        let position_code = match target.position {
-            Position::Nterm => 0,
-            Position::Cterm => 1,
-            Position::Full => 2,
-            Position::Internal => 3,
-        };
-        let mut flags = (position_code << Self::POSITION_SHIFT)
+        let mut flags = (Self::position_code(target.position) << Self::POSITION_SHIFT)
             | (target.missed_cleavages << Self::MISSED_CLEAVAGES_SHIFT);
         if target.semi_enzymatic {
             flags |= Self::SEMI_ENZYMATIC;
@@ -253,6 +249,40 @@ impl CompactPeptide {
             flags,
             var_sites: [VarSite::UNUSED; MAX_VARIABLE_MODS],
         })
+    }
+
+    /// A non-specific digest's target row: no missed cleavages, not semi-enzymatic.
+    fn nonspecific_target(
+        monoisotopic: f32,
+        start: u32,
+        length: usize,
+        position: Position,
+        var_sites: [VarSite; MAX_VARIABLE_MODS],
+    ) -> CompactPeptide {
+        CompactPeptide {
+            monoisotopic,
+            start,
+            length: length as u8,
+            flags: Self::position_code(position) << Self::POSITION_SHIFT,
+            var_sites,
+        }
+    }
+
+    /// The decoy `Peptide::reverse` makes of this target row: same start, mass and sites.
+    fn decoy_of(self) -> CompactPeptide {
+        CompactPeptide {
+            flags: self.flags | Self::DECOY,
+            ..self
+        }
+    }
+
+    fn position_code(position: Position) -> u8 {
+        match position {
+            Position::Nterm => 0,
+            Position::Cterm => 1,
+            Position::Full => 2,
+            Position::Internal => 3,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -267,7 +297,12 @@ impl CompactPeptide {
         self.flags & Self::SEMI_ENZYMATIC != 0
     }
 
-    fn position(&self) -> Position {
+    /// Proteome offset of one occurrence of the target sequence.
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    pub fn position(&self) -> Position {
         match (self.flags >> Self::POSITION_SHIFT) & Self::POSITION_MASK {
             0 => Position::Nterm,
             1 => Position::Cterm,
@@ -325,10 +360,22 @@ impl CompactPeptides {
         })
     }
 
+    /// The table [`Parameters::digest`] would give, in its row order: generated
+    /// directly from the proteome for a non-specific digest
+    /// ([`CompactPeptides::build_nonspecific`]), else one length at a time
+    /// ([`CompactPeptides::build_by_length`]).
+    pub fn build(parameters: &Parameters, fasta: &Fasta) -> Result<Self, CompactError> {
+        let enzyme: EnzymeParameters = parameters.enzyme.clone().into();
+        match enzyme.enzyme {
+            None => Self::build_nonspecific(parameters, fasta),
+            Some(_) => Self::build_by_length(parameters, fasta),
+        }
+    }
+
     /// Digest one peptide length at a time with sage's own [`Parameters::digest`]
     /// (lengths never interact, so the union is exactly the full digest), compress
     /// each length, then merge the lengths into sage's global row order.
-    pub fn build(parameters: &Parameters, fasta: &Fasta) -> Result<Self, CompactError> {
+    pub fn build_by_length(parameters: &Parameters, fasta: &Fasta) -> Result<Self, CompactError> {
         let mut table = Self::new(parameters, fasta)?;
         let mut runs = Vec::new();
         for length in table.lengths() {
@@ -585,6 +632,21 @@ impl CompactPeptides {
         Ok(())
     }
 
+    /// `a` (a row of this table) and `b` (a row of `other`, built over the same
+    /// FASTA) are the same peptide, read from the same or another occurrence of its
+    /// residues: equal length, decoy flag, variable sites and residues.
+    pub fn same_row_apart_from_occurrence(
+        &self,
+        a: &CompactPeptide,
+        other: &CompactPeptides,
+        b: &CompactPeptide,
+    ) -> bool {
+        a.length == b.length
+            && a.is_decoy() == b.is_decoy()
+            && a.var_sites == b.var_sites
+            && self.proteome.window(a.start, a.length) == other.proteome.window(b.start, b.length)
+    }
+
     /// Adjacent rows out of sage's order. Rows of different lengths are compared in
     /// full; rows of one length keep their digest's order, so only by mass.
     pub fn row_order_violations(&self) -> usize {
@@ -775,7 +837,11 @@ MCQPEPTIDEK
     }
 
     fn assert_matches_sage_digest(config: serde_json::Value) {
-        let fasta = Fasta::parse(FASTA.into(), "rev_", true);
+        assert_fasta_matches_sage_digest(FASTA, config);
+    }
+
+    fn assert_fasta_matches_sage_digest(fasta: &str, config: serde_json::Value) {
+        let fasta = Fasta::parse(fasta.into(), "rev_", true);
         let parameters = parameters(config);
         let expected = parameters.digest(&fasta);
         assert!(!expected.is_empty());
@@ -785,7 +851,20 @@ MCQPEPTIDEK
         table.resolve_proteins(&mut actual);
 
         assert_eq!(actual.len(), expected.len());
-        for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        for (row, ((actual, expected), compact)) in
+            actual.iter().zip(&expected).zip(&table.rows).enumerate()
+        {
+            assert_eq!(
+                compact.monoisotopic.to_bits(),
+                expected.monoisotopic.to_bits(),
+                "row {row}: compact mass {} vs sage {expected}",
+                compact.monoisotopic
+            );
+            assert_eq!(
+                actual.monoisotopic.to_bits(),
+                expected.monoisotopic.to_bits(),
+                "row {row}: materialized mass vs sage {expected}"
+            );
             assert_eq!(
                 without_duplicate_attributes(actual),
                 without_duplicate_attributes(expected),
@@ -866,6 +945,95 @@ MCQPEPTIDEK
             "generate_decoys": true,
             "decoy_tag": "rev_",
         }));
+    }
+
+    /// Non-specific edge cases: a C-terminal window repeating an internal one, an
+    /// N-terminal window repeated later (also as the C-terminal one), an `X`, a
+    /// protein shorter than any window, a decoy equal to a target window (PEMKQ
+    /// reversed inside is PKMEQ), a palindromic interior, a decoy-tagged protein, a
+    /// protein duplicated whole and a whole-protein window.
+    const EDGE_FASTA: &str = "\
+>sp|E1|CTERM_REPEAT
+AGKLMNPWQAKLMNP
+>sp|E2|NTERM_REPEAT
+MSTAYGGHKMSTAY
+>sp|E3|WITH_X
+PEPXTIDEKAMCQ
+>sp|E4|SHORT
+MK
+>sp|E5|DECOY_EQUALS_TARGET
+PEMKQRSTPKMEQ
+>sp|E6|PALINDROME
+GAKMKAG
+>rev_sp|E7|DECOY
+AAAAKCMR
+>sp|E8|WHOLE_DUPLICATE
+MSTAYGGHKMSTAY
+>sp|E9|FULL
+MQKCPE
+";
+
+    fn nonspecific_configs() -> Vec<serde_json::Value> {
+        vec![
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "", "min_len": 4, "max_len": 8},
+            })),
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "", "min_len": 4, "max_len": 8},
+                "static_mods": {"[": 42.010565, "C": 57.021465},
+                "variable_mods": {"M": [15.9949], "]": [-0.984016], "^Q": [-17.026548]},
+            })),
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "", "min_len": 3, "max_len": 9},
+                "peptide_min_mass": 500.0,
+                "peptide_max_mass": 800.0,
+            })),
+            serde_json::json!({
+                "enzyme": {"cleave_at": "", "min_len": 4, "max_len": 9},
+                "static_mods": {},
+                "variable_mods": {"M": [15.9949], "[": [42.010565], "C": [119.004099]},
+                "max_variable_mods": 1,
+                "peptide_min_mass": 0.0,
+                "peptide_max_mass": 5000.0,
+                "generate_decoys": true,
+                "decoy_tag": "rev_",
+            }),
+        ]
+    }
+
+    #[test]
+    fn nonspecific_edge_cases_match_sage_digest() {
+        for config in nonspecific_configs() {
+            assert_fasta_matches_sage_digest(EDGE_FASTA, config);
+        }
+    }
+
+    /// The same rows in the same order; `start` may point at another occurrence of
+    /// the same residues.
+    #[test]
+    fn nonspecific_build_equals_build_by_length() {
+        for fasta in [FASTA, EDGE_FASTA] {
+            for config in nonspecific_configs() {
+                let fasta = Fasta::parse(fasta.into(), "rev_", true);
+                let parameters = parameters(config);
+                let direct = CompactPeptides::build_nonspecific(&parameters, &fasta).unwrap();
+                let by_length = CompactPeptides::build_by_length(&parameters, &fasta).unwrap();
+                assert_eq!(direct.rows.len(), by_length.rows.len());
+                for (row, (a, b)) in direct.rows.iter().zip(&by_length.rows).enumerate() {
+                    assert_eq!(a.monoisotopic.to_bits(), b.monoisotopic.to_bits(), "row {row}");
+                    assert_eq!(
+                        (a.length, a.is_decoy(), a.var_sites),
+                        (b.length, b.is_decoy(), b.var_sites),
+                        "row {row}"
+                    );
+                    assert_eq!(
+                        direct.proteome.window(a.start, a.length),
+                        by_length.proteome.window(b.start, b.length),
+                        "row {row}"
+                    );
+                }
+            }
+        }
     }
 
     fn tryptic() -> serde_json::Value {
