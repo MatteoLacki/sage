@@ -42,8 +42,19 @@ never scores lower than monolithic (`sliced_search.md`, Charges).
 - **F9477 final pass** (regression run 11's command and inputs): 890,156 single-charge
   precursors with identical search columns (only `protein_groups` of 1,814 moved);
   of 355,897 multi-charge ones, 73,073 gain a PSM and 143,394 change (81,032 to another
-  charge). SAGE at 1% FDR: 93,249 → 93,658 PSMs, 20,761 → 20,595 peptides. Search time
-  72 → 137 s: those precursors are searched at two or three charges.
+  charge). SAGE at 1% FDR: 93,249 → 93,658 PSMs, 20,761 → 20,595 peptides.
+- **F9477 through the pipeline** (`jobs/f9477_best.toml`, reflinked copy of the
+  `56ae675` nodes, so mkpmsms output is byte-identical; regression runs 10–12 before,
+  16–18 after; peptidoforms / ions at 1%):
+  - recalibration-pass SAGE: 10,079 / 10,712 → 10,250 / 10,926;
+  - final SAGE: 20,761 / 22,701 → 20,705 / 22,717;
+  - **mokapot: 28,417 / 31,027 → 29,120 / 31,778 (+2.5% / +2.4%)**, spectra
+    117,752 → 121,372. Above mokapot's input sensitivity (a few hundred either way).
+  - Cost: final `run_sage` node 147 → 161 s; its search including reading spectra
+    (Stage 1 of streaming moved reading into the search) ~101 → 124 s, as 29% of
+    precursors are searched at two or three charges. A first, direct run had been
+    reported as "search 72 → 137 s", which compared a search without reading to one
+    with it.
 
 ## Related, not done
 
