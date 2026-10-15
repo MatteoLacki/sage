@@ -63,6 +63,8 @@ const ION_INJECTION_TIME: &[u8] = b"MS:1000927";
 const SELECTED_ION_MZ: &[u8] = b"MS:1000744";
 const SELECTED_ION_INT: &[u8] = b"MS:1000042";
 const SELECTED_ION_CHARGE: &[u8] = b"MS:1000041";
+/// One of several charges the ion may have; repeated, one per candidate.
+const POSSIBLE_CHARGE: &[u8] = b"MS:1000633";
 
 const ISO_WINDOW_TARGET: &[u8] = b"MS:1000827";
 const ISO_WINDOW_LOWER: &[u8] = b"MS:1000828";
@@ -193,6 +195,7 @@ struct SpectrumBuilder<'r> {
     precursor: Precursor,
     iso_window_lo: Option<f32>,
     iso_window_hi: Option<f32>,
+    possible_charges: Vec<u8>,
     noise_array: Vec<f32>,
     inflated: Vec<u8>,
 }
@@ -212,6 +215,7 @@ impl<'r> SpectrumBuilder<'r> {
             iso_window_hi: None,
             noise_array: Vec::new(),
             inflated: Vec::with_capacity(4096),
+            possible_charges: Vec::new(),
         }
     }
 
@@ -346,6 +350,9 @@ impl<'r> SpectrumBuilder<'r> {
                     SELECTED_ION_CHARGE => {
                         self.precursor.charge = Some(extract_value!(ev));
                     }
+                    POSSIBLE_CHARGE => {
+                        self.possible_charges.push(extract_value!(ev));
+                    }
                     SELECTED_ION_MZ => {
                         let val = extract_value!(ev);
                         if val != 0.0 {
@@ -465,6 +472,7 @@ impl<'r> SpectrumBuilder<'r> {
             (Some(State::BinaryDataArray), b"binaryDataArray") => Some(State::Spectrum),
             (Some(State::SelectedIon), b"selectedIon") => Some(State::Precursor),
             (Some(State::Precursor), b"precursor") => {
+                let possible_charges = std::mem::take(&mut self.possible_charges);
                 if self.precursor.mz != 0.0 {
                     let mut precursor = std::mem::take(&mut self.precursor);
                     precursor.isolation_window = match (self.iso_window_lo, self.iso_window_hi) {
@@ -474,7 +482,9 @@ impl<'r> SpectrumBuilder<'r> {
                         (Some(lower), Some(upper)) => Some(Tolerance::Da(-upper, lower)),
                         _ => None,
                     };
-                    self.spectrum.precursors.push(precursor);
+                    self.spectrum
+                        .precursors
+                        .extend(one_per_charge(precursor, &possible_charges));
                 }
                 Some(State::Spectrum)
             }
@@ -511,6 +521,28 @@ impl<'r> SpectrumBuilder<'r> {
         };
         Ok(finished)
     }
+}
+
+/// The precursor once per charge of its ion: its charge state and each possible charge
+/// state, in document order without repeats; itself alone when no charge is possible.
+/// The search then tries all of them together (`Scorer::candidate_charges`).
+fn one_per_charge(precursor: Precursor, possible_charges: &[u8]) -> Vec<Precursor> {
+    if possible_charges.is_empty() {
+        return vec![precursor];
+    }
+    let mut charges: Vec<u8> = precursor.charge.into_iter().collect();
+    for &charge in possible_charges {
+        if !charges.contains(&charge) {
+            charges.push(charge);
+        }
+    }
+    charges
+        .into_iter()
+        .map(|charge| Precursor {
+            charge: Some(charge),
+            ..precursor.clone()
+        })
+        .collect()
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -747,6 +779,53 @@ mod test {
         assert!((s.scan_start_time - 25.066).abs() < 0.0001);
         assert_eq!(s.ion_injection_time, 0.0);
         assert_eq!(s.intensity.len(), s.mz.len());
+        Ok(())
+    }
+
+    #[test]
+    fn possible_charge_states_join_the_charge_state() -> Result<(), MzMLError> {
+        let spectrum = |selected_ion_params: &str| {
+            format!(
+                r#"<spectrum id="s" index="0" defaultArrayLength="0">
+                <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" />
+                <precursorList count="1"><precursor><selectedIonList count="1"><selectedIon>
+                    <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="512.3" />
+                    {selected_ion_params}
+                </selectedIon></selectedIonList></precursor></precursorList>
+                </spectrum>"#
+            )
+        };
+        let possible = |charge: u8| {
+            format!(
+                r#"<cvParam cvRef="MS" accession="MS:1000633" name="possible charge state" value="{charge}" />"#
+            )
+        };
+        let charge_state =
+            r#"<cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2" />"#;
+        let reader = MzMLReader::with_file_id(0);
+        let charges = |params: String| -> Result<Vec<Option<u8>>, MzMLError> {
+            let spectrum = reader
+                .parse_spectrum(spectrum(&params).as_bytes())?
+                .unwrap();
+            assert!(spectrum
+                .precursors
+                .iter()
+                .all(|p| p.mz == spectrum.precursors[0].mz));
+            Ok(spectrum.precursors.iter().map(|p| p.charge).collect())
+        };
+        assert_eq!(charges(charge_state.to_string())?, [Some(2)]);
+        assert_eq!(
+            charges(format!("{}{}", possible(2), possible(3)))?,
+            [Some(2), Some(3)]
+        );
+        assert_eq!(
+            charges(format!("{charge_state}{}{}", possible(3), possible(4)))?,
+            [Some(2), Some(3), Some(4)]
+        );
+        assert_eq!(
+            charges(format!("{charge_state}{}{}", possible(2), possible(3)))?,
+            [Some(2), Some(3)]
+        );
         Ok(())
     }
 

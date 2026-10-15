@@ -56,11 +56,18 @@ never scores lower than monolithic (`sliced_search.md`, Charges).
     reported as "search 72 → 137 s", which compared a search without reading to one
     with it.
 
-## Related, not done
+## mzML: "possible charge state" (MS:1000633)
 
-- mzML has a term for this case, MS:1000633 "possible charge state" (repeatable in
-  `selectedIon`); SAGE's mzML reader only reads MS:1000041 "charge state", so such
-  spectra are searched as charge-less.
-- `pmsms2mzml` writes a multi-charge precursor as one spectrum per charge; it could
-  write one spectrum with several MS:1000633 terms instead (changes the pipeline's
-  mzML, FragPipe input).
+mzML has a term for this case: MS:1000633 "possible charge state", repeated in
+`selectedIon`, one per candidate ("known to be one of several possible values"), next
+to MS:1000041 "charge state" for a determined one. The mzML reader now reads it: a
+precursor's charges are its charge state and every possible charge state, in document
+order without repeats (the set of all, when both are present), each a `Precursor` with
+the same m/z, so the pooled search above applies (`mzml::one_per_charge`,
+`possible_charge_states_join_the_charge_state`). Files without MS:1000633 read as before.
+
+`pmsms2mzml --possible-charges` (default off; whether FragPipe reads it is unchecked)
+writes a multi-charge precursor as one spectrum with one MS:1000633 per charge instead
+of one spectrum per charge. The short F9477 test cut written that way and searched by
+SAGE gives the same rank-1 peptide, charge and hyperscore as the pmsms search for all
+1,862 spectra with a hit (408 multi-charge), and the same 905 peptides at 1%.
