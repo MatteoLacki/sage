@@ -221,6 +221,12 @@ impl TextSpectra {
         self.starts.is_empty()
     }
 
+    /// Reads resume from the last gzip access point before the spectrum, so reading
+    /// out of order re-inflates up to the access point spacing each time.
+    pub fn is_gzipped(&self) -> bool {
+        self.gzip.is_some()
+    }
+
     pub fn reader(&self) -> TextReader<'_> {
         TextReader {
             text: Vec::new(),

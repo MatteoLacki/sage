@@ -3,6 +3,7 @@ pub mod database;
 pub mod enzyme;
 pub mod fasta;
 pub mod fdr;
+pub mod fragment_grid;
 pub mod heap;
 pub mod ion_series;
 pub mod isotopes;

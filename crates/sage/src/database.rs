@@ -1,5 +1,6 @@
 use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
+use crate::fragment_grid::{FragmentGrid, FragmentLayout, GridShape};
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
@@ -116,6 +117,7 @@ impl Builder {
             prefilter: self.prefilter.unwrap_or(false),
             prefilter_low_memory: self.prefilter_low_memory.unwrap_or(true),
             sliced: self.sliced.unwrap_or(false),
+            fragment_layout: FragmentLayout::from_environment(),
         }
     }
 
@@ -142,6 +144,9 @@ pub struct Parameters {
     pub prefilter: bool,
     pub prefilter_low_memory: bool,
     pub sliced: bool,
+    /// Prototype switch (`SAGE_FRAGMENT_LAYOUT`), not part of the configuration.
+    #[serde(skip)]
+    pub fragment_layout: FragmentLayout,
 }
 
 impl Parameters {
@@ -280,7 +285,37 @@ impl Parameters {
         self.build_from_peptides(target_decoys)
     }
 
+    /// The theoretical fragments of `peptide` (row `idx`) that the fragment index holds.
+    fn indexed_fragments<'a>(
+        &'a self,
+        idx: usize,
+        peptide: &'a Peptide,
+    ) -> impl Iterator<Item = Theoretical> + 'a {
+        // Generate both B and Y ions, then filter down to make sure that
+        // theoretical fragments are within the search space
+        self.ion_kinds
+            .iter()
+            .flat_map(|kind| IonSeries::new(peptide, *kind).enumerate())
+            .filter(|(ion_idx, ion)| {
+                // Don't store b1, b2, y1, y2 ions for preliminary scoring
+
+                match ion.kind {
+                    Kind::A | Kind::B | Kind::C => (ion_idx + 1) > self.min_ion_index,
+                    Kind::X | Kind::Y | Kind::Z => {
+                        peptide.sequence.len().saturating_sub(1) - ion_idx > self.min_ion_index
+                    }
+                }
+            })
+            .map(move |(_, ion)| Theoretical {
+                peptide_index: PeptideIx(idx as u32),
+                fragment_mz: ion.monoisotopic_mass,
+            })
+    }
+
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
+        if let FragmentLayout::Grid(shape) = self.fragment_layout {
+            return self.build_grid(target_decoys, shape);
+        }
         log::trace!("generating fragments");
 
         // Finally, perform in silico digest for our target sequences
@@ -290,28 +325,7 @@ impl Parameters {
         let mut fragments = target_decoys
             .par_iter()
             .enumerate()
-            .flat_map_iter(|(idx, peptide)| {
-                // Generate both B and Y ions, then filter down to make sure that
-                // theoretical fragments are within the search space
-                self.ion_kinds
-                    .iter()
-                    .flat_map(|kind| IonSeries::new(peptide, *kind).enumerate())
-                    .filter(|(ion_idx, ion)| {
-                        // Don't store b1, b2, y1, y2 ions for preliminary scoring
-
-                        match ion.kind {
-                            Kind::A | Kind::B | Kind::C => (ion_idx + 1) > self.min_ion_index,
-                            Kind::X | Kind::Y | Kind::Z => {
-                                peptide.sequence.len().saturating_sub(1) - ion_idx
-                                    > self.min_ion_index
-                            }
-                        }
-                    })
-                    .map(move |(_, ion)| Theoretical {
-                        peptide_index: PeptideIx(idx as u32),
-                        fragment_mz: ion.monoisotopic_mass,
-                    })
-            })
+            .flat_map_iter(|(idx, peptide)| self.indexed_fragments(idx, peptide))
             .collect::<Vec<_>>();
         log::trace!("finalizing index");
 
@@ -384,6 +398,28 @@ impl Parameters {
             generate_decoys: self.generate_decoys,
             potential_mods,
             decoy_tag: self.decoy_tag,
+            grid: None,
+        }
+    }
+
+    /// `build_from_peptides` with the fragments laid out as a `FragmentGrid`.
+    fn build_grid(self, target_decoys: Vec<Peptide>, shape: GridShape) -> IndexedDatabase {
+        let (grid, fragment_mzs, fragment_peptide_indices) =
+            FragmentGrid::build(target_decoys.len(), shape, |row, out| {
+                out.extend(self.indexed_fragments(row, &target_decoys[row]))
+            });
+        log::info!("fragment grid: {}", grid.describe());
+        IndexedDatabase {
+            potential_mods: self.variable_mod_list(),
+            peptides: target_decoys,
+            fragment_mzs,
+            fragment_peptide_indices,
+            min_value: Vec::new(),
+            bucket_size: self.bucket_size,
+            ion_kinds: self.ion_kinds,
+            generate_decoys: self.generate_decoys,
+            decoy_tag: self.decoy_tag,
+            grid: Some(grid),
         }
     }
 }
@@ -418,6 +454,8 @@ pub struct IndexedDatabase {
     pub bucket_size: usize,
     pub generate_decoys: bool,
     pub decoy_tag: String,
+    /// Set when the fragment columns are laid out as a grid instead of pages.
+    pub grid: Option<FragmentGrid>,
 }
 
 impl IndexedDatabase {
@@ -512,7 +550,12 @@ impl IndexedQuery<'_> {
         &self,
         mass: f32,
         fragment_tol: Tolerance,
-    ) -> impl Iterator<Item = Theoretical> + '_ {
+    ) -> Box<dyn Iterator<Item = Theoretical> + '_> {
+        if self.db.grid.is_some() {
+            let mut matches = Vec::new();
+            self.page_search_batch(&[(mass, fragment_tol)], |fragment| matches.push(fragment));
+            return Box::new(matches.into_iter());
+        }
         let (fragment_lo, fragment_hi) = fragment_tol.theoretical_range(mass);
         let (precursor_lo, precursor_hi) =
             self.precursor_tol.theoretical_range(self.precursor_mass);
@@ -529,7 +572,7 @@ impl IndexedQuery<'_> {
 
         // It is absolutely critical that we do not cross page boundaries!
         // If we do, we can no longer rely on total ordering of peptide_index (precursor m/z)
-        (left_idx..right_idx).flat_map(move |page| {
+        Box::new((left_idx..right_idx).flat_map(move |page| {
             let left_idx = page * self.db.bucket_size;
             // Last chunk not guaranted to be modulo bucket size, make sure we don't
             // accidentally go out of bounds!
@@ -573,7 +616,7 @@ impl IndexedQuery<'_> {
                         && frag.fragment_mz >= fragment_lo
                         && frag.fragment_mz <= fragment_hi
                 })
-        })
+        }))
     }
 
     /// Batched `page_search`: search many `(mass, fragment_tol)` windows
@@ -614,6 +657,16 @@ impl IndexedQuery<'_> {
                     .get(self.pre_idx_lo)
                     .map_or(false, |p| p.monoisotopic < precursor_lo),
             );
+        if let Some(grid) = &self.db.grid {
+            grid.search(
+                &self.db.fragment_mzs,
+                &self.db.fragment_peptide_indices,
+                exact_pre_idx_lo..self.pre_idx_hi,
+                windows,
+                on_match,
+            );
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
         let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
 
@@ -790,6 +843,18 @@ fn resolve_page_peptide_bounds(
     }
 }
 
+/// Every index of `masses` with `lo <= mass <= hi`, in order: AVX2 when available.
+#[inline]
+pub(crate) fn scan_masses(masses: &[f32], lo: f32, hi: f32, on_match: impl FnMut(usize)) {
+    #[cfg(target_arch = "x86_64")]
+    if masses.len() >= 8 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime feature detection above guards this call.
+        unsafe { scan_masses_avx2(masses, lo, hi, on_match) };
+        return;
+    }
+    scan_masses_scalar(masses, lo, hi, on_match)
+}
+
 #[inline]
 fn scan_masses_scalar(masses: &[f32], lo: f32, hi: f32, mut on_match: impl FnMut(usize)) {
     for (i, &mass) in masses.iter().enumerate() {
@@ -868,16 +933,20 @@ mod test {
     use std::sync::Arc;
 
     use super::*;
+    use crate::fragment_grid::GridShape;
 
-    #[test]
-    fn batched_pages_match_brute_force_with_boundaries_and_duplicate_hits() {
-        let peptides: Vec<_> = [500.0, 500.0, 600.0, 600.0, 800.0, 900.0]
+    fn search_test_peptides() -> Vec<Peptide> {
+        [500.0, 500.0, 600.0, 600.0, 800.0, 900.0]
             .into_iter()
             .map(|monoisotopic| Peptide {
                 monoisotopic,
                 ..Default::default()
             })
-            .collect();
+            .collect()
+    }
+
+    /// Fragments for `search_test_peptides`, sorted by m/z.
+    fn search_test_fragments(peptides: &[Peptide]) -> Vec<Theoretical> {
         let mut fragments = Vec::new();
         for ordinal in 0..32 {
             for peptide in 0..peptides.len() {
@@ -890,16 +959,82 @@ mod test {
         // Duplicate fragments must increment the same peptide more than once.
         fragments.push(fragments[0]);
         fragments.sort_by(|a, b| a.fragment_mz.total_cmp(&b.fragment_mz));
-        let windows = [
-            (100.0, Tolerance::Da(0.0, 0.0)),
-            (120.0, Tolerance::Da(-20.0, 20.0)),
-            (120.0, Tolerance::Da(-20.0, 20.0)), // repeated window retains multiplicity
-            (200.0, Tolerance::Ppm(-20.0, 20.0)),
-            (1000.0, Tolerance::Da(-2000.0, 2000.0)),
-            (3000.0, Tolerance::Da(0.0, 1.0)),
-            (130.0, Tolerance::Da(-1.0, 6.0)),
-            (240.0, Tolerance::Ppm(-5.0, 40_000.0)),
-        ];
+        fragments
+    }
+
+    const SEARCH_TEST_WINDOWS: [(f32, Tolerance); 8] = [
+        (100.0, Tolerance::Da(0.0, 0.0)),
+        (120.0, Tolerance::Da(-20.0, 20.0)),
+        (120.0, Tolerance::Da(-20.0, 20.0)), // repeated window retains multiplicity
+        (200.0, Tolerance::Ppm(-20.0, 20.0)),
+        (1000.0, Tolerance::Da(-2000.0, 2000.0)),
+        (3000.0, Tolerance::Da(0.0, 1.0)),
+        (130.0, Tolerance::Da(-1.0, 6.0)),
+        (240.0, Tolerance::Ppm(-5.0, 40_000.0)),
+    ];
+
+    /// Batched and single-window searches of `db` find, for a range of precursor
+    /// windows, exactly the fragments a scan over `fragments` finds.
+    fn assert_search_matches_brute_force(
+        db: &IndexedDatabase,
+        fragments: &[Theoretical],
+        windows: &[(f32, Tolerance)],
+        layout: &str,
+    ) {
+        for (mass, tol) in [
+            (500.0, Tolerance::Da(0.0, 0.0)),
+            (600.0, Tolerance::Da(0.0, 0.0)),
+            (550.0, Tolerance::Da(-50.0, 50.0)),
+            (550.0, Tolerance::Da(-1.0, 1.0)),
+            (900.0, Tolerance::Da(0.0, 0.0)),
+            (100.0, Tolerance::Da(-1.0, 1.0)),
+            (1000.0, Tolerance::Da(-1.0, 1.0)),
+            (700.0, Tolerance::Da(-500.0, 500.0)),
+            (600.0, Tolerance::Ppm(-10.0, 10.0)),
+            // observed − theoretical windows that select the 500 (resp. 600) peptides;
+            // the mirrored window would select the other pair.
+            (550.0, Tolerance::Da(-1.0, 51.0)),
+            (550.0, Tolerance::Da(-51.0, 1.0)),
+        ] {
+            let (lo, hi) = tol.theoretical_range(mass);
+            let mut expected = Vec::new();
+            for &(center, tolerance) in windows {
+                let (frag_lo, frag_hi) = tolerance.theoretical_range(center);
+                for f in fragments {
+                    let precursor = db[f.peptide_index].monoisotopic;
+                    if precursor >= lo
+                        && precursor <= hi
+                        && f.fragment_mz >= frag_lo
+                        && f.fragment_mz <= frag_hi
+                    {
+                        expected.push((f.peptide_index, f.fragment_mz.to_bits()));
+                    }
+                }
+            }
+            let query = db.query(mass, tol);
+            let mut actual = Vec::new();
+            query.page_search_batch(windows, |f| {
+                actual.push((f.peptide_index, f.fragment_mz.to_bits()))
+            });
+            let mut unbatched: Vec<_> = windows
+                .iter()
+                .flat_map(|&(mass, tol)| query.page_search(mass, tol))
+                .map(|f| (f.peptide_index, f.fragment_mz.to_bits()))
+                .collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            unbatched.sort_unstable();
+            assert_eq!(actual, expected, "{layout}, mass={mass}, tol={tol:?}");
+            assert_eq!(unbatched, expected, "{layout}, mass={mass}, tol={tol:?}");
+        }
+        db.query(600.0, Tolerance::Da(-1000.0, 1000.0))
+            .page_search_batch(&[], |_| panic!("empty window list matched"));
+    }
+
+    #[test]
+    fn batched_pages_match_brute_force_with_boundaries_and_duplicate_hits() {
+        let peptides = search_test_peptides();
+        let fragments = search_test_fragments(&peptides);
         for bucket_size in [1, 7, 8, 9, 31, 64, 256] {
             let mut ordered = fragments.clone();
             let mut min_value = Vec::new();
@@ -915,61 +1050,77 @@ mod test {
                 bucket_size,
                 ..Default::default()
             };
-            for (mass, tol) in [
-                (500.0, Tolerance::Da(0.0, 0.0)),
-                (600.0, Tolerance::Da(0.0, 0.0)),
-                (550.0, Tolerance::Da(-50.0, 50.0)),
-                (550.0, Tolerance::Da(-1.0, 1.0)),
-                (900.0, Tolerance::Da(0.0, 0.0)),
-                (100.0, Tolerance::Da(-1.0, 1.0)),
-                (1000.0, Tolerance::Da(-1.0, 1.0)),
-                (700.0, Tolerance::Da(-500.0, 500.0)),
-                (600.0, Tolerance::Ppm(-10.0, 10.0)),
-                // observed − theoretical windows that select the 500 (resp. 600) peptides;
-                // the mirrored window would select the other pair.
-                (550.0, Tolerance::Da(-1.0, 51.0)),
-                (550.0, Tolerance::Da(-51.0, 1.0)),
-            ] {
-                let (lo, hi) = tol.theoretical_range(mass);
-                let mut expected = Vec::new();
-                for &(center, tolerance) in &windows {
-                    let (frag_lo, frag_hi) = tolerance.theoretical_range(center);
-                    for f in &fragments {
-                        let precursor = db[f.peptide_index].monoisotopic;
-                        if precursor >= lo
-                            && precursor <= hi
-                            && f.fragment_mz >= frag_lo
-                            && f.fragment_mz <= frag_hi
-                        {
-                            expected.push((f.peptide_index, f.fragment_mz.to_bits()));
-                        }
-                    }
-                }
-                let query = db.query(mass, tol);
-                let mut actual = Vec::new();
-                query.page_search_batch(&windows, |f| {
-                    actual.push((f.peptide_index, f.fragment_mz.to_bits()))
-                });
-                let mut unbatched: Vec<_> = windows
-                    .iter()
-                    .flat_map(|&(mass, tol)| query.page_search(mass, tol))
-                    .map(|f| (f.peptide_index, f.fragment_mz.to_bits()))
-                    .collect();
-                expected.sort_unstable();
-                actual.sort_unstable();
-                unbatched.sort_unstable();
-                assert_eq!(
-                    actual, expected,
-                    "bucket={bucket_size}, mass={mass}, tol={tol:?}"
-                );
-                assert_eq!(unbatched, expected);
-            }
-            db.query(600.0, Tolerance::Da(-1000.0, 1000.0))
-                .page_search_batch(&[], |_| panic!("empty window list matched"));
+            assert_search_matches_brute_force(
+                &db,
+                &fragments,
+                &SEARCH_TEST_WINDOWS,
+                &format!("bucket={bucket_size}"),
+            );
         }
         IndexedDatabase::default()
             .query(600.0, Tolerance::Da(-1000.0, 1000.0))
-            .page_search_batch(&windows, |_| panic!("empty database matched"));
+            .page_search_batch(&SEARCH_TEST_WINDOWS, |_| panic!("empty database matched"));
+    }
+
+    fn grid_database(
+        peptides: &[Peptide],
+        fragments: &[Theoretical],
+        shape: GridShape,
+    ) -> IndexedDatabase {
+        let (grid, fragment_mzs, fragment_peptide_indices) =
+            FragmentGrid::build(peptides.len(), shape, |row, out| {
+                out.extend(
+                    fragments
+                        .iter()
+                        .filter(|f| f.peptide_index.0 as usize == row),
+                )
+            });
+        IndexedDatabase {
+            peptides: peptides.to_vec(),
+            fragment_mzs,
+            fragment_peptide_indices,
+            grid: Some(grid),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grid_matches_brute_force_on_block_and_cell_edges() {
+        let peptides = search_test_peptides();
+        let mut fragments = search_test_fragments(&peptides);
+        // Octave edges are cell edges at every `cell_bits`; also the float just below.
+        let just_below_256 = f32::from_bits(256.0f32.to_bits() - 1);
+        for (peptide, fragment_mz) in [(2, 128.0f32), (3, 256.0), (4, just_below_256), (5, 256.0)] {
+            fragments.push(Theoretical {
+                peptide_index: PeptideIx(peptide),
+                fragment_mz,
+            });
+        }
+        let mut windows = SEARCH_TEST_WINDOWS.to_vec();
+        windows.extend([
+            (128.0, Tolerance::Da(0.0, 0.0)),
+            (256.0, Tolerance::Da(0.0, 0.0)),
+            (256.0, Tolerance::Da(-1.0, 0.0)),
+            (just_below_256, Tolerance::Da(0.0, 0.0)),
+            (126.0, Tolerance::Da(-2.0, 2.0)),
+            (5.0, Tolerance::Da(-1.0, 1.0)),
+        ]);
+        for rows_per_block in [1, 2, 3, 4, 6, 7] {
+            for cell_bits in [0, 4, 10, 23] {
+                let shape = GridShape {
+                    rows_per_block,
+                    cell_bits,
+                };
+                let db = grid_database(&peptides, &fragments, shape);
+                let layout = format!("{shape:?}");
+                assert_search_matches_brute_force(&db, &fragments, &windows, &layout);
+            }
+        }
+        for peptides in [Vec::new(), peptides] {
+            grid_database(&peptides, &[], GridShape::default())
+                .query(600.0, Tolerance::Da(-1000.0, 1000.0))
+                .page_search_batch(&windows, |_| panic!("database without fragments matched"));
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1088,6 +1239,7 @@ mod test {
             prefilter_chunk_size: 0,
             prefilter_low_memory: true,
             sliced: false,
+            fragment_layout: FragmentLayout::from_environment(),
         };
 
         let peptides = params.digest(&fasta);

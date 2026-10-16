@@ -44,6 +44,14 @@ impl IndexedSpectra {
         self.len() == 0
     }
 
+    /// Spectra read out of index order cost more than read forward (gzipped text).
+    pub fn prefers_forward_reads(&self) -> bool {
+        match self {
+            Self::Text(spectra) => spectra.is_gzipped(),
+            _ => false,
+        }
+    }
+
     pub fn reader(&self) -> IndexedReader<'_> {
         match self {
             Self::Text(spectra) => Some(spectra.reader()),

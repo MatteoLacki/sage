@@ -529,6 +529,7 @@ impl CompactPeptides {
             bucket_size: self.parameters.bucket_size,
             generate_decoys: self.parameters.generate_decoys,
             decoy_tag: self.parameters.decoy_tag.clone(),
+            grid: None,
         }
     }
 

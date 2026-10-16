@@ -25,6 +25,32 @@ const AVAILABLE_MEMORY_PER_SLICE: f64 = 0.5;
 const WINDOW_MARGIN_DA: f32 = 0.01;
 /// Caps each slice's fragments instead of sizing slices by available memory.
 const SLICE_FRAGMENTS_VARIABLE: &str = "SAGE_SLICE_FRAGMENTS";
+/// `mass` (default) or `file`: the order a slice's spectra are searched in.
+const QUERY_ORDER_VARIABLE: &str = "SAGE_QUERY_ORDER";
+
+/// The order a slice's spectra are searched in. Results are kept by query index, so
+/// the order changes only speed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryOrder {
+    /// By candidate window, so neighbouring searches read the same part of the index.
+    Mass,
+    /// By file and spectrum index: a forward sweep through each file.
+    File,
+}
+
+impl QueryOrder {
+    fn for_files(files: &[IndexedSpectra]) -> anyhow::Result<Self> {
+        let requested = match std::env::var(QUERY_ORDER_VARIABLE).as_deref() {
+            Err(_) | Ok("mass") => QueryOrder::Mass,
+            Ok("file") => QueryOrder::File,
+            Ok(other) => anyhow::bail!("{QUERY_ORDER_VARIABLE} must be mass or file, not {other}"),
+        };
+        match files.iter().any(IndexedSpectra::prefers_forward_reads) {
+            true => Ok(QueryOrder::File),
+            false => Ok(requested),
+        }
+    }
+}
 
 /// One spectrum searched at one precursor charge.
 struct Query {
@@ -97,6 +123,7 @@ pub fn search(
         .fold(0.0_f32, f32::max);
 
     let budget = SliceBudget::from_environment()?;
+    let query_order = QueryOrder::for_files(files)?;
     let plan = SlicePlan::new(
         &table.rows,
         |row| row.monoisotopic,
@@ -109,10 +136,11 @@ pub fn search(
         queries_by_slice[plan.slice_for(query.window_low)].push(index);
     }
     info!(
-        "sliced search: {} queries over {} slices (widest window {:.3} Da), planned in {:.1} s",
+        "sliced search: {} queries over {} slices (widest window {:.3} Da), searched in {:?} order, planned in {:.1} s",
         queries.len(),
         plan.slices.len(),
         widest_window,
+        query_order,
         start.elapsed().as_secs_f64()
     );
 
@@ -138,9 +166,16 @@ pub fn search(
             ..runner.make_scorer(&db, rows.start, predictions)
         };
         let first_row = rows.start as u32;
-        let same_spectrum_runs: Vec<&[usize]> = query_indices
+        let mut same_spectrum_runs: Vec<&[usize]> = query_indices
             .chunk_by(|&a, &b| queries[a].same_spectrum(&queries[b]))
             .collect();
+        if query_order == QueryOrder::Mass {
+            same_spectrum_runs.sort_by(|a, b| {
+                queries[a[0]]
+                    .window_low
+                    .total_cmp(&queries[b[0]].window_low)
+            });
+        }
         let scored: Vec<(usize, Vec<Feature>)> = same_spectrum_runs
             .par_iter()
             .map_init(
