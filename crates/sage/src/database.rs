@@ -1106,7 +1106,7 @@ mod test {
     fn grid_matches_brute_force_on_block_and_cell_edges() {
         let peptides = search_test_peptides();
         let mut fragments = search_test_fragments(&peptides);
-        // Octave edges are cell edges at every `cell_bits`; also the float just below.
+        // Octave edges, and the float just below one.
         let just_below_256 = f32::from_bits(256.0f32.to_bits() - 1);
         for (peptide, fragment_mz) in [(2, 128.0f32), (3, 256.0), (4, just_below_256), (5, 256.0)] {
             fragments.push(Theoretical {
@@ -1124,10 +1124,11 @@ mod test {
             (5.0, Tolerance::Da(-1.0, 1.0)),
         ]);
         for rows_per_block in [1, 2, 3, 4, 6, 7] {
-            for cell_bits in [0, 4, 10, 23] {
+            for (fine_bits, cell_fragments) in [(7, 1), (7, 1000), (10, 3), (14, 1), (16, 2)] {
                 let shape = GridShape {
                     rows_per_block,
-                    cell_bits,
+                    fine_bits,
+                    cell_fragments,
                 };
                 let db = grid_database(&peptides, &fragments, shape);
                 let layout = format!("{shape:?}");

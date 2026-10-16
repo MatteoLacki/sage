@@ -1,7 +1,8 @@
 # Fragment grid: precursor blocks × fragment cells (2026-10-16)
 
 Necromerge2 plans: `plans/fragment_grid.md`, `plans/grid_match_simd.md` (the
-branch-free match kernel, below). A second layout of the fragment index
+branch-free match kernel), `plans/grid_compact_cells.md` (equal-count cells and
+16-bit fragments). A second layout of the fragment index
 (`crates/sage/src/fragment_grid.rs`), chosen when the index is built. Prototype:
 switched by environment variables, default unchanged.
 
@@ -18,46 +19,59 @@ precursor-major blocks, fragment cells inside, found by arithmetic.
 ## Layout
 
 ```
-                 fragment cells c = (mz.to_bits() >> (23 - m)) - first_cell
+                 cells: runs of fine keys (mz.to_bits() >> (23 - f)), ~T fragments per block-cell
                  c0     c1     c2    ...
 block 0  rows 0..R    [run]  [run]  [run]  ...
 block 1  rows R..2R   [run]  [run]  [run]  ...
-cell_start[block][c] -> fragment offset (relative to the block) into its 8-fragment groups
+cell_start[block][c] -> fragment offset (relative to the block) into its 16-fragment groups
 ```
 
-- **Blocks:** R consecutive peptide rows. Rows are mass-sorted, so a block is a
-  precursor-mass band; equal row counts keep blocks equally full where peptide
-  density varies.
-- **Cells:** for non-negative floats the bit pattern is monotone in the value, and its
-  top bits are the exponent and leading mantissa bits. Keeping m mantissa bits splits
-  each octave into 2^m equal cells, about constant ppm wide (m = 10: 488–977 ppm).
-  One shift, no logarithm. `first_cell` is the lightest fragment's key; window keys
-  are clamped to the grid, and a window whose high end is not positive holds nothing.
+- **Blocks:** R consecutive peptide rows (R = 4096). Rows are mass-sorted, so a block
+  is a precursor-mass band; equal row counts keep blocks equally full where peptide
+  density varies. A precursor window reaches the grid only through rows: sage's binary
+  search over the per-row masses gives the candidate rows, `row / R` the blocks.
+- **Fine keys:** for non-negative floats the bit pattern is monotone in the value, and
+  its top bits are the exponent and leading mantissa bits. `mz.to_bits() >> (23 - f)`
+  keeps f mantissa bits: 2^f fine keys per octave, about constant ppm wide (f = 14:
+  61–122 ppm).
+- **Cells (equal-count):** consecutive fine keys grouped so each cell holds about T
+  fragments per block on average over the grid (T = 8), from a histogram of all
+  fragments' fine keys. A cell closes once it holds T × blocks fragments or spans
+  2^(f−7) fine keys, so no cell is wider than 2^16 bit patterns. `cell_of_fine` maps
+  each fine key from the lightest fragment's to the heaviest's to its cell (`u16`,
+  ~115 KB for class I); `cell_first_fine` holds each cell's first key. Window keys are
+  clamped to that range, and a window whose high end is not positive holds nothing.
+  Cells are contiguous fine-key ranges, so a window's cells are
+  `cell_of_fine[fine(lo)] ..= cell_of_fine[fine(hi)]`, and any such partition is exact;
+  the counts only decide how much is scanned.
 - **Inside a cell:** generation order, i.e. peptide order. Nothing relies on it.
 - **Storage:** `FragmentGrid` owns the fragments as `FragmentGroup`s, 64 B each (one
-  cache line, `align(64)`): 8 m/z (`f32`), then their 8 peptide rows (`u32`). Each
-  block starts on a group and is padded to whole groups with `FragmentGroup::PAD`
-  (NaN m/z, which no window matches). Also block group starts and per-block
-  `cells + 1` cell starts (`u32` fragment offsets relative to the block).
+  cache line, `align(64)`): 16 m/z residuals (`u16`), then their 16 rows within the
+  block (`u16`, R ≤ 65,536). A residual is `mz.to_bits() − cell_first_bits(cell)`
+  (below 2^16 by the width cap), so `cell_first_bits + residual` is the exact f32, and
+  within a cell residual order is m/z order. Each block starts on a group; lanes past
+  its last fragment are never read. Also block group starts and per-block `cells + 1`
+  cell starts (`u32` fragment offsets relative to the block). 4 B per fragment.
   `IndexedDatabase::grid` holds it; `fragment_mzs`/`fragment_peptide_indices` and
-  `min_value` stay empty. `size()` and `fragments()` read the grid, pads excluded
-  (`database_size` and `dump_fragment_index` read the page columns, so they see
-  nothing for a grid).
+  `min_value` stay empty. `size()` and `fragments()` read the grid and rebuild the
+  exact m/z and row (`database_size` and `dump_fragment_index` read the page columns,
+  so they see nothing for a grid).
 
 ## Build
 
 `Parameters::build_from_peptides` with `fragment_layout = Grid` calls `build_grid`.
 The fragments come from `Parameters::indexed_fragments`, shared with the page layout,
-so their m/z bits are identical. `FragmentGrid::build` never holds more than the
-columns and the directory:
+so their m/z bits are identical. `FragmentGrid::build` never holds more than the grid:
 1. **Count:** per block, in parallel, generate its fragments into thread-local
-   scratch; keep the count and the lowest/highest cell key.
-2. **Offsets:** block starts by prefix sum; the global key range gives `first_cell`
-   and the cell count.
-3. **Place:** the groups are allocated filled with pads (a parallel collect); per
-   block, in parallel, into its own disjoint groups: generate again, count per cell,
-   prefix sum (the block's cell starts), place in generation order (a stable counting
-   sort) into lane `offset % 8` of group `offset / 8`.
+   scratch; keep the count and the lowest/highest fine key, and add every fine key to a
+   histogram (rayon fold/reduce of per-split histograms over a fixed 16–32,768 m/z
+   range; a fragment outside it is a hard error).
+2. **Cells and offsets:** `equal_count_cells` over the histogram; block group starts
+   by prefix sum.
+3. **Place:** the groups are allocated (a parallel collect); per block, in parallel,
+   into its own disjoint groups: generate again, count per cell, prefix sum (the
+   block's cell starts), place in generation order (a stable counting sort): residual
+   and local row into lane `offset % 16` of group `offset / 16`.
 
 No global sort. The page layout instead sorts every fragment by m/z, then sorts each
 page by peptide, and peaks at about 16 B per fragment for those copies.
@@ -67,26 +81,47 @@ page by peptide, and peaks at about 16 B per fragment for those copies.
 `matched_peaks_with_isotope` asks `IndexedQuery::matched_candidates` for the matched
 candidates' offsets from `candidate_rows().start` (the exact rows
 `[exact_pre_idx_lo, pre_idx_hi)`), one entry per (window, fragment) match, and counts
-them into `preliminary` (`InitialHits::add_matches`). The grid answers with
+them into `preliminary` (`InitialHits::add_matches`, below). The grid answers with
 `FragmentGrid::matched_candidates`; pages run their own `page_search_batch` with a
 closure that pushes offsets. Per call:
-- per window, once: its `(lo, hi)` and the cells holding it;
-- per block overlapping the candidate rows (outer loop), per window (inner loop): the
-  run of groups covering `cell_start[b][first] .. cell_start[b][last + 1]`, whole
-  groups (below).
+- per window, once (`cell_windows`): `(lo, hi)`, its cells `first..=last`, and its
+  bounds as residuals: `residual_lo` in the first cell (0 when `lo` lies below it),
+  `residual_hi` in the last (`u16::MAX` when `hi` lies above it);
+- per block overlapping the candidate rows (outer loop): the candidate rows local to
+  the block, `[a, b)`, and the offset that turns a local row into a candidate offset;
+- per window (inner loop), `CellWindow::runs`: the first cell's fragments need
+  `residual >= residual_lo`, the last cell's `residual <= residual_hi` (both when the
+  cells coincide), and the cells between lie inside the window by construction;
+- each run as whole groups, the run's first and last groups masked by position
+  (`lanes_in`), so another cell's residuals (not comparable) and lanes past the block
+  are never used.
 
-**Exact by construction.** The cells partition each block and the key is monotone, so
-every fragment in a window lies in the scanned cells. A run's first and last groups
-can also hold fragments of neighbouring cells (keys outside the window's, so m/z
-outside it) and pads (NaN), never another block's. The m/z comparison and the
-candidate check therefore select exactly the (window, fragment) pairs the pages
-select; only their order differs, and counting doesn't depend on it.
+**Exact by construction.** Every fragment in the window lies in its cells (monotone
+keys). Within one cell, `bits(lo) <= bits(m/z) <= bits(hi)` is
+`residual_lo <= residual <= residual_hi` (positive floats order as their bits). The
+row check is the candidate-range check. So the kernel selects exactly the (window,
+fragment) pairs the pages select; only their order differs, and counting doesn't depend
+on it.
+
+`matched_candidates_avx2` (`#[target_feature(enable = "avx2,popcnt")]`, chosen at run
+time; `matched_candidates_scalar` otherwise) per 16 fragments, without branches:
+- residual mask: `vpmaxuw`/`vpminuw` + `vpcmpeqw` for both bounds, AND;
+- row mask: subtract `a`, `vpminuw`/`vpcmpeqw` against `b − a − 1`;
+- AND, `vpacksswb` with zero then `vpmovmskb` (lanes 0–7 in bits 0–7, lanes 8–15 in
+  bits 16–23), AND with the position mask;
+- per half: rows widened (`vpmovzxwd`) plus the block's offset, `vpermd` through
+  `LEFT_PACK[mask]` (256 × 8 lane indices, a `const fn`), unaligned store into the
+  matched list, advance by `popcnt` (`reserve` per run leaves room for 16 per group).
+  No `pext` (microcoded on Zen 2).
 
 `FragmentGrid::search` (the per-fragment callback, reached through
-`page_search_batch` and `page_search`) visits each run's fragments one at a time,
-exactly; the tests use it as the reference.
+`page_search_batch` and `page_search`) rebuilds each fragment of the window's cells
+exactly and compares the float m/z; the tests use it as the reference.
 
-## Branch-free match handling (2026-10-16)
+## Branch-free match handling (2026-10-16, `c03cecb`)
+
+This section records the first branch-free kernel, over 8-lane groups of f32 m/z and
+u32 rows with equal-ppm cells; the 16-lane residual kernel above replaced it.
 
 Profiled first with in-source cycle counters (`perf` needs root): the grid kernel of
 `062a871` was ~67% of class I search CPU, and re-running each call warm three ways
@@ -170,10 +205,12 @@ revisited for the other formats).
 | Variable | Values | Default |
 |---|---|---|
 | `SAGE_FRAGMENT_LAYOUT` | `pages`, `grid` | `pages` |
-| `SAGE_GRID_ROWS` | R | 4096 |
-| `SAGE_GRID_CELL_BITS` | m, 0–23 | 10 |
+| `SAGE_GRID_ROWS` | R, at most 65,536 | 4096 |
+| `SAGE_GRID_FINE_BITS` | f, 7–16 | 14 |
+| `SAGE_GRID_CELL_FRAGMENTS` | T, at least 1 | 8 |
 | `SAGE_QUERY_ORDER` | `mass`, `file` (sliced search) | `mass` |
 
+`SAGE_GRID_CELL_BITS` (equal-ppm cells, up to `c03cecb`) is now an error.
 `Builder::make_parameters` reads the layout into `Parameters::fragment_layout`,
 `#[serde(skip)]`, so configs and `results.json` are unchanged. Each grid build logs
 its shape and directory size (`fragment grid: ...`).
@@ -236,3 +273,59 @@ of spectra during the search); only the warm rerun is comparable. The monolithic
 tryptic index is small (1,539 blocks) and run 11 spends most of its search in full
 scoring, so the kernel's gain is diluted there. G23 tryptic search: 1.39 s → 0.91 s
 monolithic, 3.6 s → 2.3 s sliced.
+
+## Equal-count cells and 16-bit fragments (2026-10-16)
+
+`c03cecb` left the dense class I slices bound by memory traffic at 16 threads: runs
+of ~59 fragments (peaks fall where fragments are dense; equal-ppm cells held ~17 on
+average), plus overscan, at 8 B per fragment. Two steps, each measured
+(`plans/grid_compact_cells.md`):
+- **a, equal-count cells** (cells from the fine-key histogram, kernel unchanged):
+  scans fewer fragments where they are dense;
+- **b, 16-bit residuals and block-local rows** (16-lane groups, the run rules above):
+  4 B per fragment instead of 8.
+
+Checks (`temp/fragment_grid/check_all.sh`, `cells/run.sh`, `compact/run.sh`,
+necromerge2 root): unit tests for the cell table (monotone, covering, width cap,
+`equal_count_cells` on a hand-made histogram), the residual round trip (every
+generated (row, m/z bits) comes back from `fragments()`), and the kernel (dispatched,
+scalar, AVX2) against the exact reference with windows inside one cell, across two and
+many, and with edges exactly on fragment values, at R ∈ {1, 3, 8, 16, 64} ×
+(f, T) ∈ {(7, 1), (10, 4), (14, 1), (14, 16), (16, 1000)}; `lanes_in`. Breaking the
+middle-cell bounds, the position mask, the high-half mask bits, either scalar bound or
+the AVX2 upper bound each fails them. Suites with the grid forced at five shapes
+(including R 65,536). Data: small inputs, G23, F9477 runs 10/11 and every class I run
+below, grid and pages, identical to `062a871`.
+
+F9477 class I sliced, search seconds (and build), 16 threads unless noted:
+
+| kernel | dense slices 1+2 | light slice 3 | search | build | wall | peak anon |
+|---|---:|---:|---:|---:|---:|---:|
+| `062a871` (grid) | 82.3 | 18.0 | 100.3 | 17.7 | 147.8 | 26.4 GB |
+| `c03cecb` (branch-free, 8 lanes) | 79.3 | 16.4 | 95.7 | 19.1 | 146.3 | 26.4 GB |
+| a, T 8 | 63.6 | 14.5 | 78.1 | 16.9 | 122.6 | 26.6 GB |
+| a, T 16 | 66.1 | 16.2 | 82.3 | 20.2 | 131.8 | 26.4 GB |
+| a, T 32 | 72.4 | 15.2 | 87.6 | 16.8 | 132.5 | 26.3 GB |
+| **b, T 8** | **51.8** | 16.2 | **68.0** | 17.8 | **113.5** | **22.1 GB** |
+| b, T 16 | 54.0 | 14.4 | 68.4 | 15.9 | 111.7 | 22.1 GB |
+| b, f 16, T 4 | 54.5 | 14.2 | 68.7 | 16.8 | 112.5 | 22.6 GB |
+| b, T 8, 8 threads | 62.9 | 20.2 | 83.1 | 19.6 | 136.5 | 22.2 GB |
+| `c03cecb`, 8 threads | 81.5 | 24.5 | 106.0 | 16.9 | 158.0 | 26.1 GB |
+
+- **Dense slices 1.59x faster than `062a871`**, search 1.47x, wall 1.30x; pages
+  (`062a871`) searched these in 185.7 s.
+- **Smaller cells help until the fine keys run out:** at T 8 the densest fine keys
+  (f 14) already hold more than 8 fragments per block, so cells there are single fine
+  keys (3,858 cells in slice 1, not 2 × 2,384). f 16 with T 4 doubles the directory
+  (0.6–0.8 GB per dense slice) for no gain.
+- **No longer purely bandwidth-bound:** 8 → 16 threads gives 1.21x on the dense slices
+  again (`c03cecb`: 1.03x). The kernel now spends ~16 of its ~45 instructions per 16
+  fragments on the position mask (`lanes_in`, branch-free `cmov`s); only a run's
+  first and last group need it.
+- **The light slice** (2–3M rows, ~480k queries) spends little time in the kernel;
+  its 14–16 s varies with where the live memory budget puts the slice boundary.
+- **Memory:** 4 B per fragment saves ~4 GB of the peak.
+
+F9477 production search (monolithic tryptic): run 11 112.2 s (`062a871` grid) →
+94.2 (`c03cecb`) → 88.1 (a, T 16) → 91.9 s (b, T 8); run 10 19.1 s (b) against
+20.4 s (`062a871` grid). The tryptic index is small, so it gains least.
