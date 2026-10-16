@@ -388,6 +388,58 @@ impl FragmentGrid {
         )
     }
 
+    /// How evenly the fragments spread, in mass order: per tenth of the blocks, the median
+    /// fragments per block and the fragment-weighted mean cell size (the size of the cell
+    /// a fragment sits in: what a window landing on it scans), plus the overall extremes.
+    pub fn balance(&self) -> String {
+        let blocks = self.block_groups.len().saturating_sub(1);
+        if blocks == 0 || self.cells == 0 {
+            return "empty".into();
+        }
+        let block_fragments = |block: usize| {
+            let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+            starts[self.cells] as usize
+        };
+        let tenths = blocks.min(10);
+        let mut per_block = Vec::with_capacity(tenths);
+        let mut weighted_cell = Vec::with_capacity(tenths);
+        for tenth in 0..tenths {
+            let range = tenth * blocks / tenths..(tenth + 1) * blocks / tenths;
+            let mut counts: Vec<usize> = range.clone().map(block_fragments).collect();
+            counts.sort_unstable();
+            per_block.push(counts[counts.len() / 2]);
+            let (mut squares, mut total) = (0u64, 0u64);
+            for block in range {
+                let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+                for pair in starts.windows(2) {
+                    let size = u64::from(pair[1] - pair[0]);
+                    squares += size * size;
+                    total += size;
+                }
+            }
+            weighted_cell.push(squares as f64 / total.max(1) as f64);
+        }
+        let all: Vec<usize> = (0..blocks).map(block_fragments).collect();
+        let largest_cell = (0..blocks)
+            .flat_map(|block| {
+                let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+                starts.windows(2).map(|pair| pair[1] - pair[0]).max()
+            })
+            .max()
+            .unwrap_or(0);
+        format!(
+            "fragments per block {}..{} (median by tenth of blocks {:?}); fragment-weighted cell size by tenth {:?}, largest cell {}",
+            all.iter().min().unwrap(),
+            all.iter().max().unwrap(),
+            per_block,
+            weighted_cell
+                .iter()
+                .map(|size| (size * 10.0).round() / 10.0)
+                .collect::<Vec<_>>(),
+            largest_cell
+        )
+    }
+
     /// Fragments, pads excluded.
     pub fn len(&self) -> usize {
         self.fragments

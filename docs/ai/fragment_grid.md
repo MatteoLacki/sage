@@ -329,3 +329,31 @@ F9477 class I sliced, search seconds (and build), 16 threads unless noted:
 F9477 production search (monolithic tryptic): run 11 112.2 s (`062a871` grid) →
 94.2 (`c03cecb`) → 88.1 (a, T 16) → 91.9 s (b, T 8); run 10 19.1 s (b) against
 20.4 s (`062a871` grid). The tryptic index is small, so it gains least.
+
+## Balance and class II (2026-10-16)
+
+Each grid build also logs `fragment grid balance:` (`FragmentGrid::balance`): per tenth of
+the blocks in mass order, the median fragments per block and the fragment-weighted cell
+size (the size of the cell a fragment sits in, roughly what a window landing there
+scans), plus the extremes.
+- **Blocks:** fragments per block grow with mass, 1.2–1.4x within a class I slice; across
+  class II's 16 slices from ~51k to ~150k (longer peptides), flat within each.
+- **Cells:** the mean is ~8 fragments per block-cell (T 8), but the fragment-weighted size
+  is 40–140, largest 1,834 (at R 1024, one cell held all 1,024 rows of its block), worse
+  in light blocks. Likely clustered fragments: near-precursor ions (precursor minus one
+  residue, ~20 values within a narrow-mass block) and short low-m/z ions with few
+  distinct masses. Unconfirmed.
+
+R re-swept with this kernel (class I wall): 4096 113.3 s, 2048 114.7 s, 1024 118.1 s.
+
+**Class II** (9–25 aa, 620M rows, 16 slices): grid identical to pages (5,076,501 matched
+fragments); wall 1,110 s → 380 s, peak anonymous 46.1 → 27.1 GB (the pages run also
+re-read 47 GB from disk under memory pressure).
+
+Search phases, class I, warm (in-source counters, temporary; 1,033 CPU-s): grid kernel
+39%, spectrum read and processing 31% (65% in the light slice), full scoring 13%,
+`add_matches` 8.5%, RT/IIM eviction and trim 6.8%, windows 2.7%, precursor binary search
+1.8%. A cheaper run-edge mask (each run's first and last mask computed once, chosen by
+`cmov`: ~38 instead of ~45 instructions per 16 fragments) changed class I search by 2% and
+class II not at all, so it was not kept: the kernel is no longer bound by instructions.
+

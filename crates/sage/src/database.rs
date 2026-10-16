@@ -408,6 +408,7 @@ impl Parameters {
             out.extend(self.indexed_fragments(row, &target_decoys[row]))
         });
         log::info!("fragment grid: {}", grid.describe());
+        log::info!("fragment grid balance: {}", grid.balance());
         IndexedDatabase {
             potential_mods: self.variable_mod_list(),
             peptides: target_decoys,
