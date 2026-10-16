@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 thread_local! {
     static WINDOWS_SCRATCH: RefCell<Vec<(f32, Tolerance)>> = RefCell::new(Vec::new());
+    static MATCHED_SCRATCH: RefCell<Vec<u32>> = RefCell::new(Vec::new());
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -106,6 +107,31 @@ struct InitialHits {
     // Number of peptide candidates with > 0 matched peaks
     scored_candidates: usize,
     preliminary: Vec<PreScore>,
+}
+
+impl InitialHits {
+    /// Counts one match per entry of `matched`, an offset from `first_row` (the
+    /// preliminary slot `first_slot + offset`), without branching on first matches.
+    fn add_matches(
+        &mut self,
+        matched: &[u32],
+        first_row: usize,
+        first_slot: usize,
+        precursor_charge: u8,
+        isotope_error: i8,
+    ) {
+        for &offset in matched {
+            let sc = &mut self.preliminary[first_slot + offset as usize];
+            self.scored_candidates += usize::from(sc.matched == 0);
+            *sc = PreScore {
+                matched: sc.matched + 1,
+                peptide: PeptideIx((first_row + offset as usize) as u32),
+                precursor_charge,
+                isotope_error,
+            };
+        }
+        self.matched_peaks += matched.len();
+    }
 }
 
 impl AddAssign<InitialHits> for InitialHits {
@@ -625,7 +651,8 @@ impl<'db> Scorer<'db> {
 
         // Collect every (mass, fragment_tol) window for this whole
         // spectrum (every peak x every fragment charge) up front, then
-        // search them in one batched call -- `page_search_batch` computes
+        // search them in one batched call (`matched_candidates`; with pages,
+        // through `page_search_batch`) -- `page_search_batch` computes
         // each page's precursor-scoped inner range once and reuses it
         // across every window landing on that page, instead of redoing
         // that binary search independently per (peak, charge) the way a
@@ -655,18 +682,18 @@ impl<'db> Scorer<'db> {
                 }
             }
 
-            candidates.page_search_batch(&windows, |frag| {
-                let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
-                let sc = &mut hits.preliminary[idx];
-                if sc.matched == 0 {
-                    hits.scored_candidates += 1;
-                    sc.precursor_charge = precursor_charge;
-                    sc.peptide = frag.peptide_index;
-                    sc.isotope_error = isotope_error;
-                }
-
-                sc.matched += 1;
-                hits.matched_peaks += 1;
+            MATCHED_SCRATCH.with(|matched| {
+                let mut matched = matched.borrow_mut();
+                matched.clear();
+                candidates.matched_candidates(&windows, &mut matched);
+                let first_row = candidates.candidate_rows().start;
+                hits.add_matches(
+                    &matched,
+                    first_row,
+                    first_row - candidates.pre_idx_lo,
+                    precursor_charge,
+                    isotope_error,
+                );
             });
         });
         if hits.matched_peaks == 0 {
@@ -1606,6 +1633,35 @@ mod tests {
         assert_eq!(Scorer::iim_dense_slot(0, 1, 1, 1), Some(0));
         assert_eq!(Scorer::iim_dense_slot(7, 1, 1, 1), Some(7));
         assert_eq!(Scorer::iim_dense_slot(0, 2, 1, 1), None);
+    }
+
+    #[test]
+    fn add_matches_counts_like_a_per_match_callback() {
+        let matched: Vec<u32> = [3, 0, 3, 7, 7, 7, 2, 0, 3].to_vec();
+        let (first_row, first_slot) = (40, 1);
+        let mut expected = InitialHits {
+            preliminary: vec![PreScore::default(); 10],
+            ..Default::default()
+        };
+        for &offset in &matched {
+            let sc = &mut expected.preliminary[first_slot + offset as usize];
+            if sc.matched == 0 {
+                expected.scored_candidates += 1;
+                sc.precursor_charge = 3;
+                sc.peptide = PeptideIx(first_row as u32 + offset);
+                sc.isotope_error = -1;
+            }
+            sc.matched += 1;
+            expected.matched_peaks += 1;
+        }
+        let mut actual = InitialHits {
+            preliminary: vec![PreScore::default(); 10],
+            ..Default::default()
+        };
+        actual.add_matches(&matched, first_row, first_slot, 3, -1);
+        assert_eq!(actual.preliminary, expected.preliminary);
+        assert_eq!(actual.matched_peaks, expected.matched_peaks);
+        assert_eq!(actual.scored_candidates, expected.scored_candidates);
     }
 
     #[test]

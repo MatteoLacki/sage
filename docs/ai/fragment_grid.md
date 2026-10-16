@@ -1,6 +1,7 @@
 # Fragment grid: precursor blocks × fragment cells (2026-10-16)
 
-Necromerge2 plan: `plans/fragment_grid.md`. A second layout of the fragment index
+Necromerge2 plans: `plans/fragment_grid.md`, `plans/grid_match_simd.md` (the
+branch-free match kernel, below). A second layout of the fragment index
 (`crates/sage/src/fragment_grid.rs`), chosen when the index is built. Prototype:
 switched by environment variables, default unchanged.
 
@@ -21,7 +22,7 @@ precursor-major blocks, fragment cells inside, found by arithmetic.
                  c0     c1     c2    ...
 block 0  rows 0..R    [run]  [run]  [run]  ...
 block 1  rows R..2R   [run]  [run]  [run]  ...
-cell_start[block][c] -> offset (relative to the block) into the (mz, peptide) columns
+cell_start[block][c] -> fragment offset (relative to the block) into its 8-fragment groups
 ```
 
 - **Blocks:** R consecutive peptide rows. Rows are mass-sorted, so a block is a
@@ -33,9 +34,15 @@ cell_start[block][c] -> offset (relative to the block) into the (mz, peptide) co
   One shift, no logarithm. `first_cell` is the lightest fragment's key; window keys
   are clamped to the grid, and a window whose high end is not positive holds nothing.
 - **Inside a cell:** generation order, i.e. peptide order. Nothing relies on it.
-- **Storage:** the same `fragment_mzs`/`fragment_peptide_indices` columns, in grid
-  order, `min_value` empty, plus `IndexedDatabase::grid` (block starts and per-block
-  `cells + 1` cell starts, `u32` relative to the block).
+- **Storage:** `FragmentGrid` owns the fragments as `FragmentGroup`s, 64 B each (one
+  cache line, `align(64)`): 8 m/z (`f32`), then their 8 peptide rows (`u32`). Each
+  block starts on a group and is padded to whole groups with `FragmentGroup::PAD`
+  (NaN m/z, which no window matches). Also block group starts and per-block
+  `cells + 1` cell starts (`u32` fragment offsets relative to the block).
+  `IndexedDatabase::grid` holds it; `fragment_mzs`/`fragment_peptide_indices` and
+  `min_value` stay empty. `size()` and `fragments()` read the grid, pads excluded
+  (`database_size` and `dump_fragment_index` read the page columns, so they see
+  nothing for a grid).
 
 ## Build
 
@@ -47,31 +54,105 @@ columns and the directory:
    scratch; keep the count and the lowest/highest cell key.
 2. **Offsets:** block starts by prefix sum; the global key range gives `first_cell`
    and the cell count.
-3. **Place:** per block, in parallel, into its own disjoint range of the columns:
-   generate again, count per cell, prefix sum (the block's cell starts), place in
-   generation order (a stable counting sort).
+3. **Place:** the groups are allocated filled with pads (a parallel collect); per
+   block, in parallel, into its own disjoint groups: generate again, count per cell,
+   prefix sum (the block's cell starts), place in generation order (a stable counting
+   sort) into lane `offset % 8` of group `offset / 8`.
 
 No global sort. The page layout instead sorts every fragment by m/z, then sorts each
 page by peptide, and peaks at about 16 B per fragment for those copies.
 
 ## Search
 
-`IndexedQuery::page_search_batch` hands the grid the same inputs the pages get: the
-exact candidate rows `[exact_pre_idx_lo, pre_idx_hi)` and the fragment windows.
-`FragmentGrid::search`:
+`matched_peaks_with_isotope` asks `IndexedQuery::matched_candidates` for the matched
+candidates' offsets from `candidate_rows().start` (the exact rows
+`[exact_pre_idx_lo, pre_idx_hi)`), one entry per (window, fragment) match, and counts
+them into `preliminary` (`InitialHits::add_matches`). The grid answers with
+`FragmentGrid::matched_candidates`; pages run their own `page_search_batch` with a
+closure that pushes offsets. Per call:
 - per window, once: its `(lo, hi)` and the cells holding it;
-- per block overlapping the candidate rows (outer loop), per window (inner loop):
-  scan the run `cell_start[b][first] .. cell_start[b][last + 1]` with the AVX2/scalar
-  `lo <= mz <= hi` comparison (`scan_masses`); in a block not wholly inside the
-  candidate rows, also check the peptide id.
+- per block overlapping the candidate rows (outer loop), per window (inner loop): the
+  run of groups covering `cell_start[b][first] .. cell_start[b][last + 1]`, whole
+  groups (below).
 
 **Exact by construction.** The cells partition each block and the key is monotone, so
-every fragment in a window lies in the scanned cells, and the comparison and the id
-check select exactly the (window, fragment) pairs the pages select. Only the order
-they are reported in differs. `matched_peaks_with_isotope` only counts per candidate,
-so the preliminary array, RT/IIM eviction and `trim_hits` see the same values.
-`page_search` (one window; only an integration test uses it) goes through the same
-kernel.
+every fragment in a window lies in the scanned cells. A run's first and last groups
+can also hold fragments of neighbouring cells (keys outside the window's, so m/z
+outside it) and pads (NaN), never another block's. The m/z comparison and the
+candidate check therefore select exactly the (window, fragment) pairs the pages
+select; only their order differs, and counting doesn't depend on it.
+
+`FragmentGrid::search` (the per-fragment callback, reached through
+`page_search_batch` and `page_search`) visits each run's fragments one at a time,
+exactly; the tests use it as the reference.
+
+## Branch-free match handling (2026-10-16)
+
+Profiled first with in-source cycle counters (`perf` needs root): the grid kernel of
+`062a871` was ~67% of class I search CPU, and re-running each call warm three ways
+split it into scanning 26% (AVX2 compare, but `scan_masses_avx2` not inlined, one
+call per run, and a scalar 0–7 tail with unpredictable branches), per-match
+iteration 42% (`tzcnt` loop, a load from the separate id column, an unpredictable
+edge-block id check), counting with a first-touch branch 20%, and the callback's
+own overhead 12%. 268 G fragments scanned, 21.7 G matches.
+
+`matched_candidates_avx2` (`#[target_feature(enable = "avx2,popcnt")]`, chosen at run
+time; `matched_candidates_scalar` otherwise) handles a group in 19 instructions, the
+loop branch the only branch:
+- m/z mask: aligned load, `vcmpps >= lo`, `vcmpps <= hi`, AND;
+- candidate mask: aligned load of the rows, subtract the first candidate row, unsigned
+  `vpminud`/`vpcmpeqd` against the candidate count (the difference is the offset);
+- AND, `vmovmskps`, `popcnt`;
+- left-pack: `LEFT_PACK[mask]` (256 × 8 lane indices, built by a `const fn`),
+  `vpermd` of the offsets, unaligned store into the matched list, advance by the
+  popcount (`reserve` per run leaves room for 8 per group).
+
+`add_matches` then updates `preliminary[first_slot + offset]` per entry without a
+first-match branch (`scored_candidates += (matched == 0)`, the whole `PreScore`
+rewritten). A per-candidate `u16` count array plus a pass over all candidates was
+planned instead; the list avoids that pass (about as many candidates per call as
+matches).
+
+Without `popcnt` enabled the compiler emulated it (5 multiply/shift instructions per
+group); `target_feature` on the whole kernel is what lets the comparison, packing and
+loop inline into one loop.
+
+### Verification
+
+- **Unit:** `matched_candidates_equal_the_exact_search_in_every_lane_width`
+  (`fragment_grid.rs`): random fragments with repeats, 46 windows, 8 candidate ranges,
+  R ∈ {1, 3, 8, 16, 64} × m ∈ {0, 4, 10}: dispatched, scalar and AVX2 against
+  `search`. `assert_search_matches_brute_force` (`database.rs`) also checks
+  `matched_candidates` for pages and every grid shape. `add_matches` against the
+  per-match callback it replaced. Breaking the m/z comparison (`>=` to `>`), the
+  candidate bound, the run end rounding, the scalar bound or the packed count each
+  fails them.
+- **Suites:** sage-core, sage-cli and sage-cloudpath, pages and grid (R 4096/m 10,
+  R 3/m 4, R 1/m 0).
+- **Data** (`temp/fragment_grid/simd/check_all.sh`): the small inputs (8 formats,
+  monolithic and sliced, G23), F9477 runs 10 and 11 and class I, grid and pages:
+  all identical to `062a871`'s pages output.
+
+### Measurements
+
+F9477 class I sliced, search seconds, `062a871` grid / this kernel:
+
+| threads | dense slices 1+2 | light slice 3 | search | wall |
+|---:|---:|---:|---:|---:|
+| 16 | 82.3 / 79.3 (1.04x) | 18.0 / 16.4 (1.10x) | 100.3 / 95.7 (1.05x) | 147.8 / 146.3 |
+| 8 | 110.1 / 81.5 (1.35x) | 26.6 / 24.5 (1.09x) | 136.7 / 106.0 (1.29x) | 192.0 / 158.0 |
+| 4 | 190.6 / 122.2 (1.56x) | 46.7 / 38.6 (1.21x) | 237.3 / 160.8 (1.48x) | 318.7 / 237.1 |
+
+The dense slices are now bound by memory traffic at 16 threads: this kernel gains
+nothing from 8 to 16 threads there (81.5 → 79.3 s), while the old one still did
+(110.1 → 82.3 s, SMT hiding its dependent loads). The groups read 8 B per scanned
+fragment instead of 4, which offsets most of the instructions saved; with fewer
+threads, where bandwidth is not the limit, the new kernel is 1.35–1.56x faster. The
+next lever is fewer bytes scanned, not fewer instructions. Build: 19.1 s against
+17.7 s at 16 threads (the pad-filled allocation pass).
+
+F9477 production search (monolithic tryptic, 1,539 blocks): run 11 112.2 s → 94.2 s
+(pages, with the new counting: 125.0 → 122.2 s); run 10 with pages 23.3 → 22.9 s warm.
 
 ## Query order (sliced search)
 

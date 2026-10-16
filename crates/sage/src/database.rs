@@ -404,16 +404,15 @@ impl Parameters {
 
     /// `build_from_peptides` with the fragments laid out as a `FragmentGrid`.
     fn build_grid(self, target_decoys: Vec<Peptide>, shape: GridShape) -> IndexedDatabase {
-        let (grid, fragment_mzs, fragment_peptide_indices) =
-            FragmentGrid::build(target_decoys.len(), shape, |row, out| {
-                out.extend(self.indexed_fragments(row, &target_decoys[row]))
-            });
+        let grid = FragmentGrid::build(target_decoys.len(), shape, |row, out| {
+            out.extend(self.indexed_fragments(row, &target_decoys[row]))
+        });
         log::info!("fragment grid: {}", grid.describe());
         IndexedDatabase {
             potential_mods: self.variable_mod_list(),
             peptides: target_decoys,
-            fragment_mzs,
-            fragment_peptide_indices,
+            fragment_mzs: Vec::new(),
+            fragment_peptide_indices: Vec::new(),
             min_value: Vec::new(),
             bucket_size: self.bucket_size,
             ion_kinds: self.ion_kinds,
@@ -444,7 +443,8 @@ pub struct Theoretical {
 #[derive(Default)]
 pub struct IndexedDatabase {
     pub peptides: Vec<Peptide>,
-    /// Parallel columns, ordered by peptide index within each fragment-mass page.
+    /// Parallel columns, ordered by peptide index within each fragment-mass page; empty
+    /// when the fragments are in `grid`.
     pub fragment_mzs: Vec<f32>,
     pub fragment_peptide_indices: Vec<PeptideIx>,
     pub ion_kinds: Vec<Kind>,
@@ -454,7 +454,7 @@ pub struct IndexedDatabase {
     pub bucket_size: usize,
     pub generate_decoys: bool,
     pub decoy_tag: String,
-    /// Set when the fragment columns are laid out as a grid instead of pages.
+    /// Set when the fragments are laid out as a grid instead of pages.
     pub grid: Option<FragmentGrid>,
 }
 
@@ -483,17 +483,25 @@ impl IndexedDatabase {
     }
 
     pub fn size(&self) -> usize {
-        self.fragment_mzs.len()
+        match &self.grid {
+            Some(grid) => grid.len(),
+            None => self.fragment_mzs.len(),
+        }
     }
 
-    pub fn fragments(&self) -> impl Iterator<Item = Theoretical> + '_ {
-        self.fragment_mzs
-            .iter()
-            .zip(&self.fragment_peptide_indices)
-            .map(|(&fragment_mz, &peptide_index)| Theoretical {
-                peptide_index,
-                fragment_mz,
-            })
+    pub fn fragments(&self) -> Box<dyn Iterator<Item = Theoretical> + '_> {
+        if let Some(grid) = &self.grid {
+            return Box::new(grid.fragments());
+        }
+        Box::new(
+            self.fragment_mzs
+                .iter()
+                .zip(&self.fragment_peptide_indices)
+                .map(|(&fragment_mz, &peptide_index)| Theoretical {
+                    peptide_index,
+                    fragment_mz,
+                }),
+        )
     }
 
     pub fn buckets(&self) -> &[f32] {
@@ -642,29 +650,40 @@ impl IndexedQuery<'_> {
     /// OS threads, so this persists correctly across the many spectra one
     /// worker processes, without needing to thread a buffer through every
     /// call site by hand.
+    /// The peptide rows whose mass lies in the precursor window: `pre_idx_lo..pre_idx_hi`
+    /// without `binary_search_slice`'s predecessor row at the lower boundary.
+    pub fn candidate_rows(&self) -> std::ops::Range<usize> {
+        let (precursor_lo, _) = self.precursor_tol.theoretical_range(self.precursor_mass);
+        let below_window = self
+            .db
+            .peptides
+            .get(self.pre_idx_lo)
+            .map_or(false, |p| p.monoisotopic < precursor_lo);
+        self.pre_idx_lo + usize::from(below_window)..self.pre_idx_hi
+    }
+
+    /// Appends to `matched`, once per (window, fragment) match `page_search_batch`
+    /// finds, the matched peptide's offset from `candidate_rows().start`, in no
+    /// particular order.
+    pub fn matched_candidates(&self, windows: &[(f32, Tolerance)], matched: &mut Vec<u32>) {
+        let rows = self.candidate_rows();
+        if let Some(grid) = &self.db.grid {
+            grid.matched_candidates(rows, windows, matched);
+            return;
+        }
+        self.page_search_batch(windows, |fragment| {
+            matched.push((fragment.peptide_index.0 as usize - rows.start) as u32)
+        });
+    }
+
     pub fn page_search_batch(
         &self,
         windows: &[(f32, Tolerance)],
         mut on_match: impl FnMut(Theoretical),
     ) {
-        let (precursor_lo, _) = self.precursor_tol.theoretical_range(self.precursor_mass);
-        // binary_search_slice includes one predecessor at the lower boundary.
-        // Convert to an exact half-open peptide-ID range before scanning pages.
-        let exact_pre_idx_lo = self.pre_idx_lo
-            + usize::from(
-                self.db
-                    .peptides
-                    .get(self.pre_idx_lo)
-                    .map_or(false, |p| p.monoisotopic < precursor_lo),
-            );
+        let exact_pre_idx_lo = self.candidate_rows().start;
         if let Some(grid) = &self.db.grid {
-            grid.search(
-                &self.db.fragment_mzs,
-                &self.db.fragment_peptide_indices,
-                exact_pre_idx_lo..self.pre_idx_hi,
-                windows,
-                on_match,
-            );
+            grid.search(exact_pre_idx_lo..self.pre_idx_hi, windows, on_match);
             return;
         }
         #[cfg(target_arch = "x86_64")]
@@ -843,18 +862,6 @@ fn resolve_page_peptide_bounds(
     }
 }
 
-/// Every index of `masses` with `lo <= mass <= hi`, in order: AVX2 when available.
-#[inline]
-pub(crate) fn scan_masses(masses: &[f32], lo: f32, hi: f32, on_match: impl FnMut(usize)) {
-    #[cfg(target_arch = "x86_64")]
-    if masses.len() >= 8 && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: runtime feature detection above guards this call.
-        unsafe { scan_masses_avx2(masses, lo, hi, on_match) };
-        return;
-    }
-    scan_masses_scalar(masses, lo, hi, on_match)
-}
-
 #[inline]
 fn scan_masses_scalar(masses: &[f32], lo: f32, hi: f32, mut on_match: impl FnMut(usize)) {
     for (i, &mass) in masses.iter().enumerate() {
@@ -1026,6 +1033,20 @@ mod test {
             unbatched.sort_unstable();
             assert_eq!(actual, expected, "{layout}, mass={mass}, tol={tol:?}");
             assert_eq!(unbatched, expected, "{layout}, mass={mass}, tol={tol:?}");
+            let first_candidate = query.candidate_rows().start as u32;
+            let mut matched = Vec::new();
+            query.matched_candidates(windows, &mut matched);
+            let mut matched_peptides: Vec<_> = matched
+                .iter()
+                .map(|&offset| PeptideIx(first_candidate + offset))
+                .collect();
+            let mut expected_peptides: Vec<_> = expected.iter().map(|&(p, _)| p).collect();
+            matched_peptides.sort_unstable();
+            expected_peptides.sort_unstable();
+            assert_eq!(
+                matched_peptides, expected_peptides,
+                "{layout}, mass={mass}, tol={tol:?}"
+            );
         }
         db.query(600.0, Tolerance::Da(-1000.0, 1000.0))
             .page_search_batch(&[], |_| panic!("empty window list matched"));
@@ -1067,18 +1088,15 @@ mod test {
         fragments: &[Theoretical],
         shape: GridShape,
     ) -> IndexedDatabase {
-        let (grid, fragment_mzs, fragment_peptide_indices) =
-            FragmentGrid::build(peptides.len(), shape, |row, out| {
-                out.extend(
-                    fragments
-                        .iter()
-                        .filter(|f| f.peptide_index.0 as usize == row),
-                )
-            });
+        let grid = FragmentGrid::build(peptides.len(), shape, |row, out| {
+            out.extend(
+                fragments
+                    .iter()
+                    .filter(|f| f.peptide_index.0 as usize == row),
+            )
+        });
         IndexedDatabase {
             peptides: peptides.to_vec(),
-            fragment_mzs,
-            fragment_peptide_indices,
             grid: Some(grid),
             ..Default::default()
         }
