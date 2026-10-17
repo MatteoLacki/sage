@@ -409,6 +409,54 @@ pub fn deisotope<T: RawIntensity>(
     peaks
 }
 
+/// The envelope heads among `peaks` (`envelope.is_none()`), at most `top_n` of the most
+/// intense (intensity descending, then m/z ascending), as (peak, resolved charge) pairs
+/// in mass order, ties in mass in that intensity order: what sorting all peaks by
+/// intensity, taking the first `top_n` heads and stable-sorting them by mass gives, with
+/// a linear-time selection instead of the full sort.
+fn most_intense_in_mass_order(mut peaks: Vec<Deisotoped>, top_n: usize) -> (Vec<Peak>, Vec<u8>) {
+    let by_intensity = |a: &Deisotoped, b: &Deisotoped| {
+        b.intensity
+            .total_cmp(&a.intensity)
+            .then_with(|| a.mz.total_cmp(&b.mz))
+    };
+    peaks.retain(|peak| peak.envelope.is_none());
+    if peaks.len() > top_n {
+        if top_n > 0 {
+            peaks.select_nth_unstable_by(top_n - 1, by_intensity);
+        }
+        peaks.truncate(top_n);
+    }
+    let mut heads: Vec<(Peak, u8, f32)> = peaks
+        .into_iter()
+        .map(|peak| {
+            // Convert from MH* to M. `mass`'s scale always defaults to 1 when no
+            // envelope was resolved (the best available base for scoring.rs's fragment
+            // charge-hypothesis loop) -- but the charge *reported* is 0 in that case,
+            // not 1, so it stays distinguishable from a genuinely confirmed charge-1
+            // envelope. See docs/ai/fragment_charge_hypothesis.md.
+            let resolved_charge = peak.charge;
+            let scale_charge = resolved_charge.unwrap_or(1);
+            let mass = (peak.mz - PROTON) * scale_charge as f32;
+            let head = Peak {
+                mass,
+                intensity: peak.intensity,
+            };
+            (head, resolved_charge.unwrap_or(0), peak.mz)
+        })
+        .collect();
+    heads.sort_unstable_by(|(a, _, a_mz), (b, _, b_mz)| {
+        a.mass
+            .total_cmp(&b.mass)
+            .then_with(|| b.intensity.total_cmp(&a.intensity))
+            .then_with(|| a_mz.total_cmp(b_mz))
+    });
+    heads
+        .into_iter()
+        .map(|(peak, charge, _)| (peak, charge))
+        .unzip()
+}
+
 /// Path compression of isotopic envelope links
 pub fn path_compression(peaks: &mut [Deisotoped]) {
     for idx in 0..peaks.len() {
@@ -527,46 +575,14 @@ impl SpectrumProcessor {
             .unwrap_or(3);
 
         if should_deisotope {
-            let mut peaks = deisotope(
+            let peaks = deisotope(
                 spectrum.mz.as_ref(),
                 spectrum.intensity.as_ref(),
                 charge,
                 10.0,
                 self.min_deisotope_mz,
             );
-            peaks.sort_unstable_by(|a, b| {
-                b.intensity
-                    .total_cmp(&a.intensity)
-                    .then_with(|| a.mz.total_cmp(&b.mz))
-            });
-
-            // Collect as (Peak, charge) pairs so we can sort both by mass together
-            let mut pairs: Vec<(Peak, u8)> = peaks
-                .into_iter()
-                .filter(|peak| peak.envelope.is_none())
-                .map(|peak| {
-                    // Convert from MH* to M. `mass`'s scale always defaults
-                    // to 1 when no envelope was resolved (the best available
-                    // base for scoring.rs's fragment charge-hypothesis
-                    // loop) -- but the charge *reported* below is 0 in that
-                    // case, not 1, so it stays distinguishable from a
-                    // genuinely confirmed charge-1 envelope. See
-                    // docs/ai/fragment_charge_hypothesis.md.
-                    let resolved_charge = peak.charge;
-                    let scale_charge = resolved_charge.unwrap_or(1);
-                    let mass = (peak.mz - PROTON) * scale_charge as f32;
-                    (
-                        Peak {
-                            mass,
-                            intensity: peak.intensity,
-                        },
-                        resolved_charge.unwrap_or(0),
-                    )
-                })
-                .take(self.take_top_n)
-                .collect();
-            pairs.sort_by(|(a, _), (b, _)| a.mass.total_cmp(&b.mass));
-            pairs.into_iter().unzip()
+            most_intense_in_mass_order(peaks, self.take_top_n)
         } else {
             let mut peaks = spectrum
                 .mz
@@ -694,6 +710,83 @@ impl SpectrumProcessor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The selection `most_intense_in_mass_order` replaced: sort everything by
+    /// intensity, keep the first `top_n` heads, stable-sort them by mass.
+    fn most_intense_by_full_sort(mut peaks: Vec<Deisotoped>, top_n: usize) -> (Vec<Peak>, Vec<u8>) {
+        peaks.sort_unstable_by(|a, b| {
+            b.intensity
+                .total_cmp(&a.intensity)
+                .then_with(|| a.mz.total_cmp(&b.mz))
+        });
+        let mut pairs: Vec<(Peak, u8)> = peaks
+            .into_iter()
+            .filter(|peak| peak.envelope.is_none())
+            .map(|peak| {
+                let scale_charge = peak.charge.unwrap_or(1);
+                let mass = (peak.mz - PROTON) * scale_charge as f32;
+                (
+                    Peak {
+                        mass,
+                        intensity: peak.intensity,
+                    },
+                    peak.charge.unwrap_or(0),
+                )
+            })
+            .take(top_n)
+            .collect();
+        pairs.sort_by(|(a, _), (b, _)| a.mass.total_cmp(&b.mass));
+        pairs.into_iter().unzip()
+    }
+
+    #[test]
+    fn selection_of_most_intense_heads_equals_the_full_sort() {
+        let mut state = 12345u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for case in 0..200 {
+            let len = next(3000) as usize;
+            let mut peaks: Vec<Deisotoped> = (0..len)
+                .map(|i| Deisotoped {
+                    // Repeated m/z values with distinct intensities, so (intensity, m/z)
+                    // never ties; equal m/z with charge None and Some(1) gives equal masses.
+                    mz: 100.0 + (next(400_000) as f32) / 1000.0,
+                    intensity: i as f32 + next(1000) as f32 / 1024.0 + 0.5,
+                    charge: match next(4) {
+                        0 => None,
+                        c => Some(c as u8),
+                    },
+                    envelope: match next(10) < 3 {
+                        true => Some(0),
+                        false => None,
+                    },
+                })
+                .collect();
+            if case % 3 == 0 && len > 1 {
+                peaks[1].mz = peaks[0].mz;
+                peaks[0].charge = None;
+                peaks[1].charge = Some(1);
+            }
+            if case % 2 == 1 {
+                // Intensities from a small set, m/z all distinct: ties broken by m/z.
+                for (i, peak) in peaks.iter_mut().enumerate() {
+                    peak.mz = 100.0 + i as f32 * 0.25;
+                    peak.intensity = (next(20) + 1) as f32;
+                }
+            }
+            for top_n in [0, 1, 7, 800, 5000] {
+                assert_eq!(
+                    most_intense_in_mass_order(peaks.clone(), top_n),
+                    most_intense_by_full_sort(peaks.clone(), top_n),
+                    "case {case}, top_n {top_n}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn columnar_peak_selection_matches_reference_including_ties() {
