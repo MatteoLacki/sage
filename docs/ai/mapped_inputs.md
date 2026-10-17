@@ -40,10 +40,11 @@ pipeline's `dump_peptides_config.json`, compared after printing both through JSO
 `f32`s compare as the same text), the variable-mod masses, and the proteome hash
 (boundaries, accessions, residues). The FASTA path itself does not matter.
 
-In memory, a `CompactRows` column is `Owned(Vec<T>)` (built) or `Stored(SharedBytes)`
-(any `AsRef<[u8]>` kept alive by the column, here a `memmap2::Mmap`), checked once for
-length and alignment; every accessor goes through `as_slice`, so the search code is
-the same either way. sage-core gains no dependency (mapping and JSON live in
+In memory, a `CompactRows` column is a pointer and a length into either an owned
+`Vec<T>` (built) or stored bytes (`SharedBytes`: any `AsRef<[u8]>` kept alive by the
+column, here a `memmap2::Mmap`), checked once for length and alignment; every
+accessor is the same plain slice either way (see "Page faults" below for why it is
+not an enum matched per access), so the search code does not change. sage-core gains no dependency (mapping and JSON live in
 sage-cloudpath). The stored fingerprint (`CompactPeptides::stored_fingerprint`)
 replaces hashing every row's mass when positional predictions are checked.
 
@@ -54,26 +55,50 @@ rather than showing up as a lower peak.
 
 ### Measured, F9477 immunopeptidomics (16 threads, grid layout)
 
-Warm page cache, nothing else running, same binary; necromerge2
-`temp/mapped_table/timing*`.
+Nothing else running, same binary (with the column-access fix below); necromerge2
+`temp/mapped_table/timing/fixed/`. The stored table was partly evicted by the run before
+it (0.8 and 3.4 GB read from disk), as it would be in a pipeline.
 
 | | class I built | class I mapped | class II built | class II mapped |
 |---|---:|---:|---:|---:|
-| table | 7.7 s build | 0.1 s map | 33.0 s build | 0.1 s map |
+| table | 7.8 s build | 0.1 s map | 32.0 s build | 0.1 s map |
 | anonymous at "database ready" | 1.83 GB | 0.04 GB | 7.49 GB | 0.04 GB |
 | slices | 3 | 2 | 15 | 13 |
-| planning | 0.6 s | 3.8 s | 2.2 s | 8.5 s |
-| sliced search | 85.5 s | 87.4 s | 324.9 s | 323.6 s |
-| anonymous after the search | 11.57 GB | 9.95 GB | 17.01 GB | 10.64 GB |
-| peak anonymous (polled) | 21.72 GB | 20.54 GB | 25.38 GB | 20.45 GB |
-| wall | 107.6 s | 103.0 s | 386.7 s | 357.2 s |
+| planning (with query headers) | 0.4 s | 1.0 s | 1.4 s | 3.6 s |
+| sliced search | 86.3 s | 86.6 s | 320.7 s | 318.1 s |
+| anonymous after the search | 11.49 GB | 10.11 GB | 17.22 GB | 10.80 GB |
+| peak anonymous (polled) | 21.64 GB | 20.46 GB | 25.37 GB | 20.48 GB |
+| wall | 109.3 s | 102.1 s | 383.7 s | 348.4 s |
 
 Storing the table once: `dump_peptides --compact` 10.2 s and 3.6 GB peak for class I,
 43.8 s and 17.0 GB for class II (the direct build's own peak).
 
-Planning is slower mapped (+3 s, +6 s): it reads every row's mass and length through
-page faults, partly from disk when the table was evicted (0.8 and 3.3 GB read). An
-`madvise(MADV_SEQUENTIAL)` on the columns is the obvious next step if it matters.
+### Page faults: not the cost (2026-10-17)
+
+Planning (`SlicePlan::new`, one thread, every row's mass and length) was 3 to 6 s slower
+mapped. Measured on class II alone (the run exits after planning; necromerge2
+`temp/mapped_table/faults/`, table evicted with `posix_fadvise(DONTNEED)`, residency
+checked with `mincore`):
+
+| table pages | mapping | planning | minor / major faults |
+|---|---|---|---|
+| cached | plain, `WILLNEED`, `SEQUENTIAL`, `RANDOM` | 3.9 s | 96k / 0 |
+| cached | `MAP_POPULATE` (0.85 s at open) | 3.8 s | 181k at open / 0 |
+| evicted | plain, `WILLNEED`, `SEQUENTIAL` | 5.4 s | 96k / 2-297 |
+| evicted | `RANDOM` (no readahead) | 19.2 s | 81k / 14k |
+| evicted | `MAP_POPULATE` (6.8-9.9 s at open) | 3.8 s | 181k at open / 0 |
+| built table (reference) | | 2.2 s | |
+
+Faulting is cheap: each minor fault maps 64 KB (fault-around), so 1.86 GB of planning
+columns cost ~96k faults; with every page populated up front planning was no faster.
+The gap was the access path: a stored column was an enum variant holding
+`Arc<dyn AsRef<[u8]>>`, so every row access paid a match and a dynamic call (~1.9
+billion of them in the sweep). Storing a pointer and length at construction (one
+plain slice for both owned and stored columns) brought class II planning to 1.3 s
+cached, 2.7 s evicted, and the built table's from 2.2 to 1.2 s (it paid the match
+too). What remains is reading the planning columns when they were evicted (~1.4 s);
+`MAP_POPULATE` reads all 7.45 GB instead and is slower, `WILLNEED` and `SEQUENTIAL`
+gain nothing over the kernel's readahead, so no advice is set.
 
 Results identical to the pages baselines (PSM key, matched fragments, pin) for both
 classes, mapped and built, and on the small checks (pmsms sliced, G23 tryptic).

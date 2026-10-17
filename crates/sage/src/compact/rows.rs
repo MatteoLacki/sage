@@ -23,13 +23,35 @@ impl StoredElement for u16 {}
 impl StoredElement for u32 {}
 impl StoredElement for VarSites {}
 
-/// One column: built in memory, or read in place from stored bytes.
-enum Column<T: StoredElement> {
+/// One column: built in memory, or read in place from stored bytes. Either way it is
+/// read through the same pointer and length, so a stored column costs no more per
+/// access than an owned one.
+struct Column<T: StoredElement> {
+    values: *const T,
+    len: usize,
+    storage: Storage<T>,
+}
+
+/// What keeps a [`Column`]'s values alive.
+enum Storage<T> {
     Owned(Vec<T>),
     Stored(SharedBytes),
 }
 
+// SAFETY: a column's values are never written after construction, and `storage`
+// (itself `Send + Sync`) keeps them alive and in place.
+unsafe impl<T: StoredElement> Send for Column<T> {}
+unsafe impl<T: StoredElement> Sync for Column<T> {}
+
 impl<T: StoredElement> Column<T> {
+    fn owned(values: Vec<T>) -> Self {
+        Self {
+            values: values.as_ptr(),
+            len: values.len(),
+            storage: Storage::Owned(values),
+        }
+    }
+
     /// `bytes` read as `rows` values of `T`, native byte order.
     fn stored(bytes: SharedBytes, rows: usize, name: &str) -> Result<Self, String> {
         let raw: &[u8] = (*bytes).as_ref();
@@ -40,30 +62,29 @@ impl<T: StoredElement> Column<T> {
                 raw.len()
             ));
         }
-        if expected > 0 && raw.as_ptr() as usize % std::mem::align_of::<T>() != 0 {
+        let values = match rows {
+            0 => std::ptr::NonNull::<T>::dangling().as_ptr() as *const T,
+            _ => raw.as_ptr() as *const T,
+        };
+        if values as usize % std::mem::align_of::<T>() != 0 {
             return Err(format!("column {name} is not aligned for its element type"));
         }
-        Ok(Column::Stored(bytes))
+        Ok(Self {
+            values,
+            len: rows,
+            storage: Storage::Stored(bytes),
+        })
     }
 
     fn as_slice(&self) -> &[T] {
-        match self {
-            Column::Owned(values) => values,
-            Column::Stored(bytes) => {
-                let raw: &[u8] = (**bytes).as_ref();
-                if raw.is_empty() {
-                    return &[];
-                }
-                // SAFETY: `Column::stored` checked the length and alignment, `T` accepts
-                // every bit pattern, and `bytes` lives as long as `self`.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        raw.as_ptr() as *const T,
-                        raw.len() / std::mem::size_of::<T>(),
-                    )
-                }
-            }
-        }
+        // SAFETY: `values` points at `len` initialised values of `T` (checked for
+        // length and alignment when stored), kept alive by `storage` for as long as
+        // `self`.
+        unsafe { std::slice::from_raw_parts(self.values, self.len) }
+    }
+
+    fn is_stored(&self) -> bool {
+        matches!(self.storage, Storage::Stored(_))
     }
 
     fn bytes(&self) -> &[u8] {
@@ -77,16 +98,17 @@ impl<T: StoredElement> Column<T> {
 
 impl<T: StoredElement> Default for Column<T> {
     fn default() -> Self {
-        Column::Owned(Vec::new())
+        Column::owned(Vec::new())
     }
 }
 
 impl<T: StoredElement> std::fmt::Debug for Column<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Column::Owned(values) => write!(f, "Owned({} values)", values.len()),
-            Column::Stored(bytes) => write!(f, "Stored({} bytes)", (**bytes).as_ref().len()),
-        }
+        let kind = match self.storage {
+            Storage::Owned(_) => "Owned",
+            Storage::Stored(_) => "Stored",
+        };
+        write!(f, "{kind}({} values)", self.len)
     }
 }
 
@@ -134,10 +156,10 @@ impl CompactRows {
     /// Columns of `rows`, which must be sorted by mass.
     pub fn from_rows(rows: Vec<CompactPeptide>) -> CompactRows {
         let masses = ChunkedMasses::new(&rows);
-        let starts = Column::Owned(rows.par_iter().map(|row| row.start).collect());
-        let lengths = Column::Owned(rows.par_iter().map(|row| row.length).collect());
-        let flags = Column::Owned(rows.par_iter().map(|row| row.flags).collect());
-        let var_sites = Column::Owned(rows.par_iter().map(|row| row.var_sites).collect());
+        let starts = Column::owned(rows.par_iter().map(|row| row.start).collect());
+        let lengths = Column::owned(rows.par_iter().map(|row| row.length).collect());
+        let flags = Column::owned(rows.par_iter().map(|row| row.flags).collect());
+        let var_sites = Column::owned(rows.par_iter().map(|row| row.var_sites).collect());
         super::drop_in_parallel(rows);
         CompactRows {
             masses,
@@ -228,7 +250,7 @@ impl CompactRows {
 
     /// Whether the columns are read in place from stored bytes.
     pub fn is_stored(&self) -> bool {
-        matches!(self.starts, Column::Stored(_))
+        self.starts.is_stored()
     }
 }
 
@@ -281,7 +303,7 @@ impl ChunkedMasses {
             .collect();
         ChunkedMasses {
             chunks,
-            residuals: Column::Owned(residuals),
+            residuals: Column::owned(residuals),
             wide,
         }
     }
