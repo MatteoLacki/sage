@@ -685,7 +685,11 @@ impl<'db> Scorer<'db> {
             MATCHED_SCRATCH.with(|matched| {
                 let mut matched = matched.borrow_mut();
                 matched.clear();
-                candidates.matched_candidates(&windows, &mut matched);
+                candidates.matched_candidates(
+                    &windows,
+                    self.compatible_predicted_rt(query),
+                    &mut matched,
+                );
                 let first_row = candidates.candidate_rows().start;
                 hits.add_matches(
                     &matched,
@@ -741,19 +745,25 @@ impl<'db> Scorer<'db> {
     /// to prediction-coverage gaps). Missing observed
     /// `inverse_ion_mobility` (non-PASEF data) skips the IIM check only;
     /// the RT check still applies.
+    /// The predicted RTs compatible with `query`'s retention time, when predicted RTs are
+    /// configured: what eviction keeps, and what a grid with an RT axis reads.
+    fn compatible_predicted_rt(&self, query: &ProcessedSpectrum) -> Option<(f32, f32)> {
+        self.predicted_rt.map(|_| {
+            self.rt_tol
+                .as_ref()
+                .expect("validated at config-load time: rt_tol required with predicted_rt")
+                .tolerance_at(query.scan_start_time)
+                .theoretical_range(query.scan_start_time)
+        })
+    }
+
     fn evict_rt_iim_mismatches(
         &self,
         query: &ProcessedSpectrum,
         candidates: &IndexedQuery,
         hits: &mut InitialHits,
     ) {
-        let compatible_predicted_rt = self.predicted_rt.map(|_| {
-            self.rt_tol
-                .as_ref()
-                .expect("validated at config-load time: rt_tol required with predicted_rt")
-                .tolerance_at(query.scan_start_time)
-                .theoretical_range(query.scan_start_time)
-        });
+        let compatible_predicted_rt = self.compatible_predicted_rt(query);
         let compatible_predicted_iim = self.predicted_iim.and_then(|_| {
             query
                 .precursors

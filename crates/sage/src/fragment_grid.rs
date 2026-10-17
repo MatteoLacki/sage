@@ -84,6 +84,37 @@ impl FragmentLayout {
     }
 }
 
+/// Predicted retention times by peptide row (per-run calibrated, in the units of the
+/// spectra's retention times), and how many RT slabs to split each block into.
+#[derive(Clone, Copy, Debug)]
+pub struct RtSlabbing<'a> {
+    pub predicted: &'a [Option<f32>],
+    pub slabs: usize,
+}
+
+impl RtSlabbing<'_> {
+    /// `SAGE_GRID_RT_SLABS`, else the span of `predicted` over four times `window`, the
+    /// width of a spectrum's compatible window; 1 to 64. More slabs prune more rows but
+    /// leave fewer fragments per (block, slab) and so wider cells; on F9477 run 11 the
+    /// span over one window (17 slabs) was slower than over four (4 slabs).
+    pub fn derived_slabs(predicted: &[Option<f32>], window: f32) -> usize {
+        if let Some(slabs) = environment_number("SAGE_GRID_RT_SLABS") {
+            assert!(slabs >= 1, "SAGE_GRID_RT_SLABS must be at least 1");
+            return slabs;
+        }
+        let finite = predicted
+            .iter()
+            .filter_map(|rt| rt.filter(|rt| rt.is_finite()));
+        let (low, high) = finite.fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), rt| {
+            (low.min(rt), high.max(rt))
+        });
+        match high > low && window > 0.0 {
+            true => ((high - low) / (4.0 * window)).floor().clamp(1.0, 64.0) as usize,
+            false => 1,
+        }
+    }
+}
+
 fn environment_number(name: &str) -> Option<usize> {
     let value = std::env::var(name).ok()?;
     Some(
@@ -151,11 +182,19 @@ pub struct FragmentGrid {
     /// Each cell's lowest fine key.
     cell_first_fine: Vec<u32>,
     cells: usize,
+    /// Slabs per block: `rt_bounds.len() + 1` RT slabs and one for rows without a usable
+    /// prediction, or a single slab holding everything when there is no RT axis.
+    slabs: usize,
+    /// Upper bounds of the RT slabs but the last, ascending: a row with predicted RT `rt`
+    /// is in slab `rt_bounds.partition_point(|&bound| bound <= rt)`.
+    rt_bounds: Vec<f32>,
+    rt_axis: bool,
     /// Fragments, pads excluded.
     fragments: usize,
     /// Each block's first group, plus the total.
     block_groups: Vec<usize>,
-    /// Per block, `cells + 1` fragment offsets relative to the block's first group.
+    /// Per block, `slabs * cells + 1` fragment offsets relative to the block's first
+    /// group: slab `s`, cell `c` starts at entry `s * cells + c`.
     cell_starts: Vec<u32>,
     groups: Vec<FragmentGroup>,
 }
@@ -204,6 +243,8 @@ impl CellWindow {
 struct GridScratch {
     fragments: Vec<Theoretical>,
     cursors: Vec<u32>,
+    /// The RT slab of each row of the block being built.
+    row_slabs: Vec<u16>,
     windows: Vec<CellWindow>,
 }
 
@@ -218,8 +259,27 @@ impl FragmentGrid {
     pub fn build(
         rows: usize,
         shape: GridShape,
+        rt: Option<RtSlabbing>,
         fragments_of: impl Fn(usize, &mut Vec<Theoretical>) + Sync,
     ) -> FragmentGrid {
+        if let Some(rt) = &rt {
+            assert_eq!(rt.predicted.len(), rows, "one predicted RT per row");
+        }
+        let rt_bounds = rt.as_ref().map(rt_slab_bounds).unwrap_or_default();
+        let rt_slabs = rt.map_or(0, |_| rt_bounds.len() + 1);
+        let slabs = rt_slabs + 1;
+        let slab_of_row = |row: usize| -> usize {
+            let Some(rt) = rt else {
+                return 0;
+            };
+            match rt.predicted[row] {
+                Some(predicted) if predicted.is_finite() => {
+                    rt_bounds.partition_point(|&bound| bound <= predicted)
+                }
+                _ => rt_slabs,
+            }
+        };
+        let slabs = if rt.is_some() { slabs } else { 1 };
         assert!(rows <= u32::MAX as usize, "peptide rows must fit u32");
         assert!(
             shape.rows_per_block <= 1 << 16,
@@ -298,7 +358,7 @@ impl FragmentGrid {
                 &histogram[(first_fine - histogram_base) as usize
                     ..=(last_fine - histogram_base) as usize],
                 first_fine,
-                (shape.cell_fragments * blocks) as u64,
+                (shape.cell_fragments * blocks * rt_slabs.max(1)) as u64,
                 1 << (shape.fine_bits - MIN_FINE_BITS),
             ),
             false => (Vec::new(), Vec::new()),
@@ -319,34 +379,45 @@ impl FragmentGrid {
             .into_par_iter()
             .map(|_| FragmentGroup::EMPTY)
             .collect();
-        let mut cell_starts = vec![0u32; blocks * (cells + 1)];
+        let directory = slabs * cells + 1;
+        let mut cell_starts = vec![0u32; blocks * directory];
         split_by_starts(&mut groups, &block_groups)
             .into_par_iter()
-            .zip(cell_starts.par_chunks_mut(cells + 1))
+            .zip(cell_starts.par_chunks_mut(directory))
             .zip(census.par_iter())
             .enumerate()
             .for_each(|(block, ((block_groups, starts), &(count, _, _)))| {
                 GRID_SCRATCH.with(|scratch| {
                     let GridScratch {
-                        fragments, cursors, ..
+                        fragments,
+                        cursors,
+                        row_slabs,
+                        ..
                     } = &mut *scratch.borrow_mut();
                     generate(block, fragments);
                     assert_eq!(fragments.len(), count, "block {block} changed size");
+                    let first_row = block * shape.rows_per_block;
+                    row_slabs.clear();
+                    row_slabs.extend(block_rows(block).map(|row| slab_of_row(row) as u16));
                     let cell_of =
                         |bits: u32| cell_of_fine[((bits >> shift) - first_fine) as usize] as usize;
+                    let key_of = |fragment: &Theoretical| {
+                        let slab =
+                            row_slabs[fragment.peptide_index.0 as usize - first_row] as usize;
+                        slab * cells + cell_of(fragment.fragment_mz.to_bits())
+                    };
                     for fragment in fragments.iter() {
-                        starts[cell_of(fragment.fragment_mz.to_bits()) + 1] += 1;
+                        starts[key_of(fragment) + 1] += 1;
                     }
                     for cell in 1..starts.len() {
                         starts[cell] += starts[cell - 1];
                     }
                     cursors.clear();
                     cursors.extend_from_slice(starts);
-                    let first_row = block * shape.rows_per_block;
                     for fragment in fragments.iter() {
                         let bits = fragment.fragment_mz.to_bits();
                         let cell = cell_of(bits);
-                        let cursor = &mut cursors[cell];
+                        let cursor = &mut cursors[key_of(fragment)];
                         let group = &mut block_groups[*cursor as usize / LANES];
                         let lane = *cursor as usize % LANES;
                         let residual = bits - (cell_first_fine[cell] << shift);
@@ -367,6 +438,9 @@ impl FragmentGrid {
             cell_of_fine,
             cell_first_fine,
             cells,
+            slabs,
+            rt_bounds,
+            rt_axis: rt.is_some(),
             fragments,
             block_groups,
             cell_starts,
@@ -376,9 +450,10 @@ impl FragmentGrid {
 
     pub fn describe(&self) -> String {
         format!(
-            "{} blocks of {} rows x {} cells (~{} fragments each, {}-bit fine keys), {} fragments in {} groups, directory {:.1} MB",
+            "{} blocks of {} rows x {} RT slabs x {} cells (~{} fragments each, {}-bit fine keys), {} fragments in {} groups, directory {:.1} MB",
             self.block_groups.len() - 1,
             self.rows_per_block,
+            self.slabs,
             self.cells,
             self.cell_fragments,
             23 - self.shift,
@@ -396,9 +471,10 @@ impl FragmentGrid {
         if blocks == 0 || self.cells == 0 {
             return "empty".into();
         }
+        let directory = self.slabs * self.cells + 1;
         let block_fragments = |block: usize| {
-            let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
-            starts[self.cells] as usize
+            let starts = &self.cell_starts[block * directory..][..directory];
+            starts[directory - 1] as usize
         };
         let tenths = blocks.min(10);
         let mut per_block = Vec::with_capacity(tenths);
@@ -410,7 +486,7 @@ impl FragmentGrid {
             per_block.push(counts[counts.len() / 2]);
             let (mut squares, mut total) = (0u64, 0u64);
             for block in range {
-                let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+                let starts = &self.cell_starts[block * directory..][..directory];
                 for pair in starts.windows(2) {
                     let size = u64::from(pair[1] - pair[0]);
                     squares += size * size;
@@ -422,7 +498,7 @@ impl FragmentGrid {
         let all: Vec<usize> = (0..blocks).map(block_fragments).collect();
         let largest_cell = (0..blocks)
             .flat_map(|block| {
-                let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+                let starts = &self.cell_starts[block * directory..][..directory];
                 starts.windows(2).map(|pair| pair[1] - pair[0]).max()
             })
             .max()
@@ -452,10 +528,13 @@ impl FragmentGrid {
     /// Every fragment, in grid order.
     pub fn fragments(&self) -> impl Iterator<Item = Theoretical> + '_ {
         (0..self.block_groups.len().saturating_sub(1)).flat_map(move |block| {
-            let (groups, starts) = self.block(block);
-            (0..self.cells).flat_map(move |cell| {
-                (starts[cell] as usize..starts[cell + 1] as usize)
-                    .map(move |fragment| self.fragment(block, groups, cell, fragment))
+            let (groups, directory) = self.block(block);
+            (0..self.slabs).flat_map(move |slab| {
+                let starts = self.slab_starts(directory, slab);
+                (0..self.cells).flat_map(move |cell| {
+                    (starts[cell] as usize..starts[cell + 1] as usize)
+                        .map(move |fragment| self.fragment(block, groups, cell, fragment))
+                })
             })
         })
     }
@@ -500,10 +579,35 @@ impl FragmentGrid {
         candidates.start / self.rows_per_block..=(candidates.end - 1) / self.rows_per_block
     }
 
+    /// Block `block`'s groups and its whole directory (`slabs * cells + 1` starts).
     fn block(&self, block: usize) -> (&[FragmentGroup], &[u32]) {
         let groups = &self.groups[self.block_groups[block]..self.block_groups[block + 1]];
-        let starts = &self.cell_starts[block * (self.cells + 1)..][..self.cells + 1];
+        let directory = self.slabs * self.cells + 1;
+        let starts = &self.cell_starts[block * directory..][..directory];
         (groups, starts)
+    }
+
+    /// The `cells + 1` cell starts of slab `slab` within a block's directory.
+    fn slab_starts<'a>(&self, directory: &'a [u32], slab: usize) -> &'a [u32] {
+        &directory[slab * self.cells..][..self.cells + 1]
+    }
+
+    /// The slabs a spectrum whose compatible predicted RTs are `rt` (`None`: unknown)
+    /// must read, as two ranges: the RT slabs overlapping the range, and the slab of rows
+    /// without a usable prediction (sage keeps those candidates). Every slab when there
+    /// is no RT axis or no range.
+    fn slab_visits(&self, rt: Option<(f32, f32)>) -> [Range<usize>; 2] {
+        let (Some((low, high)), true) = (rt, self.rt_axis) else {
+            return [0..self.slabs, 0..0];
+        };
+        let no_prediction = self.slabs - 1;
+        let some_rt_is_compatible = low <= high;
+        if !some_rt_is_compatible {
+            return [0..0, no_prediction..self.slabs];
+        }
+        let first = self.rt_bounds.partition_point(|&bound| bound <= low);
+        let last = self.rt_bounds.partition_point(|&bound| bound <= high);
+        [first..last + 1, no_prediction..self.slabs]
     }
 
     /// Each window's fragment bounds and cells, skipping windows outside the grid. A
@@ -572,15 +676,18 @@ impl FragmentGrid {
             let searched = &mut scratch.borrow_mut().windows;
             self.cell_windows(windows, searched);
             for block in self.blocks_holding(&candidates) {
-                let (groups, starts) = self.block(block);
-                for window in searched.iter() {
-                    for cell in window.first..=window.last {
-                        for fragment in starts[cell] as usize..starts[cell + 1] as usize {
-                            let theoretical = self.fragment(block, groups, cell, fragment);
-                            let mz = theoretical.fragment_mz;
-                            let row = theoretical.peptide_index.0 as usize;
-                            if mz >= window.lo && mz <= window.hi && candidates.contains(&row) {
-                                on_match(theoretical);
+                let (groups, directory) = self.block(block);
+                for slab in 0..self.slabs {
+                    let starts = self.slab_starts(directory, slab);
+                    for window in searched.iter() {
+                        for cell in window.first..=window.last {
+                            for fragment in starts[cell] as usize..starts[cell + 1] as usize {
+                                let theoretical = self.fragment(block, groups, cell, fragment);
+                                let mz = theoretical.fragment_mz;
+                                let row = theoretical.peptide_index.0 as usize;
+                                if mz >= window.lo && mz <= window.hi && candidates.contains(&row) {
+                                    on_match(theoretical);
+                                }
                             }
                         }
                     }
@@ -591,13 +698,18 @@ impl FragmentGrid {
 
     /// Appends to `matched`, for every fragment of a peptide in `candidates` falling in
     /// one of `windows` (once per window it falls in), the peptide's offset from
-    /// `candidates.start`: the matches of `search`, in another order.
+    /// `candidates.start`: the matches of `search`, in another order. With an RT axis and
+    /// `rt` (the predicted RTs compatible with the spectrum), rows in RT slabs wholly
+    /// outside `rt` are skipped; rows in the slabs read may still lie outside it, so the
+    /// caller's own RT check stays.
     pub fn matched_candidates(
         &self,
         candidates: Range<usize>,
         windows: &[(f32, Tolerance)],
+        rt: Option<(f32, f32)>,
         matched: &mut Vec<u32>,
     ) {
+        let visits = self.slab_visits(rt);
         let candidates = candidates.start..candidates.end.min(self.rows);
         if candidates.is_empty() {
             return;
@@ -610,10 +722,10 @@ impl FragmentGrid {
                 && std::arch::is_x86_feature_detected!("popcnt")
             {
                 // SAFETY: AVX2 and POPCNT support checked at run time.
-                unsafe { self.matched_candidates_avx2(&candidates, searched, matched) };
+                unsafe { self.matched_candidates_avx2(&candidates, searched, &visits, matched) };
                 return;
             }
-            self.matched_candidates_scalar(&candidates, searched, matched);
+            self.matched_candidates_scalar(&candidates, searched, &visits, matched);
         });
     }
 
@@ -621,22 +733,26 @@ impl FragmentGrid {
         &self,
         candidates: &Range<usize>,
         searched: &[CellWindow],
+        visits: &[Range<usize>; 2],
         matched: &mut Vec<u32>,
     ) {
         for block in self.blocks_holding(candidates) {
-            let (groups, starts) = self.block(block);
+            let (groups, directory) = self.block(block);
             let (local, offset_of_local) = self.local_candidates(block, candidates);
-            for window in searched {
-                for (run, residual_lo, residual_hi) in window.runs(starts) {
-                    for fragment in run {
-                        let group = &groups[fragment / LANES];
-                        let residual = group.residuals[fragment % LANES];
-                        let row = group.rows[fragment % LANES] as u32;
-                        if residual >= residual_lo
-                            && residual <= residual_hi
-                            && local.contains(&row)
-                        {
-                            matched.push(row.wrapping_add(offset_of_local));
+            for slab in visits.iter().flat_map(Clone::clone) {
+                let starts = self.slab_starts(directory, slab);
+                for window in searched {
+                    for (run, residual_lo, residual_hi) in window.runs(starts) {
+                        for fragment in run {
+                            let group = &groups[fragment / LANES];
+                            let residual = group.residuals[fragment % LANES];
+                            let row = group.rows[fragment % LANES] as u32;
+                            if residual >= residual_lo
+                                && residual <= residual_hi
+                                && local.contains(&row)
+                            {
+                                matched.push(row.wrapping_add(offset_of_local));
+                            }
                         }
                     }
                 }
@@ -653,79 +769,102 @@ impl FragmentGrid {
         &self,
         candidates: &Range<usize>,
         searched: &[CellWindow],
+        visits: &[Range<usize>; 2],
         matched: &mut Vec<u32>,
     ) {
         use std::arch::x86_64::*;
         for block in self.blocks_holding(candidates) {
-            let (groups, starts) = self.block(block);
+            let (groups, directory) = self.block(block);
             let (local, offset_of_local) = self.local_candidates(block, candidates);
             let first_local = _mm256_set1_epi16(local.start as u16 as i16);
             let last_local = _mm256_set1_epi16((local.end - local.start - 1) as u16 as i16);
             let offset_of_local = _mm256_set1_epi32(offset_of_local as i32);
-            for window in searched {
-                for (run, residual_lo, residual_hi) in window.runs(starts) {
-                    if run.is_empty() {
-                        continue;
+            for slab in visits.iter().flat_map(Clone::clone) {
+                let starts = self.slab_starts(directory, slab);
+                for window in searched {
+                    for (run, residual_lo, residual_hi) in window.runs(starts) {
+                        if run.is_empty() {
+                            continue;
+                        }
+                        let lower = _mm256_set1_epi16(residual_lo as i16);
+                        let upper = _mm256_set1_epi16(residual_hi as i16);
+                        let groups_of_run = run.start / LANES..(run.end + LANES - 1) / LANES;
+                        matched.reserve(groups_of_run.len() * LANES);
+                        let out = matched.as_mut_ptr();
+                        let mut len = matched.len();
+                        for g in groups_of_run {
+                            let group = &groups[g];
+                            let residuals =
+                                _mm256_load_si256(group.residuals.as_ptr() as *const __m256i);
+                            let rows = _mm256_load_si256(group.rows.as_ptr() as *const __m256i);
+                            let in_window = _mm256_and_si256(
+                                _mm256_cmpeq_epi16(_mm256_max_epu16(residuals, lower), residuals),
+                                _mm256_cmpeq_epi16(_mm256_min_epu16(residuals, upper), residuals),
+                            );
+                            let rows_from_first = _mm256_sub_epi16(rows, first_local);
+                            let is_candidate = _mm256_cmpeq_epi16(
+                                _mm256_min_epu16(rows_from_first, last_local),
+                                rows_from_first,
+                            );
+                            let both = _mm256_and_si256(in_window, is_candidate);
+                            let bytes = _mm256_movemask_epi8(_mm256_packs_epi16(
+                                both,
+                                _mm256_setzero_si256(),
+                            )) as u32;
+                            let in_run = lanes_in(g, &run);
+                            let low = (bytes & in_run & 0xFF) as usize;
+                            let high = ((bytes >> 16) & (in_run >> HALF) & 0xFF) as usize;
+                            let offsets_low = _mm256_add_epi32(
+                                _mm256_cvtepu16_epi32(_mm256_castsi256_si128(rows)),
+                                offset_of_local,
+                            );
+                            let offsets_high = _mm256_add_epi32(
+                                _mm256_cvtepu16_epi32(_mm256_extracti128_si256(rows, 1)),
+                                offset_of_local,
+                            );
+                            // SAFETY: `reserve` left room for 16 more per group of the run.
+                            _mm256_storeu_si256(
+                                out.add(len) as *mut __m256i,
+                                _mm256_permutevar8x32_epi32(
+                                    offsets_low,
+                                    _mm256_loadu_si256(LEFT_PACK[low].as_ptr() as *const __m256i),
+                                ),
+                            );
+                            len += low.count_ones() as usize;
+                            _mm256_storeu_si256(
+                                out.add(len) as *mut __m256i,
+                                _mm256_permutevar8x32_epi32(
+                                    offsets_high,
+                                    _mm256_loadu_si256(LEFT_PACK[high].as_ptr() as *const __m256i),
+                                ),
+                            );
+                            len += high.count_ones() as usize;
+                        }
+                        // SAFETY: the first `len` slots are written.
+                        matched.set_len(len);
                     }
-                    let lower = _mm256_set1_epi16(residual_lo as i16);
-                    let upper = _mm256_set1_epi16(residual_hi as i16);
-                    let groups_of_run = run.start / LANES..(run.end + LANES - 1) / LANES;
-                    matched.reserve(groups_of_run.len() * LANES);
-                    let out = matched.as_mut_ptr();
-                    let mut len = matched.len();
-                    for g in groups_of_run {
-                        let group = &groups[g];
-                        let residuals =
-                            _mm256_load_si256(group.residuals.as_ptr() as *const __m256i);
-                        let rows = _mm256_load_si256(group.rows.as_ptr() as *const __m256i);
-                        let in_window = _mm256_and_si256(
-                            _mm256_cmpeq_epi16(_mm256_max_epu16(residuals, lower), residuals),
-                            _mm256_cmpeq_epi16(_mm256_min_epu16(residuals, upper), residuals),
-                        );
-                        let rows_from_first = _mm256_sub_epi16(rows, first_local);
-                        let is_candidate = _mm256_cmpeq_epi16(
-                            _mm256_min_epu16(rows_from_first, last_local),
-                            rows_from_first,
-                        );
-                        let both = _mm256_and_si256(in_window, is_candidate);
-                        let bytes =
-                            _mm256_movemask_epi8(_mm256_packs_epi16(both, _mm256_setzero_si256()))
-                                as u32;
-                        let in_run = lanes_in(g, &run);
-                        let low = (bytes & in_run & 0xFF) as usize;
-                        let high = ((bytes >> 16) & (in_run >> HALF) & 0xFF) as usize;
-                        let offsets_low = _mm256_add_epi32(
-                            _mm256_cvtepu16_epi32(_mm256_castsi256_si128(rows)),
-                            offset_of_local,
-                        );
-                        let offsets_high = _mm256_add_epi32(
-                            _mm256_cvtepu16_epi32(_mm256_extracti128_si256(rows, 1)),
-                            offset_of_local,
-                        );
-                        // SAFETY: `reserve` left room for 16 more per group of the run.
-                        _mm256_storeu_si256(
-                            out.add(len) as *mut __m256i,
-                            _mm256_permutevar8x32_epi32(
-                                offsets_low,
-                                _mm256_loadu_si256(LEFT_PACK[low].as_ptr() as *const __m256i),
-                            ),
-                        );
-                        len += low.count_ones() as usize;
-                        _mm256_storeu_si256(
-                            out.add(len) as *mut __m256i,
-                            _mm256_permutevar8x32_epi32(
-                                offsets_high,
-                                _mm256_loadu_si256(LEFT_PACK[high].as_ptr() as *const __m256i),
-                            ),
-                        );
-                        len += high.count_ones() as usize;
-                    }
-                    // SAFETY: the first `len` slots are written.
-                    matched.set_len(len);
                 }
             }
         }
     }
+}
+
+/// Upper bounds of `rt.slabs` RT slabs holding about equally many rows (from a sample of
+/// the finite predictions); fewer when predictions repeat.
+fn rt_slab_bounds(rt: &RtSlabbing) -> Vec<f32> {
+    let step = (rt.predicted.len() / 100_000).max(1);
+    let mut sample: Vec<f32> = rt
+        .predicted
+        .iter()
+        .step_by(step)
+        .filter_map(|predicted| predicted.filter(|value| value.is_finite()))
+        .collect();
+    sample.sort_unstable_by(f32::total_cmp);
+    let mut bounds: Vec<f32> = (1..rt.slabs)
+        .filter_map(|slab| sample.get(slab * sample.len() / rt.slabs).copied())
+        .collect();
+    bounds.dedup_by(|a, b| a.to_bits() == b.to_bits());
+    bounds
 }
 
 /// The lanes of group `group` whose fragments lie in `run`, as a 16-bit mask.
@@ -863,7 +1002,7 @@ mod test {
                     fine_bits,
                     cell_fragments,
                 };
-                let grid = FragmentGrid::build(rows, shape, |row, out| {
+                let grid = FragmentGrid::build(rows, shape, None, |row, out| {
                     out.extend(by_row[row].iter().map(|&fragment_mz| Theoretical {
                         peptide_index: PeptideIx(row as u32),
                         fragment_mz,
@@ -891,7 +1030,7 @@ mod test {
                         exact.push(fragment.peptide_index.0 - candidates.start as u32)
                     });
                     let mut dispatched = Vec::new();
-                    grid.matched_candidates(candidates.clone(), &windows, &mut dispatched);
+                    grid.matched_candidates(candidates.clone(), &windows, None, &mut dispatched);
                     assert_eq!(
                         sorted(dispatched),
                         sorted(exact.clone()),
@@ -901,7 +1040,8 @@ mod test {
                         continue;
                     }
                     let mut scalar = Vec::new();
-                    grid.matched_candidates_scalar(&candidates, &searched, &mut scalar);
+                    let all_slabs = grid.slab_visits(None);
+                    grid.matched_candidates_scalar(&candidates, &searched, &all_slabs, &mut scalar);
                     assert_eq!(
                         sorted(scalar),
                         sorted(exact.clone()),
@@ -914,7 +1054,12 @@ mod test {
                         let mut vector = Vec::new();
                         // SAFETY: AVX2 and POPCNT support checked at run time.
                         unsafe {
-                            grid.matched_candidates_avx2(&candidates, &searched, &mut vector)
+                            grid.matched_candidates_avx2(
+                                &candidates,
+                                &searched,
+                                &all_slabs,
+                                &mut vector,
+                            )
                         };
                         assert_eq!(sorted(vector), sorted(exact), "{shape:?} {candidates:?}");
                     }
@@ -951,6 +1096,132 @@ mod test {
                     let mz = grid.fragment(block, groups, cell, fragment).fragment_mz;
                     let key = (mz.to_bits() >> grid.shift) - grid.first_fine;
                     assert_eq!(grid.cell_of_fine[key as usize] as usize, cell);
+                }
+            }
+        }
+    }
+
+    /// `small` minus `large`, as multisets: empty when `small` is contained in `large`.
+    fn missing_from(small: &[u32], large: &[u32]) -> Vec<u32> {
+        let mut large = sorted(large.to_vec());
+        let mut missing = Vec::new();
+        for value in sorted(small.to_vec()) {
+            match large.binary_search(&value) {
+                Ok(at) => {
+                    large.remove(at);
+                }
+                Err(_) => missing.push(value),
+            }
+        }
+        missing
+    }
+
+    #[test]
+    fn rt_slabs_keep_every_match_sage_keeps_and_add_none() {
+        let mut random = Lcg(29);
+        let rows = 61;
+        let by_row = random_fragments(rows, &mut random);
+        let predicted: Vec<Option<f32>> = (0..rows)
+            .map(|_| match random.below(50) {
+                0..=4 => None,
+                5 => Some(f32::NAN),
+                6 => Some(f32::INFINITY),
+                _ => Some(random.below(10_000) as f32 / 100.0),
+            })
+            .collect();
+        let all: Vec<f32> = by_row.iter().flatten().copied().collect();
+        let windows: Vec<(f32, Tolerance)> = (0..40)
+            .map(|_| {
+                (
+                    all[random.below(all.len() as u64) as usize],
+                    Tolerance::Ppm(-30.0, 30.0),
+                )
+            })
+            .chain([(1000.0, Tolerance::Da(-2000.0, 2000.0))])
+            .collect();
+        let rt_windows = [
+            None,
+            Some((10.0, 20.0)),
+            Some((0.0, 100.0)),
+            Some((55.5, 55.6)),
+            Some((-5.0, 3.0)),
+            Some((99.0, 150.0)),
+            Some((30.0, 20.0)),
+            Some((f32::NAN, 10.0)),
+        ];
+        for rows_per_block in [1, 7, 64] {
+            for slabs in [1, 2, 5, 13] {
+                let shape = GridShape {
+                    rows_per_block,
+                    fine_bits: 10,
+                    cell_fragments: 2,
+                };
+                let rt = RtSlabbing {
+                    predicted: &predicted,
+                    slabs,
+                };
+                let grid = FragmentGrid::build(rows, shape, Some(rt), |row, out| {
+                    out.extend(by_row[row].iter().map(|&fragment_mz| Theoretical {
+                        peptide_index: PeptideIx(row as u32),
+                        fragment_mz,
+                    }))
+                });
+                assert_eq!(grid.len(), all.len());
+                for candidates in [0..rows, 3..40, 20..21] {
+                    let mut unpruned = Vec::new();
+                    grid.search(candidates.clone(), &windows, |fragment| {
+                        unpruned.push(fragment.peptide_index.0 - candidates.start as u32)
+                    });
+                    // Windows starting or ending exactly on a slab bound, where rows can sit.
+                    let on_bounds = grid.rt_bounds.iter().flat_map(|&bound| {
+                        [
+                            Some((bound, bound)),
+                            Some((bound, bound + 1.0)),
+                            Some((bound - 1.0, bound)),
+                        ]
+                    });
+                    for rt_window in rt_windows.into_iter().chain(on_bounds) {
+                        let kept: Vec<u32> = unpruned
+                            .iter()
+                            .copied()
+                            .filter(|&offset| {
+                                let predicted = predicted[candidates.start + offset as usize];
+                                match (rt_window, predicted) {
+                                    (None, _) | (_, None) => true,
+                                    (Some((lo, hi)), Some(rt)) => rt >= lo && rt <= hi,
+                                }
+                            })
+                            .collect();
+                        let mut pruned = Vec::new();
+                        grid.matched_candidates(
+                            candidates.clone(),
+                            &windows,
+                            rt_window,
+                            &mut pruned,
+                        );
+                        let label = format!(
+                            "R {rows_per_block}, slabs {slabs}, {candidates:?}, {rt_window:?}"
+                        );
+                        assert!(
+                            missing_from(&pruned, &unpruned).is_empty(),
+                            "{label}: extra"
+                        );
+                        assert!(missing_from(&kept, &pruned).is_empty(), "{label}: lost");
+                        if rt_window.is_none() {
+                            assert_eq!(sorted(pruned.clone()), sorted(unpruned.clone()), "{label}");
+                        }
+                        let mut searched = Vec::new();
+                        grid.cell_windows(&windows, &mut searched);
+                        let visits = grid.slab_visits(rt_window);
+                        let mut scalar = Vec::new();
+                        grid.matched_candidates_scalar(
+                            &candidates,
+                            &searched,
+                            &visits,
+                            &mut scalar,
+                        );
+                        assert_eq!(sorted(scalar), sorted(pruned.clone()), "{label}: scalar");
+                    }
                 }
             }
         }

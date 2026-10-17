@@ -154,11 +154,14 @@ pub fn search(
         let rows = rows_reached_by(table, &queries, query_indices);
         let build = Phase::start();
         let peptides = table.materialize_rows(rows.clone());
+        let rt = predictions
+            .rt()
+            .and_then(|rt| runner.rt_slabbing(&rt[rows.clone()]));
         let db = runner
             .parameters
             .database
             .clone()
-            .build_from_peptides(peptides);
+            .build_from_peptides_with_rt(peptides, rt);
         let build = build.finish();
 
         let search = Phase::start();

@@ -13,6 +13,7 @@ use sage_cloudpath::{FileFormat, Url};
 use sage_core::compact::CompactPeptides;
 use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
+use sage_core::fragment_grid::{FragmentLayout, RtSlabbing};
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
@@ -56,6 +57,13 @@ pub struct Predictions {
     rt: Option<Vec<Option<f32>>>,
     iim: Option<Vec<Option<f32>>>,
     fragment_intensity_index: Option<Vec<Option<(u64, u64)>>>,
+}
+
+impl Predictions {
+    /// Predicted RT by peptide row, when `--predicted-rt` is given.
+    pub fn rt(&self) -> Option<&[Option<f32>]> {
+        self.rt.as_deref()
+    }
 }
 
 /// Verifies `(fingerprint, values)` (loaded from a positional
@@ -951,6 +959,28 @@ impl Runner {
             .collect::<SageResults>()
     }
 
+    /// RT slabs for a fragment grid over `predicted` (one per peptide row), when the
+    /// layout is a grid and RT filtering is configured: about the predictions' span over
+    /// the width of a spectrum's compatible window in the middle of that span.
+    pub fn rt_slabbing<'a>(&self, predicted: &'a [Option<f32>]) -> Option<RtSlabbing<'a>> {
+        let FragmentLayout::Grid(_) = self.parameters.database.fragment_layout else {
+            return None;
+        };
+        let rt_tol = self.parameters.rt_tol.as_ref()?;
+        let (low, high) = predicted
+            .iter()
+            .filter_map(|rt| rt.filter(|rt| rt.is_finite()))
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), rt| {
+                (low.min(rt), high.max(rt))
+            });
+        let middle = (low + high) / 2.0;
+        let (window_low, window_high) = rt_tol.tolerance_at(middle).theoretical_range(middle);
+        Some(RtSlabbing {
+            predicted,
+            slabs: RtSlabbing::derived_slabs(predicted, window_high - window_low),
+        })
+    }
+
     /// The row count and fingerprint of this run's peptide table, whichever form it is in.
     fn peptide_rows(&self) -> PeptideRows {
         match &self.compact {
@@ -1108,6 +1138,16 @@ impl Runner {
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
         let predictions = self.resolve_predictions()?;
+        if self.compact.is_none() {
+            if let Some(rt) = predictions.rt().and_then(|rt| self.rt_slabbing(rt)) {
+                let peptides = std::mem::take(&mut self.database.peptides);
+                self.database = self
+                    .parameters
+                    .database
+                    .clone()
+                    .build_from_peptides_with_rt(peptides, Some(rt));
+            }
+        }
         log_memory("database and predictions ready");
 
         //Collect all results into a single container

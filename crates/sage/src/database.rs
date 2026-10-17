@@ -1,6 +1,6 @@
 use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
-use crate::fragment_grid::{FragmentGrid, FragmentLayout, GridShape};
+use crate::fragment_grid::{FragmentGrid, FragmentLayout, GridShape, RtSlabbing};
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
@@ -313,8 +313,18 @@ impl Parameters {
     }
 
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
+        self.build_from_peptides_with_rt(target_decoys, None)
+    }
+
+    /// `build_from_peptides`; a grid layout also splits its blocks into RT slabs by `rt`
+    /// (one predicted RT per peptide). Pages ignore `rt`.
+    pub fn build_from_peptides_with_rt(
+        self,
+        target_decoys: Vec<Peptide>,
+        rt: Option<RtSlabbing>,
+    ) -> IndexedDatabase {
         if let FragmentLayout::Grid(shape) = self.fragment_layout {
-            return self.build_grid(target_decoys, shape);
+            return self.build_grid(target_decoys, shape, rt);
         }
         log::trace!("generating fragments");
 
@@ -403,10 +413,20 @@ impl Parameters {
     }
 
     /// `build_from_peptides` with the fragments laid out as a `FragmentGrid`.
-    fn build_grid(self, target_decoys: Vec<Peptide>, shape: GridShape) -> IndexedDatabase {
-        let grid = FragmentGrid::build(target_decoys.len(), shape, |row, out| {
-            out.extend(self.indexed_fragments(row, &target_decoys[row]))
-        });
+    fn build_grid(
+        self,
+        target_decoys: Vec<Peptide>,
+        shape: GridShape,
+        rt: Option<RtSlabbing>,
+    ) -> IndexedDatabase {
+        let grid = FragmentGrid::build(
+            target_decoys.len(),
+            shape,
+            rt,
+            |row, out: &mut Vec<Theoretical>| {
+                out.extend(self.indexed_fragments(row, &target_decoys[row]))
+            },
+        );
         log::info!("fragment grid: {}", grid.describe());
         log::info!("fragment grid balance: {}", grid.balance());
         IndexedDatabase {
@@ -665,11 +685,17 @@ impl IndexedQuery<'_> {
 
     /// Appends to `matched`, once per (window, fragment) match `page_search_batch`
     /// finds, the matched peptide's offset from `candidate_rows().start`, in no
-    /// particular order.
-    pub fn matched_candidates(&self, windows: &[(f32, Tolerance)], matched: &mut Vec<u32>) {
+    /// particular order. A grid with an RT axis may leave out peptides whose predicted
+    /// RT lies outside `rt` (the caller evicts those anyway); pages ignore `rt`.
+    pub fn matched_candidates(
+        &self,
+        windows: &[(f32, Tolerance)],
+        rt: Option<(f32, f32)>,
+        matched: &mut Vec<u32>,
+    ) {
         let rows = self.candidate_rows();
         if let Some(grid) = &self.db.grid {
-            grid.matched_candidates(rows, windows, matched);
+            grid.matched_candidates(rows, windows, rt, matched);
             return;
         }
         self.page_search_batch(windows, |fragment| {
@@ -1036,7 +1062,7 @@ mod test {
             assert_eq!(unbatched, expected, "{layout}, mass={mass}, tol={tol:?}");
             let first_candidate = query.candidate_rows().start as u32;
             let mut matched = Vec::new();
-            query.matched_candidates(windows, &mut matched);
+            query.matched_candidates(windows, None, &mut matched);
             let mut matched_peptides: Vec<_> = matched
                 .iter()
                 .map(|&offset| PeptideIx(first_candidate + offset))
@@ -1089,7 +1115,7 @@ mod test {
         fragments: &[Theoretical],
         shape: GridShape,
     ) -> IndexedDatabase {
-        let grid = FragmentGrid::build(peptides.len(), shape, |row, out| {
+        let grid = FragmentGrid::build(peptides.len(), shape, None, |row, out| {
             out.extend(
                 fragments
                     .iter()

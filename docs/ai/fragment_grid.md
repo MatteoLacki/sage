@@ -357,3 +357,59 @@ Search phases, class I, warm (in-source counters, temporary; 1,033 CPU-s): grid 
 `cmov`: ~38 instead of ~45 instructions per 16 fragments) changed class I search by 2% and
 class II not at all, so it was not kept: the kernel is no longer bound by instructions.
 
+## Predicted RT as a third axis (2026-10-16)
+
+With `--predicted-rt` (and `rt_tol_sec`) and the grid layout, each block's fragments are
+also split by their peptide's predicted RT:
+
+```
+block (rows in mass order) -> RT slab -> m/z cell -> entries
+directory per block: slabs * cells + 1 starts; slab s, cell c at entry s * cells + c
+```
+
+- **Slabs:** `RtSlabbing { predicted, slabs }` (`fragment_grid.rs`) gives one predicted RT
+  per row, the same array `Scorer::predicted_rt` reads. Slab bounds are equal-count
+  quantiles of a sample of the finite predictions (`rt_slab_bounds`); a row with
+  predicted RT `rt` is in slab `rt_bounds.partition_point(|&b| b <= rt)`. Rows without a
+  prediction, or with a non-finite one, go to one extra slab that every spectrum reads.
+- **How many:** `RtSlabbing::derived_slabs`: the predictions' span over four widths of a
+  spectrum's compatible window at mid-span (`Runner::rt_slabbing`), 1 to 64;
+  `SAGE_GRID_RT_SLABS` overrides it. Cells then target T fragments per (block, slab, cell)
+  (`cell_fragments * blocks * slabs` per cell), so the directory stays about as large.
+- **Where it is built:** sliced search, per slice from its rows' predictions
+  (`build_from_peptides_with_rt`); monolithic search, by rebuilding the grid once the
+  predictions are resolved (`Runner::run`; the database is built before predictions are
+  read).
+- **Query:** `Scorer::compatible_predicted_rt` (the range eviction keeps, now shared with
+  the kernel) → `FragmentGrid::slab_visits`: the RT slabs overlapping it and the
+  no-prediction slab. Rows in skipped slabs have predicted RTs outside the range, so
+  sage's eviction would have removed them; rows of the visited slabs that fall outside are
+  counted and then evicted as before.
+- **Exact without changing sage:** a window whose every match is evicted leaves sage with
+  an all-empty preliminary array trimmed to ≤ 50 slots, while pruning leaves it empty and
+  untrimmed. Pooled trims see the same first k slots either way and empty slots never
+  enter `bounded_min_heapify`'s heap, so the pooled results, and the output, are the same.
+- **Tests:** `rt_slabs_keep_every_match_sage_keeps_and_add_none`: random rows with
+  predictions, none, NaN and infinity; RT windows inside, around, outside, inverted, NaN,
+  and on every slab bound; R ∈ {1, 7, 64} × slabs ∈ {1, 2, 5, 13}: the kernel's matches
+  contain every match sage's RT check keeps and nothing the unpruned search lacks; scalar
+  equals dispatched. Dropping the last visited RT slab, skipping the no-prediction slab or
+  a strict bound in the build each fails it.
+
+RT slabs on F9477 run 11 (monolithic tryptic, `--predicted-rt`, R 4096 unless noted),
+search seconds, every run identical to pages:
+
+| slabs (RT + no prediction) | cells | search |
+|---|---:|---:|
+| no RT axis | 10,146 | 75.9 |
+| 1 + 1 | 10,146 | 78.2 |
+| **4 + 1** | 3,513 | **69.9** |
+| 17 + 1 (span over one window) | 1,058 | 71.5 |
+| 32 + 1 | 690 | 76.0 |
+| 17 + 1, R 256 | 588 | 70.5 (directory 1.04 GB) |
+
+The kernel is about a fifth of this search, so the RT axis gains ~8%. More slabs leave
+fewer fragments per (block, slab) and so fewer, wider cells; past ~4 slabs the m/z
+waste outweighs the rows pruned, hence `derived_slabs` divides the span by four windows
+(4 slabs here). One dataset only.
+
