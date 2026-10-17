@@ -20,38 +20,41 @@ pub struct SlicePlan {
 }
 
 impl SlicePlan {
-    /// Cut `rows` (ascending by `mass`) into cores costing about `budget` each,
-    /// splitting only between rows of different masses, and extend each core so a
+    /// Cut rows `0..rows` (ascending by `mass(row)`) into cores costing about `budget`
+    /// each, splitting only between rows of different masses, and extend each core so a
     /// query window up to `widest_window` wide that starts inside it fits whole.
-    pub fn new<T>(
-        rows: &[T],
-        mass: impl Fn(&T) -> f32,
-        cost: impl Fn(&T) -> usize,
+    pub fn new(
+        rows: usize,
+        mass: impl Fn(usize) -> f32,
+        cost: impl Fn(usize) -> usize,
         budget: usize,
         widest_window: f32,
     ) -> Self {
         let mut cores = Vec::new();
         let mut core_start = 0;
         let mut core_cost = 0;
-        for (index, row) in rows.iter().enumerate() {
-            let starts_new_mass = index > core_start && mass(&rows[index - 1]) < mass(row);
+        let mut previous_mass = f32::NEG_INFINITY;
+        for row in 0..rows {
+            let row_mass = mass(row);
+            let starts_new_mass = row > core_start && previous_mass < row_mass;
             if core_cost >= budget && starts_new_mass {
-                cores.push(core_start..index);
-                core_start = index;
+                cores.push(core_start..row);
+                core_start = row;
                 core_cost = 0;
             }
             core_cost += cost(row);
+            previous_mass = row_mass;
         }
-        cores.push(core_start..rows.len());
+        cores.push(core_start..rows);
 
         let slices = cores
             .iter()
             .map(|core| {
-                let end = match rows.get(core.end) {
-                    None => rows.len(),
-                    Some(next_core_first) => {
-                        let limit = mass(next_core_first) + widest_window;
-                        rows.partition_point(|row| mass(row) < limit)
+                let end = match core.end < rows {
+                    false => rows,
+                    true => {
+                        let limit = mass(core.end) + widest_window;
+                        partition_point(rows, |row| mass(row) < limit)
                     }
                 };
                 Slice {
@@ -62,7 +65,8 @@ impl SlicePlan {
             .collect();
         let core_start_masses = cores
             .iter()
-            .filter_map(|core| rows.get(core.start).map(&mass))
+            .filter(|core| core.start < rows)
+            .map(|core| mass(core.start))
             .collect();
         Self {
             slices,
@@ -81,13 +85,31 @@ impl SlicePlan {
 
 /// The rows a slice must hold for queries whose windows reach from `low` (their lowest
 /// window start) to `high` (their highest window end): any of those windows finds the
-/// same rows in them as in all of `rows`, the padding row below it included.
-pub fn rows_reaching<T>(rows: &[T], mass: impl Fn(&T) -> f32, low: f32, high: f32) -> Range<usize> {
-    let start = rows
-        .partition_point(|row| mass(row) < low)
-        .saturating_sub(1);
-    let end = rows.partition_point(|row| mass(row) <= high);
+/// same rows in them as in all rows `0..rows` (ascending by `mass(row)`), the padding
+/// row below it included.
+pub fn rows_reaching(
+    rows: usize,
+    mass: impl Fn(usize) -> f32,
+    low: f32,
+    high: f32,
+) -> Range<usize> {
+    let start = partition_point(rows, |row| mass(row) < low).saturating_sub(1);
+    let end = partition_point(rows, |row| mass(row) <= high);
     start..end.max(start)
+}
+
+/// `slice::partition_point` over rows `0..rows`: the first row for which `before` is
+/// false, `before` being true for a prefix of the rows.
+fn partition_point(rows: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, rows);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match before(middle) {
+            true => low = middle + 1,
+            false => high = middle,
+        }
+    }
+    low
 }
 
 #[cfg(test)]
@@ -126,7 +148,13 @@ mod test {
         for (count, budget) in [(2_000, 37), (5_000, 400), (300, 1), (1_000, 10_000)] {
             let masses = sorted_masses_with_duplicates(&mut random, count);
             let widest_window = 3.1;
-            let plan = SlicePlan::new(&masses, |m| *m, |_| 1, budget, widest_window);
+            let plan = SlicePlan::new(
+                masses.len(),
+                |row| masses[row],
+                |_| 1,
+                budget,
+                widest_window,
+            );
 
             let mut windows: Vec<(f32, f32)> = (0..3_000)
                 .map(|_| {
@@ -165,7 +193,13 @@ mod test {
         for (count, budget) in [(2_000, 37), (5_000, 400), (1_000, 10_000)] {
             let masses = sorted_masses_with_duplicates(&mut random, count);
             let widest_window = 3.1;
-            let plan = SlicePlan::new(&masses, |m| *m, |_| 1, budget, widest_window);
+            let plan = SlicePlan::new(
+                masses.len(),
+                |row| masses[row],
+                |_| 1,
+                budget,
+                widest_window,
+            );
             let mut windows_by_slice = vec![Vec::new(); plan.slices.len()];
             for _ in 0..3_000 {
                 let low = 590.0 + random.next() * 420.0;
@@ -181,7 +215,7 @@ mod test {
                     .iter()
                     .map(|w| w.1)
                     .fold(f32::NEG_INFINITY, f32::max);
-                let reach = rows_reaching(&masses, |m| *m, low, high);
+                let reach = rows_reaching(masses.len(), |row| masses[row], low, high);
                 assert!(slice.rows.start <= reach.start && reach.end <= slice.rows.end);
                 for &(low, high) in windows {
                     let (left, right) = global_range(&masses, low, high);
@@ -199,7 +233,7 @@ mod test {
     fn cores_partition_the_rows_at_mass_changes() {
         let mut random = Lcg(11);
         let masses = sorted_masses_with_duplicates(&mut random, 4_000);
-        let plan = SlicePlan::new(&masses, |m| *m, |_| 1, 50, 3.1);
+        let plan = SlicePlan::new(masses.len(), |row| masses[row], |_| 1, 50, 3.1);
         let mut next = 0;
         for slice in &plan.slices {
             assert_eq!(slice.core.start, next);
@@ -215,7 +249,7 @@ mod test {
 
     #[test]
     fn empty_rows_make_one_empty_slice() {
-        let plan = SlicePlan::new(&Vec::<f32>::new(), |m| *m, |_| 1, 10, 3.1);
+        let plan = SlicePlan::new(0, |_| unreachable!(), |_| 1, 10, 3.1);
         assert_eq!(plan.slices.len(), 1);
         assert_eq!(plan.slices[0].rows, 0..0);
         assert_eq!(plan.slice_for(1000.0), 0);

@@ -8,9 +8,19 @@ digests. The sliced search (`sliced_search.md`) builds its slices from it.
 
 - **`Proteome`:** every target protein's residues concatenated (`u8`), plus
   `protein_starts: Vec<u32>` and the accessions. Human: 11.5 MB.
-- **`CompactPeptide`:** 16 B (`f32` mass, `u32` proteome offset of one occurrence of
+- **`CompactPeptide`:** one row: `f32` mass, `u32` proteome offset of one occurrence of
   the target sequence, `u8` length, `u8` flags, two `(u8 position, u8 mass id)` variable-mod
-  sites, padded from 14 to 16 by alignment).
+  sites. 16 B as a struct (14 padded to 16); the builds work in it.
+- **`CompactRows`** (`compact/rows.rs`, 2026-10-16): the built table, one column per field,
+  12 B per row. Masses are mass-sorted, so each chunk of 1,024 rows stores its first f32
+  bit pattern and each row a `u16` offset from it; positive floats order as their bits, so
+  `from_bits(base + residual)` is the exact mass (a chunk spanning more than 2^16 bit
+  patterns, only in the sparse tails, keeps full patterns). `get(i)` decodes row `i` back
+  to the identical `CompactPeptide`. Class I 2.38 → 1.79 GB, class II 9.93 → 7.45 GB
+  (`verify_compact_peptides --direct`, human, the immunopeptidomics configs: both PASS,
+  0 mismatches against sage's digest; `start`/`position` differences as below). A `u16`
+  modified-form number instead of the 4 B of sites would reach 10 B; not done (it needs a
+  fast exact ranking of a sequence's allowed forms).
   - The flags hold decoy, semi-enzymatic, `Position` and missed cleavages (4 bits).
   - Decoys are not stored as sequences. A decoy row points at its target window and
     is read through `Peptide::reverse`, which keeps both ends and flips the interior.

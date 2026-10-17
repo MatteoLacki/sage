@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 mod nonspecific;
+mod rows;
+
+pub use rows::CompactRows;
 
 /// Residue indices share a `u8` with the two peptide-terminus codes.
 const MAX_PEPTIDE_LENGTH: usize = VarSite::NTERM as usize;
@@ -319,7 +322,7 @@ impl CompactPeptide {
 pub struct CompactPeptides {
     pub proteome: Proteome,
     /// `Parameters::digest`'s own order: row `i` is `PeptideIx(i)` of a monolithic search.
-    pub rows: Vec<CompactPeptide>,
+    pub rows: CompactRows,
     /// Distinct variable-mod masses; a [`VarSite`] stores an index into this.
     variable_mod_masses: Vec<f32>,
     parameters: Parameters,
@@ -353,7 +356,7 @@ impl CompactPeptides {
 
         Ok(Self {
             proteome: Proteome::new(fasta)?,
-            rows: Vec::new(),
+            rows: CompactRows::default(),
             variable_mod_masses,
             parameters: parameters.clone(),
             no_protein: Arc::from(""),
@@ -497,17 +500,25 @@ impl CompactPeptides {
 
     /// `materialize` every row in `rows`, in order.
     pub fn materialize_rows(&self, rows: std::ops::Range<usize>) -> Vec<Peptide> {
-        self.rows[rows]
-            .par_iter()
-            .map(|row| self.materialize(row))
+        rows.into_par_iter()
+            .map(|row| self.materialize(&self.rows.get(row)))
             .collect()
     }
 
     /// How many fragments `build_from_peptides` indexes for `row`: one per ion kind
     /// per backbone cleavage, minus the first `min_ion_index` of each kind.
     pub fn fragment_count(&self, row: &CompactPeptide) -> usize {
+        self.fragments_of_length(row.len())
+    }
+
+    /// [`CompactPeptides::fragment_count`] of table row `row`.
+    pub fn fragment_count_of(&self, row: usize) -> usize {
+        self.fragments_of_length(self.rows.length(row))
+    }
+
+    fn fragments_of_length(&self, length: usize) -> usize {
         self.parameters.ion_kinds.len()
-            * (row.len().saturating_sub(1)).saturating_sub(self.parameters.min_ion_index)
+            * (length.saturating_sub(1)).saturating_sub(self.parameters.min_ion_index)
     }
 
     /// An `IndexedDatabase` holding only `rows` (ascending), with proteins, and no
@@ -516,7 +527,7 @@ impl CompactPeptides {
     pub fn database_for_rows(&self, rows: &[usize]) -> IndexedDatabase {
         let mut peptides: Vec<Peptide> = rows
             .par_iter()
-            .map(|&row| self.materialize(&self.rows[row]))
+            .map(|&row| self.materialize(&self.rows.get(row)))
             .collect();
         self.resolve_proteins(&mut peptides);
         IndexedDatabase {
@@ -629,7 +640,7 @@ impl CompactPeptides {
                     .collect();
                 self.merge_into(heads, output);
             });
-        self.rows = merged;
+        self.rows = CompactRows::from_rows(merged);
         Ok(())
     }
 
@@ -651,10 +662,10 @@ impl CompactPeptides {
     /// Adjacent rows out of sage's order. Rows of different lengths are compared in
     /// full; rows of one length keep their digest's order, so only by mass.
     pub fn row_order_violations(&self) -> usize {
-        self.rows
-            .par_windows(2)
-            .filter(|pair| {
-                let (a, b) = (&pair[0], &pair[1]);
+        (1..self.rows.len())
+            .into_par_iter()
+            .filter(|&next| {
+                let (a, b) = (&self.rows.get(next - 1), &self.rows.get(next));
                 match a.length == b.length {
                     true => a.monoisotopic.total_cmp(&b.monoisotopic).is_gt(),
                     false => !self.compare_different_lengths(a, b).is_lt(),
@@ -848,12 +859,19 @@ MCQPEPTIDEK
         assert!(!expected.is_empty());
 
         let table = CompactPeptides::build(&parameters, &fasta).unwrap();
-        let mut actual: Vec<Peptide> = table.rows.iter().map(|row| table.materialize(row)).collect();
+        let mut actual: Vec<Peptide> = table
+            .rows
+            .iter()
+            .map(|row| table.materialize(&row))
+            .collect();
         table.resolve_proteins(&mut actual);
 
         assert_eq!(actual.len(), expected.len());
-        for (row, ((actual, expected), compact)) in
-            actual.iter().zip(&expected).zip(&table.rows).enumerate()
+        for (row, ((actual, expected), compact)) in actual
+            .iter()
+            .zip(&expected)
+            .zip(table.rows.iter())
+            .enumerate()
         {
             assert_eq!(
                 compact.monoisotopic.to_bits(),
@@ -1020,7 +1038,7 @@ MQKCPE
                 let direct = CompactPeptides::build_nonspecific(&parameters, &fasta).unwrap();
                 let by_length = CompactPeptides::build_by_length(&parameters, &fasta).unwrap();
                 assert_eq!(direct.rows.len(), by_length.rows.len());
-                for (row, (a, b)) in direct.rows.iter().zip(&by_length.rows).enumerate() {
+                for (row, (a, b)) in direct.rows.iter().zip(by_length.rows.iter()).enumerate() {
                     assert_eq!(a.monoisotopic.to_bits(), b.monoisotopic.to_bits(), "row {row}");
                     assert_eq!(
                         (a.length, a.is_decoy(), a.var_sites),
@@ -1049,7 +1067,11 @@ MQKCPE
             let fasta = Fasta::parse(FASTA.into(), "rev_", true);
             let parameters = parameters(config);
             let table = CompactPeptides::build(&parameters, &fasta).unwrap();
-            let counted: usize = table.rows.iter().map(|row| table.fragment_count(row)).sum();
+            let counted: usize = table
+                .rows
+                .iter()
+                .map(|row| table.fragment_count(&row))
+                .sum();
             let built = parameters
                 .clone()
                 .build_from_peptides(parameters.digest(&fasta))

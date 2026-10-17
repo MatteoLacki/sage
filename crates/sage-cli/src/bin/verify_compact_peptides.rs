@@ -122,7 +122,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "# direct build: {} rows ({:.3} GB) in {:.2} s, {} adjacent rows out of sage's order, peak rss {:.3} GB",
                 direct_table.rows.len(),
-                compact_gb(direct_table.rows.len()),
+                direct_table.rows.bytes() as f64 / 1e9,
                 start.elapsed().as_secs_f64(),
                 direct_table.row_order_violations(),
                 peak_rss_bytes()? as f64 / 1e9,
@@ -183,7 +183,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "# merged {} rows ({:.3} GB) in {:.2} s, {} adjacent rows out of sage's order, peak rss {:.3} GB",
         table.rows.len(),
-        compact_gb(table.rows.len()),
+        table.rows.bytes() as f64 / 1e9,
         merge_start.elapsed().as_secs_f64(),
         order_violations,
         peak_rss_bytes()? as f64 / 1e9,
@@ -249,10 +249,9 @@ fn compare_with_full_digest(table: &CompactPeptides, expected: &[Peptide]) -> us
         return 1;
     }
     let start = Instant::now();
-    let mut materialized: Vec<Peptide> = table
-        .rows
-        .par_iter()
-        .map(|row| table.materialize(row))
+    let mut materialized: Vec<Peptide> = (0..table.rows.len())
+        .into_par_iter()
+        .map(|row| table.materialize(&table.rows.get(row)))
         .collect();
     table.resolve_proteins(&mut materialized);
 
@@ -301,13 +300,12 @@ fn compare_with_direct_build(by_length: &CompactPeptides, direct: &CompactPeptid
         );
         return 1;
     }
-    let (mismatches, other_starts, other_positions) = by_length
-        .rows
-        .par_iter()
-        .zip(&direct.rows)
-        .map(|(a, b)| {
+    let (mismatches, other_starts, other_positions) = (0..direct.rows.len())
+        .into_par_iter()
+        .map(|row| {
+            let (a, b) = (by_length.rows.get(row), direct.rows.get(row));
             let same = a.monoisotopic.to_bits() == b.monoisotopic.to_bits()
-                && by_length.same_row_apart_from_occurrence(a, direct, b);
+                && by_length.same_row_apart_from_occurrence(&a, direct, &b);
             (
                 !same as usize,
                 (a.start() != b.start()) as usize,

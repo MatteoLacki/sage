@@ -9,7 +9,7 @@ use crate::process_memory::available_memory_bytes;
 use crate::runner::{Predictions, Runner};
 use log::info;
 use rayon::prelude::*;
-use sage_core::compact::{drop_in_parallel, CompactPeptide, CompactPeptides};
+use sage_core::compact::{drop_in_parallel, CompactPeptides};
 use sage_core::database::{IndexedDatabase, PeptideIx};
 use sage_core::scoring::{Feature, RankingScore, Scorer};
 use sage_core::slicing::{rows_reaching, SlicePlan};
@@ -95,10 +95,11 @@ impl SliceBudget {
         }
     }
 
-    fn cost(&self, table: &CompactPeptides, row: &CompactPeptide) -> usize {
+    fn cost(&self, table: &CompactPeptides, row: usize) -> usize {
+        let fragments = table.fragment_count_of(row);
         match self {
-            Self::Fragments(_) => table.fragment_count(row),
-            Self::Bytes(_) => BYTES_PER_ROW + BYTES_PER_FRAGMENT * table.fragment_count(row),
+            Self::Fragments(_) => fragments,
+            Self::Bytes(_) => BYTES_PER_ROW + BYTES_PER_FRAGMENT * fragments,
         }
     }
 }
@@ -125,8 +126,8 @@ pub fn search(
     let budget = SliceBudget::from_environment()?;
     let query_order = QueryOrder::for_files(files)?;
     let plan = SlicePlan::new(
-        &table.rows,
-        |row| row.monoisotopic,
+        table.rows.len(),
+        |row| table.rows.mass(row),
         |row| budget.cost(table, row),
         budget.limit(),
         widest_window + WINDOW_MARGIN_DA,
@@ -275,8 +276,8 @@ fn rows_reached_by(
         .map(|&index| queries[index].window_high)
         .fold(f32::NEG_INFINITY, f32::max);
     rows_reaching(
-        &table.rows,
-        |row| row.monoisotopic,
+        table.rows.len(),
+        |row| table.rows.mass(row),
         low - WINDOW_MARGIN_DA,
         high + WINDOW_MARGIN_DA,
     )

@@ -10,7 +10,7 @@ use log::info;
 use rayon::prelude::*;
 use sage_cloudpath::text_spectra::{TextFormat, TextSpectra};
 use sage_cloudpath::{FileFormat, Url};
-use sage_core::compact::{CompactPeptide, CompactPeptides};
+use sage_core::compact::CompactPeptides;
 use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
@@ -329,7 +329,7 @@ impl Runner {
             info!(
                 "compacted {} peptides ({:.2} GB) in {:#?}",
                 compact.rows.len(),
-                (compact.rows.len() * std::mem::size_of::<CompactPeptide>()) as f64 / 1e9,
+                compact.rows.bytes() as f64 / 1e9,
                 start.elapsed()
             );
             return Ok(Self {
@@ -954,10 +954,7 @@ impl Runner {
     /// The row count and fingerprint of this run's peptide table, whichever form it is in.
     fn peptide_rows(&self) -> PeptideRows {
         match &self.compact {
-            Some(table) => PeptideRows::new(
-                table.rows.len(),
-                table.rows.iter().map(|row| row.monoisotopic),
-            ),
+            Some(table) => PeptideRows::new(table.rows.len(), table.rows.masses()),
             None => PeptideRows::new(
                 self.database.peptides.len(),
                 self.database.peptides.iter().map(|p| p.monoisotopic),

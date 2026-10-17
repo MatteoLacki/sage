@@ -1,6 +1,6 @@
 use clap::{Arg, Command, ValueHint};
 use sage_cli::process_memory::{peak_rss_bytes, reset_peak_rss};
-use sage_core::compact::CompactPeptide;
+use sage_core::compact::CompactRows;
 use sage_core::database::{Builder, IndexedDatabase};
 use sage_core::enzyme::EnzymeParameters;
 use sage_core::peptide::Peptide;
@@ -19,7 +19,7 @@ use std::time::Instant;
 ///
 /// Prints a TSV to stdout, one row per length plus a `total` row. Byte columns
 /// are estimates from struct sizes and allocation capacities, ignoring
-/// allocator rounding; `compact_gb` is the same peptides as [`CompactPeptide`] rows. `peak_rss_gb` is the process high-water mark during
+/// allocator rounding; `compact_gb` is the same peptides as [`CompactRows`] columns. `peak_rss_gb` is the process high-water mark during
 /// that length's digest+build (reset between lengths via
 /// `/proc/self/clear_refs`), so it includes the FASTA held throughout.
 fn main() -> anyhow::Result<()> {
@@ -167,7 +167,7 @@ impl LengthSize {
     }
 
     fn compact_bytes(&self) -> usize {
-        (self.target_peptides + self.decoy_peptides) * std::mem::size_of::<CompactPeptide>()
+        (self.target_peptides + self.decoy_peptides) * CompactRows::BYTES_PER_ROW
     }
 
     fn print(&self, label: &str) {

@@ -3,8 +3,8 @@
 //! `docs/ai/compact_peptides.md`.
 
 use super::{
-    CompactError, CompactPeptide, CompactPeptides, Proteome, VarSite, MAX_PEPTIDE_LENGTH,
-    MAX_VARIABLE_MODS,
+    CompactError, CompactPeptide, CompactPeptides, CompactRows, Proteome, VarSite,
+    MAX_PEPTIDE_LENGTH, MAX_VARIABLE_MODS,
 };
 use crate::database::Parameters;
 use crate::enzyme::{EnzymeParameters, Position};
@@ -117,7 +117,7 @@ impl CompactPeptides {
             rows.len(),
             phase.elapsed().as_secs_f64(),
         );
-        table.rows = rows;
+        table.rows = CompactRows::from_rows(rows);
         Ok(table)
     }
 
