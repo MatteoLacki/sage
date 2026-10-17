@@ -4,19 +4,127 @@
 
 use super::{CompactPeptide, VarSite, MAX_VARIABLE_MODS};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// Rows per mass chunk.
-const CHUNK: usize = 1024;
+pub const CHUNK: usize = 1024;
+
+type VarSites = [VarSite; MAX_VARIABLE_MODS];
+
+/// Bytes kept alive for as long as a column is read from them, e.g. a memory-mapped
+/// file.
+pub type SharedBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// Element types a column can be read from stored bytes as: every bit pattern of
+/// their size is a valid value.
+trait StoredElement: Copy + Send + Sync + 'static {}
+impl StoredElement for u8 {}
+impl StoredElement for u16 {}
+impl StoredElement for u32 {}
+impl StoredElement for VarSites {}
+
+/// One column: built in memory, or read in place from stored bytes.
+enum Column<T: StoredElement> {
+    Owned(Vec<T>),
+    Stored(SharedBytes),
+}
+
+impl<T: StoredElement> Column<T> {
+    /// `bytes` read as `rows` values of `T`, native byte order.
+    fn stored(bytes: SharedBytes, rows: usize, name: &str) -> Result<Self, String> {
+        let raw: &[u8] = (*bytes).as_ref();
+        let expected = rows * std::mem::size_of::<T>();
+        if raw.len() != expected {
+            return Err(format!(
+                "column {name} holds {} bytes, expected {expected} for {rows} rows",
+                raw.len()
+            ));
+        }
+        if expected > 0 && raw.as_ptr() as usize % std::mem::align_of::<T>() != 0 {
+            return Err(format!("column {name} is not aligned for its element type"));
+        }
+        Ok(Column::Stored(bytes))
+    }
+
+    fn as_slice(&self) -> &[T] {
+        match self {
+            Column::Owned(values) => values,
+            Column::Stored(bytes) => {
+                let raw: &[u8] = (**bytes).as_ref();
+                if raw.is_empty() {
+                    return &[];
+                }
+                // SAFETY: `Column::stored` checked the length and alignment, `T` accepts
+                // every bit pattern, and `bytes` lives as long as `self`.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        raw.as_ptr() as *const T,
+                        raw.len() / std::mem::size_of::<T>(),
+                    )
+                }
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let values = self.as_slice();
+        // SAFETY: plain values without padding viewed as their bytes.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        }
+    }
+}
+
+impl<T: StoredElement> Default for Column<T> {
+    fn default() -> Self {
+        Column::Owned(Vec::new())
+    }
+}
+
+impl<T: StoredElement> std::fmt::Debug for Column<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Column::Owned(values) => write!(f, "Owned({} values)", values.len()),
+            Column::Stored(bytes) => write!(f, "Stored({} bytes)", (**bytes).as_ref().len()),
+        }
+    }
+}
+
+/// [`CompactRows`]' columns as bytes, to store; [`StoredRows`] reads them back.
+pub struct RowColumns<'a> {
+    pub rows: usize,
+    /// Per [`CHUNK`] rows: the first row's mass bit pattern, and where the chunk's
+    /// full bit patterns start in `wide_masses` (`u32::MAX` when it has none).
+    pub mass_chunks: &'a [(u32, u32)],
+    pub wide_masses: &'a [u32],
+    pub mass_residuals: &'a [u8],
+    pub starts: &'a [u8],
+    pub lengths: &'a [u8],
+    pub flags: &'a [u8],
+    pub var_sites: &'a [u8],
+}
+
+/// Stored columns, as [`RowColumns`] wrote them, for [`CompactRows::from_stored`].
+pub struct StoredRows {
+    pub rows: usize,
+    pub mass_chunks: Vec<(u32, u32)>,
+    pub wide_masses: Vec<u32>,
+    pub mass_residuals: SharedBytes,
+    pub starts: SharedBytes,
+    pub lengths: SharedBytes,
+    pub flags: SharedBytes,
+    pub var_sites: SharedBytes,
+}
 
 /// Rows sorted by precursor mass, one column per field. Row `i` decodes back to the
 /// identical [`CompactPeptide`].
 #[derive(Debug, Default)]
 pub struct CompactRows {
     masses: ChunkedMasses,
-    starts: Vec<u32>,
-    lengths: Vec<u8>,
-    flags: Vec<u8>,
-    var_sites: Vec<[VarSite; MAX_VARIABLE_MODS]>,
+    starts: Column<u32>,
+    lengths: Column<u8>,
+    flags: Column<u8>,
+    var_sites: Column<VarSites>,
 }
 
 impl CompactRows {
@@ -26,10 +134,10 @@ impl CompactRows {
     /// Columns of `rows`, which must be sorted by mass.
     pub fn from_rows(rows: Vec<CompactPeptide>) -> CompactRows {
         let masses = ChunkedMasses::new(&rows);
-        let starts = rows.par_iter().map(|row| row.start).collect();
-        let lengths = rows.par_iter().map(|row| row.length).collect();
-        let flags = rows.par_iter().map(|row| row.flags).collect();
-        let var_sites = rows.par_iter().map(|row| row.var_sites).collect();
+        let starts = Column::Owned(rows.par_iter().map(|row| row.start).collect());
+        let lengths = Column::Owned(rows.par_iter().map(|row| row.length).collect());
+        let flags = Column::Owned(rows.par_iter().map(|row| row.flags).collect());
+        let var_sites = Column::Owned(rows.par_iter().map(|row| row.var_sites).collect());
         super::drop_in_parallel(rows);
         CompactRows {
             masses,
@@ -40,22 +148,54 @@ impl CompactRows {
         }
     }
 
+    /// Rows read in place from stored columns, checked for size and consistency.
+    pub fn from_stored(stored: StoredRows) -> Result<CompactRows, String> {
+        let rows = stored.rows;
+        let masses = ChunkedMasses::stored(
+            rows,
+            stored.mass_chunks,
+            stored.wide_masses,
+            Column::stored(stored.mass_residuals, rows, "mass_residual")?,
+        )?;
+        Ok(CompactRows {
+            masses,
+            starts: Column::stored(stored.starts, rows, "start")?,
+            lengths: Column::stored(stored.lengths, rows, "length")?,
+            flags: Column::stored(stored.flags, rows, "flags")?,
+            var_sites: Column::stored(stored.var_sites, rows, "var_sites")?,
+        })
+    }
+
+    /// The columns as bytes, in native byte order.
+    pub fn columns(&self) -> RowColumns<'_> {
+        RowColumns {
+            rows: self.len(),
+            mass_chunks: &self.masses.chunks,
+            wide_masses: &self.masses.wide,
+            mass_residuals: self.masses.residuals.bytes(),
+            starts: self.starts.bytes(),
+            lengths: self.lengths.bytes(),
+            flags: self.flags.bytes(),
+            var_sites: self.var_sites.bytes(),
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.starts.len()
+        self.starts.as_slice().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.starts.is_empty()
+        self.len() == 0
     }
 
     /// Row `row`, decoded.
     pub fn get(&self, row: usize) -> CompactPeptide {
         CompactPeptide {
             monoisotopic: self.masses.get(row),
-            start: self.starts[row],
-            length: self.lengths[row],
-            flags: self.flags[row],
-            var_sites: self.var_sites[row],
+            start: self.starts.as_slice()[row],
+            length: self.lengths.as_slice()[row],
+            flags: self.flags.as_slice()[row],
+            var_sites: self.var_sites.as_slice()[row],
         }
     }
 
@@ -66,7 +206,7 @@ impl CompactRows {
 
     /// Row `row`'s peptide length.
     pub fn length(&self, row: usize) -> usize {
-        self.lengths[row] as usize
+        self.lengths.as_slice()[row] as usize
     }
 
     pub fn iter(&self) -> impl Iterator<Item = CompactPeptide> + '_ {
@@ -80,10 +220,15 @@ impl CompactRows {
     /// Bytes the columns hold.
     pub fn bytes(&self) -> usize {
         self.masses.bytes()
-            + self.starts.len() * 4
-            + self.lengths.len()
-            + self.flags.len()
-            + self.var_sites.len() * std::mem::size_of::<[VarSite; MAX_VARIABLE_MODS]>()
+            + self.starts.bytes().len()
+            + self.lengths.bytes().len()
+            + self.flags.bytes().len()
+            + self.var_sites.bytes().len()
+    }
+
+    /// Whether the columns are read in place from stored bytes.
+    pub fn is_stored(&self) -> bool {
+        matches!(self.starts, Column::Stored(_))
     }
 }
 
@@ -96,7 +241,7 @@ struct ChunkedMasses {
     /// Per chunk: its first row's bit pattern, and where its full patterns start in
     /// `wide` (`u32::MAX` for a chunk that fits in residuals).
     chunks: Vec<(u32, u32)>,
-    residuals: Vec<u16>,
+    residuals: Column<u16>,
     wide: Vec<u32>,
 }
 
@@ -136,21 +281,48 @@ impl ChunkedMasses {
             .collect();
         ChunkedMasses {
             chunks,
-            residuals,
+            residuals: Column::Owned(residuals),
             wide,
         }
+    }
+
+    /// Stored chunks over `rows` rows, checked so every row decodes inside them.
+    fn stored(
+        rows: usize,
+        chunks: Vec<(u32, u32)>,
+        wide: Vec<u32>,
+        residuals: Column<u16>,
+    ) -> Result<ChunkedMasses, String> {
+        if chunks.len() != (rows + CHUNK - 1) / CHUNK {
+            return Err(format!(
+                "{} mass chunks stored for {rows} rows, expected {}",
+                chunks.len(),
+                (rows + CHUNK - 1) / CHUNK
+            ));
+        }
+        for (chunk, &(_, wide_start)) in chunks.iter().enumerate() {
+            let chunk_rows = CHUNK.min(rows - chunk * CHUNK);
+            if wide_start != u32::MAX && wide_start as usize + chunk_rows > wide.len() {
+                return Err(format!("mass chunk {chunk} points past the wide masses"));
+            }
+        }
+        Ok(ChunkedMasses {
+            chunks,
+            residuals,
+            wide,
+        })
     }
 
     fn get(&self, row: usize) -> f32 {
         let (base, wide_start) = self.chunks[row / CHUNK];
         match wide_start {
-            u32::MAX => f32::from_bits(base + self.residuals[row] as u32),
+            u32::MAX => f32::from_bits(base + self.residuals.as_slice()[row] as u32),
             _ => f32::from_bits(self.wide[wide_start as usize + row % CHUNK]),
         }
     }
 
     fn bytes(&self) -> usize {
-        self.chunks.len() * 8 + self.residuals.len() * 2 + self.wide.len() * 4
+        self.chunks.len() * 8 + self.residuals.bytes().len() + self.wide.len() * 4
     }
 }
 
@@ -202,5 +374,109 @@ mod test {
             .zip(&masses)
             .all(|(a, b)| a.to_bits() == b.to_bits()));
         assert!(CompactRows::from_rows(Vec::new()).is_empty());
+    }
+
+    /// Bytes in a `u64` buffer, so every column type is aligned in them.
+    struct AlignedBytes(Vec<u64>, usize);
+
+    impl AsRef<[u8]> for AlignedBytes {
+        fn as_ref(&self) -> &[u8] {
+            // SAFETY: the buffer holds at least `self.1` initialised bytes.
+            unsafe { std::slice::from_raw_parts(self.0.as_ptr() as *const u8, self.1) }
+        }
+    }
+
+    fn shared(bytes: &[u8]) -> SharedBytes {
+        let mut words = vec![0u64; (bytes.len() + 7) / 8];
+        // SAFETY: `words` has room for `bytes.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                words.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            )
+        };
+        Arc::new(AlignedBytes(words, bytes.len()))
+    }
+
+    fn stored_copy(columns: &CompactRows) -> Result<CompactRows, String> {
+        let c = columns.columns();
+        CompactRows::from_stored(StoredRows {
+            rows: c.rows,
+            mass_chunks: c.mass_chunks.to_vec(),
+            wide_masses: c.wide_masses.to_vec(),
+            mass_residuals: shared(c.mass_residuals),
+            starts: shared(c.starts),
+            lengths: shared(c.lengths),
+            flags: shared(c.flags),
+            var_sites: shared(c.var_sites),
+        })
+    }
+
+    #[test]
+    fn stored_columns_decode_every_row_exactly() {
+        let mut masses: Vec<f32> = (0..5_000).map(|i| 800.0 + i as f32 * 1e-4).collect();
+        masses.extend((0..3_000).map(|i| 2_000.0 + i as f32 * 7.5));
+        let rows: Vec<CompactPeptide> = masses
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| row(m, i as u32))
+            .collect();
+        let columns = CompactRows::from_rows(rows.clone());
+        let stored = stored_copy(&columns).unwrap();
+        assert!(stored.is_stored() && !columns.is_stored());
+        assert_eq!(stored.len(), rows.len());
+        assert_eq!(stored.bytes(), columns.bytes());
+        for (i, expected) in rows.iter().enumerate() {
+            assert_eq!(stored.get(i), *expected, "row {i}");
+            assert_eq!(stored.mass(i).to_bits(), expected.monoisotopic.to_bits());
+        }
+        assert!(stored_copy(&CompactRows::from_rows(Vec::new()))
+            .unwrap()
+            .is_empty());
+        let empty: SharedBytes = Arc::new(Vec::<u8>::new());
+        let empty_rows = CompactRows::from_stored(StoredRows {
+            rows: 0,
+            mass_chunks: Vec::new(),
+            wide_masses: Vec::new(),
+            mass_residuals: empty.clone(),
+            starts: empty.clone(),
+            lengths: empty.clone(),
+            flags: empty.clone(),
+            var_sites: empty,
+        })
+        .unwrap();
+        assert!(empty_rows.is_empty() && empty_rows.columns().starts.is_empty());
+    }
+
+    #[test]
+    fn stored_columns_are_checked() {
+        let rows: Vec<CompactPeptide> = (0..3_000).map(|i| row(900.0 + i as f32, i)).collect();
+        let columns = CompactRows::from_rows(rows);
+        let c = columns.columns();
+        let mut short_starts = c.starts.to_vec();
+        short_starts.truncate(short_starts.len() - 4);
+        let wrong_length = CompactRows::from_stored(StoredRows {
+            rows: c.rows,
+            mass_chunks: c.mass_chunks.to_vec(),
+            wide_masses: c.wide_masses.to_vec(),
+            mass_residuals: shared(c.mass_residuals),
+            starts: shared(&short_starts),
+            lengths: shared(c.lengths),
+            flags: shared(c.flags),
+            var_sites: shared(c.var_sites),
+        });
+        assert!(wrong_length.unwrap_err().contains("start"));
+        let missing_chunk = CompactRows::from_stored(StoredRows {
+            rows: c.rows,
+            mass_chunks: c.mass_chunks[1..].to_vec(),
+            wide_masses: c.wide_masses.to_vec(),
+            mass_residuals: shared(c.mass_residuals),
+            starts: shared(c.starts),
+            lengths: shared(c.lengths),
+            flags: shared(c.flags),
+            var_sites: shared(c.var_sites),
+        });
+        assert!(missing_chunk.unwrap_err().contains("mass chunks"));
     }
 }

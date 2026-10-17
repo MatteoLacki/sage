@@ -51,6 +51,9 @@ pub struct Search {
     /// only its arrays) that `predicted_fragment_intensity_index`'s
     /// `(start, end)` ranges address.
     pub predicted_fragment_intensity_cache: Option<String>,
+    /// A peptide table stored by `dump_peptides --compact`, read in place instead of
+    /// building it (`database.sliced` only).
+    pub compact_peptides: Option<String>,
     pub precursor_charge: (u8, u8),
     pub override_precursor_charge: bool,
     pub isotope_errors: (i8, i8),
@@ -200,6 +203,8 @@ pub struct Input {
     /// Path to the shared `arrays.mmappet` directory
     /// `predicted_fragment_intensity_index`'s `(start, end)` ranges address.
     pub predicted_fragment_intensity_cache: Option<String>,
+    /// Directory `dump_peptides --compact` stored this run's peptide table in.
+    pub compact_peptides: Option<String>,
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
@@ -471,6 +476,9 @@ impl Input {
         if let Some(path) = matches.get_one::<String>("predicted-fragment-intensity-cache") {
             input.predicted_fragment_intensity_cache = Some(path.into());
         }
+        if let Some(path) = matches.get_one::<String>("compact-peptides") {
+            input.compact_peptides = Some(path.into());
+        }
 
         if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
             input.write_pin = Some(write_pin);
@@ -608,6 +616,11 @@ impl Input {
                  monoisotopic root and dropped from the spectrum's peak array \
                  entirely, so there is nothing for `isotope_ladder` to observe. \
                  Set `deisotope: false`, or remove `isotope_ladder`."
+            );
+        }
+        if self.compact_peptides.is_some() && !database.sliced {
+            anyhow::bail!(
+                "`compact_peptides` is read by the sliced search only -- set `database.sliced: true`."
             );
         }
         if database.sliced && database.prefilter {
@@ -750,6 +763,7 @@ impl Input {
             iim_sigma: self.iim_sigma,
             predicted_fragment_intensity_index: self.predicted_fragment_intensity_index,
             predicted_fragment_intensity_cache: self.predicted_fragment_intensity_cache,
+            compact_peptides: self.compact_peptides,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: if self.unlimited_max_peaks.unwrap_or(false) {
                 usize::MAX
@@ -900,7 +914,7 @@ mod test {
 
     #[test]
     fn predicted_rt_without_tolerance_errors() {
-        let json = mk_predicted_json(Some("predicted_rt.parquet"), None, None, None);
+        let json = mk_predicted_json(Some("predicted_rt.mmappet"), None, None, None);
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
@@ -999,7 +1013,7 @@ mod test {
 
     #[test]
     fn predicted_iim_without_tolerance_errors() {
-        let json = mk_predicted_json(None, None, Some("predicted_iim.parquet"), None);
+        let json = mk_predicted_json(None, None, Some("predicted_iim.mmappet"), None);
         let input: Input = serde_json::from_value(json).unwrap();
         let err = match input.build() {
             Err(e) => e,
@@ -1016,7 +1030,7 @@ mod test {
         // RT-only filtering is a supported, independent mode -- no mobility_tol
         // needed at all. See plans/rt_iim_independent_dimensions.md.
         let json = mk_predicted_json_with_sigma(
-            Some("predicted_rt.parquet"),
+            Some("predicted_rt.mmappet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
             Some(flat_linear_spline_json(5.0)),
             None,
@@ -1029,7 +1043,7 @@ mod test {
             .expect("RT-only predicted-property filtering should be valid");
         assert_eq!(
             search.predicted_rt.as_deref(),
-            Some("predicted_rt.parquet")
+            Some("predicted_rt.mmappet")
         );
         assert!(search.predicted_iim.is_none());
         assert!(search.mobility_tol.is_none());
@@ -1042,7 +1056,7 @@ mod test {
             None,
             None,
             None,
-            Some("predicted_iim.parquet"),
+            Some("predicted_iim.mmappet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
             Some(0.005),
         );
@@ -1052,7 +1066,7 @@ mod test {
             .expect("IIM-only predicted-property filtering should be valid");
         assert_eq!(
             search.predicted_iim.as_deref(),
-            Some("predicted_iim.parquet")
+            Some("predicted_iim.mmappet")
         );
         assert!(search.predicted_rt.is_none());
         assert!(search.rt_tol.is_none());
@@ -1062,10 +1076,10 @@ mod test {
     #[test]
     fn predicted_rt_and_iim_together_converts_seconds_to_minutes() {
         let json = mk_predicted_json_with_sigma(
-            Some("predicted_rt.parquet"),
+            Some("predicted_rt.mmappet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
             Some(flat_linear_spline_json(6.0)),
-            Some("predicted_iim.parquet"),
+            Some("predicted_iim.mmappet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
             Some(0.005),
         );
@@ -1093,11 +1107,11 @@ mod test {
         );
         assert_eq!(
             search.predicted_rt.as_deref(),
-            Some("predicted_rt.parquet")
+            Some("predicted_rt.mmappet")
         );
         assert_eq!(
             search.predicted_iim.as_deref(),
-            Some("predicted_iim.parquet")
+            Some("predicted_iim.mmappet")
         );
     }
 
@@ -1106,7 +1120,7 @@ mod test {
         let mut bad_spline = flat_value_tol_spline_json(-30.0, 30.0);
         bad_spline["lo"]["grid_step"] = serde_json::json!(0.0);
         let json = mk_predicted_json_with_sigma(
-            Some("predicted_rt.parquet"),
+            Some("predicted_rt.mmappet"),
             Some(bad_spline),
             Some(flat_linear_spline_json(5.0)),
             None,
@@ -1132,7 +1146,7 @@ mod test {
         let mut bad_sigma = flat_linear_spline_json(5.0);
         bad_sigma["grid_step"] = serde_json::json!(0.0);
         let json = mk_predicted_json_with_sigma(
-            Some("predicted_rt.parquet"),
+            Some("predicted_rt.mmappet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
             Some(bad_sigma),
             None,
@@ -1156,7 +1170,7 @@ mod test {
         // requirement (plans/lda_external_rt_iim_features.md) should reject
         // this the same way it already rejects predicted_rt without rt_tol_sec.
         let json = mk_predicted_json(
-            Some("predicted_rt.parquet"),
+            Some("predicted_rt.mmappet"),
             Some(flat_value_tol_spline_json(-30.0, 30.0)),
             None,
             None,
@@ -1177,7 +1191,7 @@ mod test {
         let json = mk_predicted_json(
             None,
             None,
-            Some("predicted_iim.parquet"),
+            Some("predicted_iim.mmappet"),
             Some(flat_value_tol_spline_json(-0.01, 0.01)),
         );
         let input: Input = serde_json::from_value(json).unwrap();

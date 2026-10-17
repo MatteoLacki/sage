@@ -112,6 +112,17 @@ fn main() -> anyhow::Result<()> {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(
+            Arg::new("compact-peptides")
+                .long("compact-peptides")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help(
+                    "Directory `dump_peptides --compact` stored this FASTA and digest's \
+                     peptide table in: read in place instead of building it. Needs \
+                     database.sliced.",
+                )
+                .value_hint(ValueHint::DirPath),
+        )
+        .arg(
             Arg::new("unimod-db-path")
                 .long("unimod-db-path")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())

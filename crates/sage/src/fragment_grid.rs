@@ -3,6 +3,7 @@
 
 use crate::database::{PeptideIx, Theoretical};
 use crate::mass::Tolerance;
+use crate::predicted::PredictedValues;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::ops::Range;
@@ -88,7 +89,7 @@ impl FragmentLayout {
 /// spectra's retention times), and how many RT slabs to split each block into.
 #[derive(Clone, Copy, Debug)]
 pub struct RtSlabbing<'a> {
-    pub predicted: &'a [Option<f32>],
+    pub predicted: PredictedValues<'a>,
     pub slabs: usize,
 }
 
@@ -97,14 +98,14 @@ impl RtSlabbing<'_> {
     /// width of a spectrum's compatible window; 1 to 64. More slabs prune more rows but
     /// leave fewer fragments per (block, slab) and so wider cells; on F9477 run 11 the
     /// span over one window (17 slabs) was slower than over four (4 slabs).
-    pub fn derived_slabs(predicted: &[Option<f32>], window: f32) -> usize {
+    pub fn derived_slabs(predicted: PredictedValues, window: f32) -> usize {
         if let Some(slabs) = environment_number("SAGE_GRID_RT_SLABS") {
             assert!(slabs >= 1, "SAGE_GRID_RT_SLABS must be at least 1");
             return slabs;
         }
-        let finite = predicted
-            .iter()
-            .filter_map(|rt| rt.filter(|rt| rt.is_finite()));
+        let finite = (0..predicted.len())
+            .map(|row| predicted.get(row))
+            .filter(|rt| rt.is_finite());
         let (low, high) = finite.fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), rt| {
             (low.min(rt), high.max(rt))
         });
@@ -272,11 +273,10 @@ impl FragmentGrid {
             let Some(rt) = rt else {
                 return 0;
             };
-            match rt.predicted[row] {
-                Some(predicted) if predicted.is_finite() => {
-                    rt_bounds.partition_point(|&bound| bound <= predicted)
-                }
-                _ => rt_slabs,
+            let predicted = rt.predicted.get(row);
+            match predicted.is_finite() {
+                true => rt_bounds.partition_point(|&bound| bound <= predicted),
+                false => rt_slabs,
             }
         };
         let slabs = if rt.is_some() { slabs } else { 1 };
@@ -853,11 +853,10 @@ impl FragmentGrid {
 /// the finite predictions); fewer when predictions repeat.
 fn rt_slab_bounds(rt: &RtSlabbing) -> Vec<f32> {
     let step = (rt.predicted.len() / 100_000).max(1);
-    let mut sample: Vec<f32> = rt
-        .predicted
-        .iter()
+    let mut sample: Vec<f32> = (0..rt.predicted.len())
         .step_by(step)
-        .filter_map(|predicted| predicted.filter(|value| value.is_finite()))
+        .map(|row| rt.predicted.get(row))
+        .filter(|value| value.is_finite())
         .collect();
     sample.sort_unstable_by(f32::total_cmp);
     let mut bounds: Vec<f32> = (1..rt.slabs)
@@ -1121,12 +1120,11 @@ mod test {
         let mut random = Lcg(29);
         let rows = 61;
         let by_row = random_fragments(rows, &mut random);
-        let predicted: Vec<Option<f32>> = (0..rows)
+        let predicted: Vec<f64> = (0..rows)
             .map(|_| match random.below(50) {
-                0..=4 => None,
-                5 => Some(f32::NAN),
-                6 => Some(f32::INFINITY),
-                _ => Some(random.below(10_000) as f32 / 100.0),
+                0..=5 => f64::NAN,
+                6 => f64::INFINITY,
+                _ => random.below(10_000) as f64 / 100.0,
             })
             .collect();
         let all: Vec<f32> = by_row.iter().flatten().copied().collect();
@@ -1157,7 +1155,7 @@ mod test {
                     cell_fragments: 2,
                 };
                 let rt = RtSlabbing {
-                    predicted: &predicted,
+                    predicted: PredictedValues::new(&predicted),
                     slabs,
                 };
                 let grid = FragmentGrid::build(rows, shape, Some(rt), |row, out| {
@@ -1185,10 +1183,10 @@ mod test {
                             .iter()
                             .copied()
                             .filter(|&offset| {
-                                let predicted = predicted[candidates.start + offset as usize];
-                                match (rt_window, predicted) {
-                                    (None, _) | (_, None) => true,
-                                    (Some((lo, hi)), Some(rt)) => rt >= lo && rt <= hi,
+                                let rt = predicted[candidates.start + offset as usize] as f32;
+                                match rt_window {
+                                    None => true,
+                                    Some((lo, hi)) => rt >= lo && rt <= hi,
                                 }
                             })
                             .collect();

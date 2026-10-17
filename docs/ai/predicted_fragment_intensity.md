@@ -36,10 +36,11 @@ Real verified log line (2026-08-31, full F9477): `loaded 16874172 predicted
 
 ## Reader (`sage-cloudpath/src/fragment_intensity_cache.rs`)
 
-- `read_fragment_intensity_index` — plain parquet row-iteration
+- `read_fragment_intensity_index` — originally plain parquet row-iteration
   (`sequence`/`charge`/`start`/`end` columns) into a
-  `HashMap<(String, u8), (u64, u64)>`. Same shape as
-  `predicted_properties::read_predicted_iim`.
+  `HashMap<(String, u8), (u64, u64)>`; positional since 2026-09-08 and, since
+  2026-10-17, the mapped `start`/`end` columns of an mmappet dataset
+  (`mapped_inputs.md`).
 - `FragmentIntensityArrays::open` — mmaps `arrays.mmappet`'s two flat
   binary columns directly (`memmap2`, same technique `pmsms.rs` already
   uses for `pmsms.mmappet`/precursors `.mmappet`). Schema/mmap-slice

@@ -43,6 +43,9 @@ protein and keeps the proteins whose digest yields the peptide's target form wit
 same modifications. That reproduces both `group_digests`' grouping and
 `reorder_peptides`' merge across positions.
 
+A table can also be stored once and mapped by later runs (`dump_peptides --compact`,
+`sage --compact-peptides`): see `mapped_inputs.md`.
+
 ## Building
 
 `CompactPeptides::build` generates a non-specific digest (`cleave_at = ""`) directly

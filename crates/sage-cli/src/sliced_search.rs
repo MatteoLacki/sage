@@ -156,7 +156,7 @@ pub fn search(
         let peptides = table.materialize_rows(rows.clone());
         let rt = predictions
             .rt()
-            .and_then(|rt| runner.rt_slabbing(&rt[rows.clone()]));
+            .and_then(|rt| runner.rt_slabbing(rt.slice(rows.clone())));
         let db = runner
             .parameters
             .database

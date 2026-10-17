@@ -4,100 +4,198 @@
 //! independent, separately-loadable files -- RT has no charge dimension
 //! (Chronologer_RT doesn't take one), IIM does.
 //!
-//! Both files are positional, not `sequence`-keyed (2026-09-08 -- see
+//! Both are positional, not `sequence`-keyed (2026-09-08 -- see
 //! `docs/ai/dumped_peptides_positional_predictions.md`): row `i` of
-//! `predicted_rt.parquet` is peptide row `i` of the `dumped_peptides`
-//! parquet both files were derived from; `predicted_iim.parquet` is dense
-//! over `(peptide_row, charge)` in the same `peptide_idx * charge_span +
+//! `predicted_rt.mmappet` is peptide row `i` of the `dumped_peptides`
+//! both files were derived from; `predicted_iim.mmappet` is dense over
+//! `(peptide_row, charge)` in the same `peptide_idx * charge_span +
 //! (charge - min_charge)` layout `Scorer::iim_dense_slot` already uses.
-//! Each file carries a `dumped_peptides_sha256` file-level key-value
-//! metadata entry (see `dumped_peptides_fingerprint`) -- the caller
-//! (`sage-cli`'s `resolve_predicted_rt`/`resolve_predicted_iim`) must check
-//! it against the current run's own digest before trusting these
+//! Each is an mmappet dataset (`schema.txt` + `0.bin`) mapped in place, with a
+//! `meta.json` sidecar carrying `dumped_peptides_sha256` (see
+//! `dumped_peptides_fingerprint`) -- the caller (`sage-cli`'s `Runner`) must
+//! check it against the current run's own digest before trusting these
 //! positions.
 
-use std::fs::File;
+use memmap2::Mmap;
+use std::marker::PhantomData;
 use std::path::Path;
-
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PredictedPropertiesError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("parquet error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
-    #[error("missing column: {0}")]
-    MissingColumn(&'static str),
-    #[error("{0} is missing required `dumped_peptides_sha256` file metadata -- regenerate it with a current `feature-prediction` build")]
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0} has no column `{1}`")]
+    MissingColumn(String, &'static str),
+    #[error("{0}: column `{1}` has dtype `{2}`, expected `{3}`")]
+    WrongDtype(String, &'static str, String, &'static str),
+    #[error("{0}: column `{1}` is not a whole number of `{2}` values")]
+    BadLength(String, &'static str, &'static str),
+    #[error("{0} is missing `dumped_peptides_sha256` in its meta.json -- regenerate it with a current `feature-prediction` build")]
     MissingFingerprint(String),
 }
 
-fn col_idx(
-    schema: &parquet::schema::types::SchemaDescriptor,
-    name: &'static str,
-) -> Result<usize, PredictedPropertiesError> {
-    schema
-        .columns()
-        .iter()
-        .position(|c| c.name() == name)
-        .ok_or(PredictedPropertiesError::MissingColumn(name))
+/// Element types a mapped column can hold, by their numpy dtype name.
+pub trait ColumnType: Copy + Send + Sync + 'static {
+    const DTYPE: &'static str;
 }
 
-fn read_fingerprint(
-    reader: &SerializedFileReader<File>,
-    path: &Path,
-) -> Result<String, PredictedPropertiesError> {
-    reader
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .into_iter()
-        .flatten()
-        .find(|kv| kv.key == "dumped_peptides_sha256")
-        .and_then(|kv| kv.value.clone())
-        .ok_or_else(|| PredictedPropertiesError::MissingFingerprint(path.display().to_string()))
+impl ColumnType for f64 {
+    const DTYPE: &'static str = "float64";
 }
 
-/// One parquet file, single column `rt`(double, minutes), one row per
-/// `dumped_peptides` row, in that same order. Returns the embedded
-/// `dumped_peptides` fingerprint alongside the dense values.
+impl ColumnType for i64 {
+    const DTYPE: &'static str = "int64";
+}
+
+/// One column of an mmappet dataset, mapped read-only; clones share the mapping.
+#[derive(Clone)]
+pub struct MappedColumn<T: ColumnType> {
+    map: Option<Arc<Mmap>>,
+    len: usize,
+    element: PhantomData<T>,
+}
+
+impl<T: ColumnType> MappedColumn<T> {
+    /// Column `name` of the mmappet dataset `dir`, which must hold `T`.
+    pub fn open(dir: &Path, name: &'static str) -> Result<Self, PredictedPropertiesError> {
+        let label = dir.display().to_string();
+        let schema = std::fs::read_to_string(dir.join("schema.txt"))?;
+        let (index, dtype) = schema
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .enumerate()
+            .find(|(_, (_, column))| column.trim() == name)
+            .map(|(index, (dtype, _))| (index, dtype.to_string()))
+            .ok_or_else(|| PredictedPropertiesError::MissingColumn(label.clone(), name))?;
+        if dtype != T::DTYPE {
+            return Err(PredictedPropertiesError::WrongDtype(
+                label,
+                name,
+                dtype,
+                T::DTYPE,
+            ));
+        }
+        let file = std::fs::File::open(dir.join(format!("{index}.bin")))?;
+        let bytes = file.metadata()?.len() as usize;
+        if bytes % std::mem::size_of::<T>() != 0 {
+            return Err(PredictedPropertiesError::BadLength(label, name, T::DTYPE));
+        }
+        let map = match bytes {
+            0 => None,
+            // SAFETY: prediction files are written once and never modified while mapped.
+            _ => Some(Arc::new(unsafe { Mmap::map(&file)? })),
+        };
+        Ok(Self {
+            map,
+            len: bytes / std::mem::size_of::<T>(),
+            element: PhantomData,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        match &self.map {
+            None => &[],
+            // SAFETY: the mapping starts page-aligned, holds `len` values of `T` (checked
+            // in `open`), every bit pattern is a valid `T`, and it lives as long as `self`.
+            Some(map) => unsafe { std::slice::from_raw_parts(map.as_ptr() as *const T, self.len) },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The `dumped_peptides_sha256` in `dir/meta.json`.
+pub fn read_fingerprint(dir: &Path) -> Result<String, PredictedPropertiesError> {
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    meta.get("dumped_peptides_sha256")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| PredictedPropertiesError::MissingFingerprint(dir.display().to_string()))
+}
+
+/// Column `rt` (float64, minutes), one row per `dumped_peptides` row, in that same
+/// order. Returns the `dumped_peptides` fingerprint alongside the mapped values.
 pub fn read_predicted_rt(
-    path: &Path,
-) -> Result<(String, Vec<f32>), PredictedPropertiesError> {
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    let fingerprint = read_fingerprint(&reader, path)?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let i_rt = col_idx(schema, "rt")?;
-
-    let mut values = Vec::with_capacity(reader.metadata().file_metadata().num_rows() as usize);
-    for row in reader.get_row_iter(None)? {
-        let row = row?;
-        values.push(row.get_double(i_rt)? as f32);
-    }
-
-    Ok((fingerprint, values))
+    dir: &Path,
+) -> Result<(String, MappedColumn<f64>), PredictedPropertiesError> {
+    Ok((read_fingerprint(dir)?, MappedColumn::open(dir, "rt")?))
 }
 
-/// One parquet file, single column `iim`(double, 1/K0), dense over
-/// `(peptide_row, charge)` -- see module docs for the slot layout. Returns
-/// the embedded `dumped_peptides` fingerprint alongside the dense values.
+/// Column `iim` (float64, 1/K0), dense over `(peptide_row, charge)` -- see module
+/// docs for the slot layout. Returns the `dumped_peptides` fingerprint alongside the
+/// mapped values.
 pub fn read_predicted_iim(
-    path: &Path,
-) -> Result<(String, Vec<f32>), PredictedPropertiesError> {
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    let fingerprint = read_fingerprint(&reader, path)?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let i_iim = col_idx(schema, "iim")?;
+    dir: &Path,
+) -> Result<(String, MappedColumn<f64>), PredictedPropertiesError> {
+    Ok((read_fingerprint(dir)?, MappedColumn::open(dir, "iim")?))
+}
 
-    let mut values = Vec::with_capacity(reader.metadata().file_metadata().num_rows() as usize);
-    for row in reader.get_row_iter(None)? {
-        let row = row?;
-        values.push(row.get_double(i_iim)? as f32);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sage_predicted_properties_test_{}_{name}_{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    Ok((fingerprint, values))
+    fn write_rt(dir: &Path, dtype: &str, values: &[f64]) {
+        std::fs::write(dir.join("schema.txt"), format!("{dtype} rt")).unwrap();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join("0.bin"), bytes).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"dumped_peptides_sha256": "abc"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn maps_values_and_fingerprint() {
+        let dir = temp_dir("maps");
+        write_rt(&dir, "float64", &[1.5, f64::NAN, 30.25]);
+        let (fingerprint, rt) = read_predicted_rt(&dir).unwrap();
+        assert_eq!(fingerprint, "abc");
+        assert_eq!(rt.len(), 3);
+        assert_eq!(rt.as_slice()[0], 1.5);
+        assert!(rt.as_slice()[1].is_nan());
+        assert_eq!(rt.clone().as_slice()[2], 30.25);
+    }
+
+    #[test]
+    fn rejects_wrong_dtype_missing_column_and_fingerprint() {
+        let dir = temp_dir("rejects");
+        write_rt(&dir, "float32", &[1.0]);
+        assert!(matches!(
+            read_predicted_rt(&dir),
+            Err(PredictedPropertiesError::WrongDtype(..))
+        ));
+        assert!(matches!(
+            read_predicted_iim(&dir),
+            Err(PredictedPropertiesError::MissingColumn(..))
+        ));
+        write_rt(&dir, "float64", &[1.0]);
+        std::fs::write(dir.join("meta.json"), "{}").unwrap();
+        assert!(matches!(
+            read_predicted_rt(&dir),
+            Err(PredictedPropertiesError::MissingFingerprint(..))
+        ));
+    }
 }

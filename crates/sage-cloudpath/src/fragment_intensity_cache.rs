@@ -2,14 +2,15 @@
 //! (see `necromerge2`'s `docs/ai/predicted_fragment_intensity.md`).
 //!
 //! Two separate inputs, given as explicit paths:
-//!   - a small, job-scoped parquet index, positional not `sequence`-keyed
+//!   - a small, job-scoped pointer index, positional not `sequence`-keyed
 //!     since 2026-09-08 (see `docs/ai/dumped_peptides_positional_predictions.md`):
-//!     `start`/`end`(int64, sentinel -1 for "no cache entry") — half-open
-//!     row range into the shared arrays below, dense over
+//!     an mmappet dataset with `start`/`end` (int64, sentinel -1 for "no cache
+//!     entry") -- half-open row range into the shared arrays below, dense over
 //!     `(peptide_row, charge)` in the same layout `Scorer::iim_dense_slot`
-//!     uses. Produced by `feature-prediction-export-fragments-for-sage`.
-//!     Carries a `dumped_peptides_sha256` file metadata entry the caller
-//!     must check (see `dumped_peptides_fingerprint`).
+//!     uses -- mapped in place. Produced by
+//!     `feature-prediction-export-fragments-for-sage`. Its `meta.json` carries a
+//!     `dumped_peptides_sha256` the caller must check (see
+//!     `dumped_peptides_fingerprint`).
 //!   - the shared, ever-growing `arrays.mmappet/` directory (schema.txt +
 //!     `0.bin`/`1.bin`, same on-disk format `pmsms.rs` reads for
 //!     `pmsms.mmappet`/precursors `.mmappet` -- schema/mmap-slice helpers
@@ -19,80 +20,52 @@
 //!     documented-literal-duplication convention rather than adding a
 //!     shared abstraction for two call sites).
 
-#![cfg(feature = "parquet")]
-
 use std::fs::File;
 use std::path::Path;
 
 use half::f16;
 use memmap2::Mmap;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
+
+use crate::predicted_properties::{read_fingerprint, MappedColumn, PredictedPropertiesError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FragmentIntensityCacheError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("parquet error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    #[error(transparent)]
+    Predicted(#[from] PredictedPropertiesError),
     #[error("missing column: {0}")]
     MissingColumn(&'static str),
     #[error("mmappet column {0} has dtype `{1}`, expected `{2}`")]
     WrongDtype(&'static str, String, &'static str),
-    #[error("{0} is missing required `dumped_peptides_sha256` file metadata -- regenerate it with a current `feature-prediction` build")]
-    MissingFingerprint(String),
+    #[error("{0}: `start` and `end` differ in length")]
+    UnequalColumns(String),
 }
 
-fn col_idx(
-    schema: &parquet::schema::types::SchemaDescriptor,
-    name: &'static str,
-) -> Result<usize, FragmentIntensityCacheError> {
-    schema
-        .columns()
-        .iter()
-        .position(|c| c.name() == name)
-        .ok_or(FragmentIntensityCacheError::MissingColumn(name))
+/// The job-scoped, dense `(peptide_row, charge)` pointer index, mapped -- see
+/// module docs. Values are permanent once written (the shared cache is
+/// append-only).
+#[derive(Clone)]
+pub struct FragmentIntensityIndex {
+    pub start: MappedColumn<i64>,
+    pub end: MappedColumn<i64>,
 }
 
-/// Read the job-scoped, dense `(peptide_row, charge) -> Option<(start,
-/// end)>` pointer index -- see module docs. Values are permanent once
-/// written (the shared cache is append-only), so this can be resolved
-/// once, up front, same as `predicted_properties::read_predicted_iim`.
-/// Returns the embedded `dumped_peptides` fingerprint alongside the dense
-/// values -- the caller must check it against the current run's own digest
+/// Map the pointer index in `dir`. Returns the `dumped_peptides` fingerprint
+/// alongside it -- the caller must check it against the current run's own digest
 /// before trusting these positions.
 pub fn read_fragment_intensity_index(
-    path: &Path,
-) -> Result<(String, Vec<Option<(u64, u64)>>), FragmentIntensityCacheError> {
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    let fingerprint = reader
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .into_iter()
-        .flatten()
-        .find(|kv| kv.key == "dumped_peptides_sha256")
-        .and_then(|kv| kv.value.clone())
-        .ok_or_else(|| FragmentIntensityCacheError::MissingFingerprint(path.display().to_string()))?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-
-    let i_start = col_idx(schema, "start")?;
-    let i_end = col_idx(schema, "end")?;
-
-    let mut values = Vec::with_capacity(reader.metadata().file_metadata().num_rows() as usize);
-    for row in reader.get_row_iter(None)? {
-        let row = row?;
-        let start = row.get_long(i_start)?;
-        let end = row.get_long(i_end)?;
-        values.push(if start < 0 {
-            None
-        } else {
-            Some((start as u64, end as u64))
-        });
+    dir: &Path,
+) -> Result<(String, FragmentIntensityIndex), FragmentIntensityCacheError> {
+    let fingerprint = read_fingerprint(dir)?;
+    let start = MappedColumn::open(dir, "start")?;
+    let end = MappedColumn::open(dir, "end")?;
+    if start.len() != end.len() {
+        return Err(FragmentIntensityCacheError::UnequalColumns(
+            dir.display().to_string(),
+        ));
     }
-
-    Ok((fingerprint, values))
+    Ok((fingerprint, FragmentIntensityIndex { start, end }))
 }
 
 /// Parse an mmappet `schema.txt` into an ordered list of `(dtype, column

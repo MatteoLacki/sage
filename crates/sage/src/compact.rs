@@ -19,7 +19,7 @@ use std::sync::Arc;
 mod nonspecific;
 mod rows;
 
-pub use rows::CompactRows;
+pub use rows::{CompactRows, RowColumns, SharedBytes, StoredRows, CHUNK as ROWS_PER_MASS_CHUNK};
 
 /// Residue indices share a `u8` with the two peptide-terminus codes.
 const MAX_PEPTIDE_LENGTH: usize = VarSite::NTERM as usize;
@@ -108,6 +108,20 @@ impl Proteome {
         self.residues.len()
     }
 
+    /// Every target protein's residues, concatenated.
+    pub fn residues(&self) -> &[u8] {
+        &self.residues
+    }
+
+    /// Where each protein starts in [`Proteome::residues`], then where the last ends.
+    pub fn protein_starts(&self) -> &[u32] {
+        &self.protein_starts
+    }
+
+    pub fn accessions(&self) -> &[Arc<str>] {
+        &self.accessions
+    }
+
     fn protein_range(&self, protein: usize) -> std::ops::Range<usize> {
         self.protein_starts[protein] as usize..self.protein_starts[protein + 1] as usize
     }
@@ -169,8 +183,10 @@ impl Proteome {
 }
 
 /// One applied variable modification: a residue index or peptide terminus, and an
-/// index into [`CompactPeptides`]' distinct variable-mod masses.
+/// index into [`CompactPeptides`]' distinct variable-mod masses. Two bytes, any
+/// value of either a valid one, so a stored column of them can be mapped as is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 struct VarSite {
     position: u8,
     mass_id: u8,
@@ -327,6 +343,9 @@ pub struct CompactPeptides {
     variable_mod_masses: Vec<f32>,
     parameters: Parameters,
     no_protein: Arc<str>,
+    /// `dumped_peptides_sha256` of the rows' masses, recorded when the table was
+    /// stored, so a run reading it back need not hash every mass again.
+    pub stored_fingerprint: Option<String>,
 }
 
 impl CompactPeptides {
@@ -360,7 +379,13 @@ impl CompactPeptides {
             variable_mod_masses,
             parameters: parameters.clone(),
             no_protein: Arc::from(""),
+            stored_fingerprint: None,
         })
+    }
+
+    /// Distinct variable-mod masses, ascending; rows refer to them by index.
+    pub fn variable_mod_masses(&self) -> &[f32] {
+        &self.variable_mod_masses
     }
 
     /// The table [`Parameters::digest`] would give, in its row order: generated

@@ -99,3 +99,9 @@ populated / 2,028,474 sentinel) with the new code against the same
 Cross-language fingerprint algorithm equivalence (Python `hashlib.sha256`
 vs Rust `sha2::Sha256`, same little-endian `f32` bytes) verified directly
 with a small fixture before the full-scale check.
+
+## mmappet, mapped in place (2026-10-17)
+
+The three files are now mmappet datasets with the fingerprint in a `meta.json`
+sidecar, mapped instead of decoded; `resolve_*` check the fingerprint and length and
+keep the mapping. See `mapped_inputs.md`.

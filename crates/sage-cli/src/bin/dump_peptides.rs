@@ -1,5 +1,7 @@
 use clap::{Arg, Command, ValueHint};
+use sage_core::compact::CompactPeptides;
 use sage_core::database::Builder;
+use std::time::Instant;
 
 /// Digest a FASTA database and dump every target/decoy peptide, in the same
 /// `Peptide::Display` inline-mod string format `sage` itself uses
@@ -15,6 +17,10 @@ use sage_core::database::Builder;
 /// responsible for slicing their full sage config down to just the
 /// `database` subdictionary before passing it via `--config` — this binary
 /// itself never reads or requires the rest of that config.
+///
+/// `--compact <dir>` also (or, without `-o`, only) stores the run's
+/// `CompactPeptides` table there, for `sage --compact-peptides <dir>`
+/// (`sage_cloudpath::compact_store`).
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::default()
         .filter_level(log::LevelFilter::Error)
@@ -50,9 +56,15 @@ fn main() -> anyhow::Result<()> {
                 .short('o')
                 .long("output")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
-                .default_value("peptides.parquet")
-                .help("Output parquet path")
+                .help("Output parquet path (default peptides.parquet, unless only --compact is given)")
                 .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("compact")
+                .long("compact")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help("Directory to store the compact peptide table in, for `sage --compact-peptides`")
+                .value_hint(ValueHint::DirPath),
         )
         .arg(
             Arg::new("unimod-db-path")
@@ -68,7 +80,12 @@ fn main() -> anyhow::Result<()> {
         .get_matches();
 
     let fasta_path = matches.get_one::<String>("fasta").unwrap();
-    let output = matches.get_one::<String>("output").unwrap();
+    let compact = matches.get_one::<String>("compact");
+    let output = match (matches.get_one::<String>("output"), compact) {
+        (Some(output), _) => Some(output.clone()),
+        (None, None) => Some("peptides.parquet".to_string()),
+        (None, Some(_)) => None,
+    };
 
     // Must happen before parsing --config below: overrides the embedded
     // default table `static_mods`/`variable_mods`'s `UNIMOD:<id>`
@@ -95,12 +112,42 @@ fn main() -> anyhow::Result<()> {
         params.generate_decoys,
     )?;
 
+    let compact_fingerprint = match compact {
+        Some(dir) => {
+            let start = Instant::now();
+            let table = CompactPeptides::build(&params, &fasta)?;
+            let fingerprint =
+                sage_cloudpath::compact_store::write(&table, &params, std::path::Path::new(dir))?;
+            log::info!(
+                "stored {} compact peptides ({:.2} GB) in {dir} in {:.1} s",
+                table.rows.len(),
+                table.rows.bytes() as f64 / 1e9,
+                start.elapsed().as_secs_f64()
+            );
+            Some(fingerprint)
+        }
+        None => None,
+    };
+    let Some(output) = output else {
+        return Ok(());
+    };
+
     let decoy_tag = params.decoy_tag.clone();
     let generate_decoys = params.generate_decoys;
     let mut peptides = params.digest(&fasta);
     peptides.sort_by(|a, b| a.monoisotopic.total_cmp(&b.monoisotopic));
 
     log::info!("digested {} target/decoy peptides", peptides.len());
+    if let Some(compact_fingerprint) = compact_fingerprint {
+        let fingerprint = sage_cloudpath::dumped_peptides_fingerprint::fingerprint_monoisotopic(
+            peptides.iter().map(|peptide| peptide.monoisotopic),
+        );
+        anyhow::ensure!(
+            fingerprint == compact_fingerprint,
+            "the compact table's rows and the digest's peptides differ (dumped_peptides_sha256 \
+             {compact_fingerprint} vs {fingerprint})"
+        );
+    }
 
     let bytes = sage_cloudpath::parquet::serialize_peptides(&peptides, &decoy_tag, generate_decoys)?;
 
@@ -108,7 +155,7 @@ fn main() -> anyhow::Result<()> {
     // it to already exist — fine for inputs, wrong for a file we're about
     // to create. Canonicalize the (existing) parent directory instead, same
     // pattern as `Runner::make_path`'s `output_directory.join(...)`.
-    let output_path = std::path::Path::new(output);
+    let output_path = std::path::Path::new(&output);
     let parent = match output_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => std::path::Path::new("."),

@@ -4,6 +4,7 @@ use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
 use crate::peptide::Peptide;
+use crate::predicted::{PredictedRanges, PredictedValues};
 #[cfg(test)]
 use crate::spectrum::Peak;
 use crate::spectrum::{PeakColumns, Precursor, ProcessedSpectrum};
@@ -402,28 +403,26 @@ pub struct Scorer<'db> {
     /// used to evict candidates whose `observed − predicted` RT falls
     /// outside `rt_tol`. `rt_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
-    /// `predicted_iim` — either, both, or neither may be set. Resolved
-    /// once from a `sequence -> rt` map by `Runner::resolve_predicted_rt`
-    /// (not read directly by `Scorer`) — the index form avoids calling
-    /// `Peptide::to_string()` per (candidate, spectrum) during search, a
-    /// real measured ~37% `run_sage` overhead before this. See
+    /// `predicted_iim` — either, both, or neither may be set. Positional,
+    /// read in place from `--predicted-rt` by `Runner` — the index form
+    /// avoids calling `Peptide::to_string()` per (candidate, spectrum) during
+    /// search, a real measured ~37% `run_sage` overhead before this. See
     /// `plans/rt_iim_independent_dimensions.md`.
-    pub predicted_rt: Option<&'db [Option<f32>]>,
+    pub predicted_rt: Option<PredictedValues<'db>>,
     /// Externally-predicted IIM, dense-indexed via [`iim_dense_slot`] (one
     /// slot per `(peptide index, charge)` combination in
     /// `[min_precursor_charge, max_precursor_charge]`), used to evict
     /// candidates whose `observed − predicted` IIM falls outside
     /// `mobility_tol`. `mobility_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
-    /// `predicted_rt`. Resolved once by `Runner::resolve_predicted_iim`,
-    /// same reasoning as `predicted_rt`. A dense array beats a
+    /// `predicted_rt`. Positional like `predicted_rt`. A dense array beats a
     /// `HashMap<(usize, u8), f32>` here: a standalone benchmark at real
     /// F9477 scale (18.9M entries, 20M random-access queries, fixed seed)
     /// measured 239ns/query for `std::HashMap` vs 10.4ns/query for a dense
     /// array — 23x, and smaller too (no per-entry key storage or
     /// hashmap load-factor overhead). See
     /// `plans/rt_iim_independent_dimensions.md`.
-    pub predicted_iim: Option<&'db [Option<f32>]>,
+    pub predicted_iim: Option<PredictedValues<'db>>,
     /// Robust (MAD-based) scale of the `predicted_rt` residual as a
     /// function of observed `scan_start_time`, already converted to minutes
     /// (`sage-cli/src/input.rs`'s `spline_secs_to_minutes` at config-load
@@ -455,11 +454,10 @@ pub struct Scorer<'db> {
     /// [`iim_dense_slot`] shape `predicted_iim` uses -- each entry is a
     /// `(start, end)` half-open row range into
     /// `predicted_fragment_intensity_annotation_id`/`_intensity` below.
-    /// Resolved once by `Runner::resolve_predicted_fragment_intensity`, same
-    /// reasoning as `predicted_rt`/`predicted_iim` (avoids `Peptide::
+    /// Positional like `predicted_rt`/`predicted_iim` (avoids `Peptide::
     /// to_string()` per candidate). See
     /// `docs/ai/predicted_fragment_intensity.md`.
-    pub predicted_fragment_intensity_index: Option<&'db [Option<(u64, u64)>]>,
+    pub predicted_fragment_intensity_index: Option<PredictedRanges<'db>>,
     /// The shared, ever-growing `arrays.mmappet` annotation-id column
     /// (`git/featureprediction`'s SAGE-order fragment-slot numbering, see
     /// `ms2_similarity::fragment_annotation_id`), sliced per candidate via
@@ -788,7 +786,7 @@ impl<'db> Scorer<'db> {
 
             let rt_ok = compatible_predicted_rt.map_or(true, |(lo, hi)| {
                 self.predicted_rt
-                    .and_then(|by_idx| by_idx[peptide_idx])
+                    .map(|by_idx| by_idx.get(peptide_idx))
                     .map_or(true, |rt| rt >= lo && rt <= hi)
             });
             let iim_ok = compatible_predicted_iim.map_or(true, |(lo, hi)| {
@@ -798,7 +796,7 @@ impl<'db> Scorer<'db> {
                     self.min_precursor_charge,
                     self.max_precursor_charge,
                 )
-                .and_then(|slot| self.predicted_iim.and_then(|dense| dense[slot]))
+                .and_then(|slot| self.predicted_iim.map(|dense| dense.get(slot)))
                 .map_or(true, |iim| iim >= lo && iim <= hi)
             });
 
@@ -828,18 +826,16 @@ impl<'db> Scorer<'db> {
         // that in the match pattern itself the way a `Copy` scalar could.
         let (predicted_rt_external, delta_rt_z2_external) =
             match (self.predicted_rt, self.rt_sigma.as_ref()) {
-                (Some(by_idx), Some(sigma_spline)) => match by_idx[peptide_idx] {
-                    Some(rt) => {
-                        let sigma = sigma_spline.eval(query.scan_start_time);
-                        if sigma > 0.0 {
-                            let z = (query.scan_start_time - rt) / sigma;
-                            (rt, z * z)
-                        } else {
-                            (0.0, 0.0)
-                        }
+                (Some(by_idx), Some(sigma_spline)) => {
+                    let rt = by_idx.get(peptide_idx);
+                    let sigma = sigma_spline.eval(query.scan_start_time);
+                    if sigma > 0.0 {
+                        let z = (query.scan_start_time - rt) / sigma;
+                        (rt, z * z)
+                    } else {
+                        (0.0, 0.0)
                     }
-                    None => (0.0, 0.0),
-                },
+                }
                 _ => (0.0, 0.0),
             };
 
@@ -855,7 +851,7 @@ impl<'db> Scorer<'db> {
                     self.min_precursor_charge,
                     self.max_precursor_charge,
                 )
-                .and_then(|slot| dense[slot])
+                .map(|slot| dense.get(slot))
                 .map_or((0.0, 0.0), |ims| {
                     let z = (observed - ims) / sigma;
                     (ims, z * z)
@@ -1261,11 +1257,9 @@ impl<'db> Scorer<'db> {
         }
         let slot = slot.unwrap();
 
-        if slot >= by_slot.len() || by_slot[slot].is_none() {
+        let Some((start, end)) = by_slot.get(slot) else {
             return (false, dense);
-        }
-        let (start, end) = by_slot[slot].unwrap();
-        let (start, end) = (start as usize, end as usize);
+        };
 
         if self.predicted_fragment_intensity_annotation_id.is_none() {
             return (false, dense);
@@ -1825,11 +1819,12 @@ mod tests {
                 peaks: peaks.into(),
                 ..Default::default()
             };
-            let index = vec![Some((0, annotations.len() as u64)); database.peptides.len()];
+            let starts = vec![0i64; database.peptides.len()];
+            let ends = vec![annotations.len() as i64; database.peptides.len()];
             let mut scorer = mk_isotope_test_scorer(&database);
             scorer.annotate_matches = true;
             scorer.max_fragment_charge = Some(1);
-            scorer.predicted_fragment_intensity_index = Some(&index);
+            scorer.predicted_fragment_intensity_index = Some(PredictedRanges::new(&starts, &ends));
             scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
             scorer.predicted_fragment_intensity = Some(&intensities);
             let (score, fragments) = scorer.score_candidate(

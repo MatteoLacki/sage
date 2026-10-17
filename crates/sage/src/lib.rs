@@ -13,6 +13,7 @@ pub mod ml;
 pub mod modification;
 pub mod ms2_similarity;
 pub mod peptide;
+pub mod predicted;
 pub mod protein_grouping;
 pub mod scoring;
 pub mod slicing;
