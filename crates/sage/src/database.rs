@@ -1,3 +1,4 @@
+use crate::compact::{CompactPeptides, CompactView};
 use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
 use crate::fragment_grid::{FragmentGrid, FragmentLayout, GridShape, RtSlabbing};
@@ -5,6 +6,7 @@ use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
 use crate::peptide::Peptide;
+use crate::peptide_view::PeptideView;
 use dashmap::DashSet;
 use fnv::FnvBuildHasher;
 use rayon::prelude::*;
@@ -13,6 +15,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct EnzymeBuilder {
@@ -286,10 +290,10 @@ impl Parameters {
     }
 
     /// The theoretical fragments of `peptide` (row `idx`) that the fragment index holds.
-    fn indexed_fragments<'a>(
+    fn indexed_fragments<'a, P: PeptideView>(
         &'a self,
         idx: usize,
-        peptide: &'a Peptide,
+        peptide: &'a P,
     ) -> impl Iterator<Item = Theoretical> + 'a {
         // Generate both B and Y ions, then filter down to make sure that
         // theoretical fragments are within the search space
@@ -302,7 +306,7 @@ impl Parameters {
                 match ion.kind {
                     Kind::A | Kind::B | Kind::C => (ion_idx + 1) > self.min_ion_index,
                     Kind::X | Kind::Y | Kind::Z => {
-                        peptide.sequence.len().saturating_sub(1) - ion_idx > self.min_ion_index
+                        peptide.len().saturating_sub(1) - ion_idx > self.min_ion_index
                     }
                 }
             })
@@ -332,11 +336,43 @@ impl Parameters {
         // Note that multiple charge states are actually handled by
         // [`SpectrumProcessor`] or during scoring - all theoretical
         // fragments are monoisotopic/uncharged
-        let mut fragments = target_decoys
+        let fragments = target_decoys
             .par_iter()
             .enumerate()
             .flat_map_iter(|(idx, peptide)| self.indexed_fragments(idx, peptide))
             .collect::<Vec<_>>();
+        self.index_pages(fragments, Rows::Peptides(target_decoys))
+    }
+
+    /// An index over rows `rows` of `table`, read through [`CompactView`]s: no
+    /// [`Peptide`] is built. Fragments, layout and the rows' masses are those of the
+    /// same rows materialised and passed to [`Parameters::build_from_peptides_with_rt`].
+    pub fn build_from_compact(
+        self,
+        table: Arc<CompactPeptides>,
+        rows: Range<usize>,
+        rt: Option<RtSlabbing>,
+    ) -> IndexedDatabase {
+        let rows = CompactSlice { table, rows };
+        if let FragmentLayout::Grid(shape) = self.fragment_layout {
+            let grid = FragmentGrid::build(rows.len(), shape, rt, |row, out| {
+                out.extend(self.indexed_fragments(row, &rows.view(row)))
+            });
+            return self.index_grid(grid, Rows::Compact(rows));
+        }
+        let fragments = (0..rows.len())
+            .into_par_iter()
+            .fold(Vec::new, |mut fragments, row| {
+                fragments.extend(self.indexed_fragments(row, &rows.view(row)));
+                fragments
+            })
+            .flatten_iter()
+            .collect::<Vec<_>>();
+        self.index_pages(fragments, Rows::Compact(rows))
+    }
+
+    /// The page index over `fragments` (any order), for the peptide rows `rows`.
+    fn index_pages(self, mut fragments: Vec<Theoretical>, rows: Rows) -> IndexedDatabase {
         log::trace!("finalizing index");
 
         // Sort all of our theoretical fragments by m/z, from low to high
@@ -398,8 +434,10 @@ impl Parameters {
             .map(|fragment| (fragment.fragment_mz, fragment.peptide_index))
             .unzip();
 
+        let (peptides, compact) = rows.into_fields();
         IndexedDatabase {
-            peptides: target_decoys,
+            peptides,
+            compact,
             fragment_mzs,
             fragment_peptide_indices,
             min_value,
@@ -427,11 +465,17 @@ impl Parameters {
                 out.extend(self.indexed_fragments(row, &target_decoys[row]))
             },
         );
+        self.index_grid(grid, Rows::Peptides(target_decoys))
+    }
+
+    fn index_grid(self, grid: FragmentGrid, rows: Rows) -> IndexedDatabase {
         log::info!("fragment grid: {}", grid.describe());
         log::info!("fragment grid balance: {}", grid.balance());
+        let (peptides, compact) = rows.into_fields();
         IndexedDatabase {
             potential_mods: self.variable_mod_list(),
-            peptides: target_decoys,
+            peptides,
+            compact,
             fragment_mzs: Vec::new(),
             fragment_peptide_indices: Vec::new(),
             min_value: Vec::new(),
@@ -440,6 +484,112 @@ impl Parameters {
             generate_decoys: self.generate_decoys,
             decoy_tag: self.decoy_tag,
             grid: Some(grid),
+        }
+    }
+}
+
+/// The peptide rows an index is built over.
+enum Rows {
+    Peptides(Vec<Peptide>),
+    Compact(CompactSlice),
+}
+
+impl Rows {
+    fn into_fields(self) -> (Vec<Peptide>, Option<CompactSlice>) {
+        match self {
+            Rows::Peptides(peptides) => (peptides, None),
+            Rows::Compact(slice) => (Vec::new(), Some(slice)),
+        }
+    }
+}
+
+/// Rows `rows` of a compact table, an index's peptides read in place: row `i` of the
+/// index is row `rows.start + i` of the table.
+#[derive(Clone)]
+pub struct CompactSlice {
+    pub table: Arc<CompactPeptides>,
+    pub rows: Range<usize>,
+}
+
+impl CompactSlice {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn view(&self, row: usize) -> CompactView<'_> {
+        self.table.view(self.rows.start + row)
+    }
+
+    fn mass(&self, row: usize) -> f32 {
+        self.table.rows.mass(self.rows.start + row)
+    }
+}
+
+/// One of an index's peptides: a built [`Peptide`] or a compact row read in place.
+#[derive(Clone, Copy)]
+pub enum PeptideRef<'a> {
+    Built(&'a Peptide),
+    Compact(CompactView<'a>),
+}
+
+impl PeptideView for PeptideRef<'_> {
+    fn len(&self) -> usize {
+        match self {
+            PeptideRef::Built(peptide) => peptide.len(),
+            PeptideRef::Compact(view) => view.len(),
+        }
+    }
+
+    fn residue(&self, index: usize) -> u8 {
+        match self {
+            PeptideRef::Built(peptide) => peptide.residue(index),
+            PeptideRef::Compact(view) => view.residue(index),
+        }
+    }
+
+    fn modification(&self, index: usize) -> f32 {
+        match self {
+            PeptideRef::Built(peptide) => peptide.modification(index),
+            PeptideRef::Compact(view) => view.modification(index),
+        }
+    }
+
+    fn nterm(&self) -> Option<f32> {
+        match self {
+            PeptideRef::Built(peptide) => peptide.nterm,
+            PeptideRef::Compact(view) => view.nterm(),
+        }
+    }
+
+    fn cterm(&self) -> Option<f32> {
+        match self {
+            PeptideRef::Built(peptide) => peptide.cterm,
+            PeptideRef::Compact(view) => view.cterm(),
+        }
+    }
+
+    fn monoisotopic(&self) -> f32 {
+        match self {
+            PeptideRef::Built(peptide) => peptide.monoisotopic,
+            PeptideRef::Compact(view) => view.monoisotopic(),
+        }
+    }
+
+    fn decoy(&self) -> bool {
+        match self {
+            PeptideRef::Built(peptide) => peptide.decoy,
+            PeptideRef::Compact(view) => view.decoy(),
+        }
+    }
+
+    fn missed_cleavages(&self) -> u8 {
+        match self {
+            PeptideRef::Built(peptide) => peptide.missed_cleavages,
+            PeptideRef::Compact(view) => view.missed_cleavages(),
         }
     }
 }
@@ -463,7 +613,10 @@ pub struct Theoretical {
 
 #[derive(Default)]
 pub struct IndexedDatabase {
+    /// The peptides, by row; empty when they are read from `compact` instead.
     pub peptides: Vec<Peptide>,
+    /// The rows of a compact table this index was built over, read in place.
+    pub compact: Option<CompactSlice>,
     /// Parallel columns, ordered by peptide index within each fragment-mass page; empty
     /// when the fragments are in `grid`.
     pub fragment_mzs: Vec<f32>,
@@ -487,12 +640,17 @@ impl IndexedDatabase {
     pub fn query(&self, precursor_mass: f32, precursor_tol: Tolerance) -> IndexedQuery<'_> {
         let (precursor_lo, precursor_hi) = precursor_tol.theoretical_range(precursor_mass);
 
-        let (pre_idx_lo, pre_idx_hi) = binary_search_slice(
-            &self.peptides,
-            |p, bounds| p.monoisotopic.total_cmp(bounds),
-            precursor_lo,
-            precursor_hi,
-        );
+        let (pre_idx_lo, pre_idx_hi) = match &self.compact {
+            Some(rows) => {
+                binary_search_rows(rows.len(), |row| rows.mass(row), precursor_lo, precursor_hi)
+            }
+            None => binary_search_slice(
+                &self.peptides,
+                |p, bounds| p.monoisotopic.total_cmp(bounds),
+                precursor_lo,
+                precursor_hi,
+            ),
+        };
 
         IndexedQuery {
             db: self,
@@ -500,6 +658,30 @@ impl IndexedDatabase {
             precursor_tol,
             pre_idx_lo,
             pre_idx_hi,
+        }
+    }
+
+    /// Number of peptide rows.
+    pub fn row_count(&self) -> usize {
+        match &self.compact {
+            Some(rows) => rows.len(),
+            None => self.peptides.len(),
+        }
+    }
+
+    /// Row `row`'s precursor mass.
+    pub fn row_mass(&self, row: usize) -> f32 {
+        match &self.compact {
+            Some(rows) => rows.mass(row),
+            None => self.peptides[row].monoisotopic,
+        }
+    }
+
+    /// Peptide `index`, built or read in place.
+    pub fn peptide(&self, index: PeptideIx) -> PeptideRef<'_> {
+        match &self.compact {
+            Some(rows) => PeptideRef::Compact(rows.view(index.0 as usize)),
+            None => PeptideRef::Built(&self.peptides[index.0 as usize]),
         }
     }
 
@@ -675,11 +857,8 @@ impl IndexedQuery<'_> {
     /// without `binary_search_slice`'s predecessor row at the lower boundary.
     pub fn candidate_rows(&self) -> std::ops::Range<usize> {
         let (precursor_lo, _) = self.precursor_tol.theoretical_range(self.precursor_mass);
-        let below_window = self
-            .db
-            .peptides
-            .get(self.pre_idx_lo)
-            .map_or(false, |p| p.monoisotopic < precursor_lo);
+        let below_window = self.pre_idx_lo < self.db.row_count()
+            && self.db.row_mass(self.pre_idx_lo) < precursor_lo;
         self.pre_idx_lo + usize::from(below_window)..self.pre_idx_hi
     }
 
@@ -936,6 +1115,34 @@ struct PageSearchScratch {
 
 thread_local! {
     static PAGE_SEARCH_SCRATCH: RefCell<PageSearchScratch> = RefCell::new(PageSearchScratch::default());
+}
+
+/// [`binary_search_slice`] over `rows` rows by their masses.
+fn binary_search_rows(
+    rows: usize,
+    mass: impl Fn(usize) -> f32,
+    low: f32,
+    high: f32,
+) -> (usize, usize) {
+    let left_idx = partition_point(0..rows, |row| mass(row).total_cmp(&low) == Ordering::Less)
+        .saturating_sub(1);
+    let right_idx = partition_point(left_idx..rows, |row| {
+        mass(row).total_cmp(&high) != Ordering::Greater
+    });
+    (left_idx, right_idx)
+}
+
+/// The first index of `range` where `pred` turns false, `pred` true before it.
+fn partition_point(range: Range<usize>, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (range.start, range.end);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match pred(mid) {
+            true => lo = mid + 1,
+            false => hi = mid,
+        }
+    }
+    lo
 }
 
 /// Return the widest `left` and `right` indices into a `slice` (sorted by the

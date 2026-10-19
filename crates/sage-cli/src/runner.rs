@@ -26,6 +26,7 @@ use sage_core::scoring::{Feature, Scorer};
 use sage_core::spectrum::{MS1Spectra, ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
 use sage_core::tmt::TmtQuant;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 // HTML report specific imports
 use maud::{html, PreEscaped};
@@ -159,7 +160,7 @@ pub struct Runner {
     raw_precursor_windows: std::sync::atomic::AtomicUsize,
     /// With `database.sliced`, the whole peptide table. `database` is then empty
     /// until the search is over, and afterwards holds only the reported peptides.
-    pub compact: Option<CompactPeptides>,
+    pub compact: Option<Arc<CompactPeptides>>,
     pub parameters: Search,
     /// Externally-predicted, positional (`(dumped_peptides_sha256,
     /// values)`, row `i` = `database.peptides[i]` -- see
@@ -354,7 +355,7 @@ impl Runner {
             return Ok(Self {
                 raw_precursor_windows: Default::default(),
                 database: IndexedDatabase::default(),
-                compact: Some(compact),
+                compact: Some(Arc::new(compact)),
                 parameters,
                 predicted_rt,
                 predicted_iim,
@@ -1056,7 +1057,7 @@ impl Runner {
         first_row: usize,
         predictions: &'a Predictions,
     ) -> Scorer<'a> {
-        let rows = first_row..first_row + db.peptides.len();
+        let rows = first_row..first_row + db.row_count();
         let (min_charge, max_charge) = self.parameters.precursor_charge;
         let charge_span = (max_charge - min_charge + 1) as usize;
         let charge_slots = rows.start * charge_span..rows.end * charge_span;
@@ -1113,7 +1114,7 @@ impl Runner {
 
     fn batch_files_sliced(
         &self,
-        table: &CompactPeptides,
+        table: &Arc<CompactPeptides>,
         predictions: &Predictions,
         batch_size: usize,
     ) -> anyhow::Result<SageResults> {

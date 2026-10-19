@@ -1,9 +1,9 @@
-use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx};
+use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx, PeptideRef};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
-use crate::peptide::Peptide;
+use crate::peptide_view::PeptideView;
 use crate::predicted::{PredictedRanges, PredictedValues};
 #[cfg(test)]
 use crate::spectrum::Peak;
@@ -1038,7 +1038,7 @@ impl<'db> Scorer<'db> {
             let fragments: Option<Fragments> = score_vector[idx].1.take();
             let psm_id = increment_psm_counter();
 
-            let peptide = &self.db[score.peptide];
+            let peptide = self.db.peptide(score.peptide);
             let precursor_mass = mz * score.precursor_charge as f32;
 
             // Margins are on `rank_key` (the actual ranking key per
@@ -1062,8 +1062,8 @@ impl<'db> Scorer<'db> {
                 (k as f64 * lambda.ln() - lambda - lnfact(k)) / std::f64::consts::LN_10;
 
             let isotope_error = score.isotope_error as f32 * NEUTRON;
-            let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
-                / (precursor_mass - isotope_error + peptide.monoisotopic);
+            let delta_mass = (precursor_mass - peptide.monoisotopic() - isotope_error) * 2E6
+                / (precursor_mass - isotope_error + peptide.monoisotopic());
 
             // External (Chronologer/IM2Deep, per-run-calibrated) RT/IIM,
             // independent of SAGE's own in-run composition-regression model
@@ -1090,7 +1090,7 @@ impl<'db> Scorer<'db> {
                 rank: idx as u32 + 1,
                 label: peptide.label(),
                 expmass: precursor_mass,
-                calcmass: peptide.monoisotopic,
+                calcmass: peptide.monoisotopic(),
                 // Features
                 charge: score.precursor_charge,
                 rt: query.scan_start_time,
@@ -1117,10 +1117,10 @@ impl<'db> Scorer<'db> {
                 },
                 longest_b: score.longest_b as u32,
                 longest_y: score.longest_y as u32,
-                longest_y_pct: score.longest_y as f32 / (peptide.sequence.len() as f32),
-                peptide_len: peptide.sequence.len(),
+                longest_y_pct: score.longest_y as f32 / (peptide.len() as f32),
+                peptide_len: peptide.len(),
                 scored_candidates: hits.scored_candidates as u32,
-                missed_cleavages: peptide.missed_cleavages,
+                missed_cleavages: peptide.missed_cleavages(),
 
                 // Outputs
                 discriminant_score: 0.0,
@@ -1163,7 +1163,18 @@ impl<'db> Scorer<'db> {
 
     /// Remove peaks matching a PSM from a query spectrum
     fn remove_matched_peaks(&self, query: &mut ProcessedSpectrum, psm: &Feature) {
-        let peptide = &self.db[psm.peptide_idx];
+        match self.db.peptide(psm.peptide_idx) {
+            PeptideRef::Built(peptide) => self.remove_peaks_matching(query, psm, peptide),
+            PeptideRef::Compact(view) => self.remove_peaks_matching(query, psm, &view),
+        }
+    }
+
+    fn remove_peaks_matching<P: PeptideView>(
+        &self,
+        query: &mut ProcessedSpectrum,
+        psm: &Feature,
+        peptide: &P,
+    ) {
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, psm.charge);
 
         // Remove MS2 peaks matched by previous match
@@ -1339,7 +1350,10 @@ impl<'db> Scorer<'db> {
     /// stay inside the `flat_map` closure (per `IonSeries`) rather than
     /// wrapping the whole chain, or it silently becomes a global counter --
     /// see docs/ai/predicted_fragment_intensity.md.
-    fn iter_fragments<'p>(&self, peptide: &'p Peptide) -> impl Iterator<Item = (usize, Ion)> + 'p
+    fn iter_fragments<'p, P: PeptideView>(
+        &self,
+        peptide: &'p P,
+    ) -> impl Iterator<Item = (usize, Ion)> + 'p
     where
         'db: 'p,
     {
@@ -1354,13 +1368,25 @@ impl<'db> Scorer<'db> {
         query: &ProcessedSpectrum,
         pre_score: &PreScore,
     ) -> (Score, Option<Fragments>) {
+        match self.db.peptide(pre_score.peptide) {
+            PeptideRef::Built(peptide) => self.score_peptide(query, pre_score, peptide),
+            PeptideRef::Compact(view) => self.score_peptide(query, pre_score, &view),
+        }
+    }
+
+    /// `score_candidate` for the candidate's peptide `peptide`.
+    fn score_peptide<P: PeptideView>(
+        &self,
+        query: &ProcessedSpectrum,
+        pre_score: &PreScore,
+        peptide: &P,
+    ) -> (Score, Option<Fragments>) {
         let mut score = Score {
             peptide: pre_score.peptide,
             precursor_charge: pre_score.precursor_charge,
             isotope_error: pre_score.isotope_error,
             ..Default::default()
         };
-        let peptide = &self.db[score.peptide];
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
 
@@ -1490,7 +1516,7 @@ impl<'db> Scorer<'db> {
                         let idx = match frag.kind {
                             Kind::A | Kind::B | Kind::C => idx as i32 + 1,
                             Kind::X | Kind::Y | Kind::Z => {
-                                peptide.sequence.len().saturating_sub(1) as i32 - idx as i32
+                                peptide.len().saturating_sub(1) as i32 - idx as i32
                             }
                         };
                         fragments_details.kinds.push(frag.kind);

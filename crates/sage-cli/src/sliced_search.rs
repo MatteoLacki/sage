@@ -9,16 +9,16 @@ use crate::process_memory::available_memory_bytes;
 use crate::runner::{Predictions, Runner};
 use log::info;
 use rayon::prelude::*;
-use sage_core::compact::{drop_in_parallel, CompactPeptides};
+use sage_core::compact::CompactPeptides;
 use sage_core::database::{IndexedDatabase, PeptideIx};
 use sage_core::scoring::{Feature, RankingScore, Scorer};
 use sage_core::slicing::{rows_reaching, SlicePlan};
 use sage_core::spectrum::{Precursor, ProcessedSpectrum, SpectrumProcessor};
+use std::sync::Arc;
 use std::time::Instant;
 
-/// While a slice's index is built, a row costs its `Peptide` plus, per fragment,
-/// the index entry and the copies sorting and unzipping make.
-const BYTES_PER_ROW: usize = 200;
+/// While a slice's index is built, a fragment costs its index entry and the copies
+/// sorting and unzipping make; rows are read in place from the table and cost nothing.
 const BYTES_PER_FRAGMENT: usize = 16;
 const AVAILABLE_MEMORY_PER_SLICE: f64 = 0.5;
 /// Added to the candidate windows, against float rounding at slice edges.
@@ -99,7 +99,7 @@ impl SliceBudget {
         let fragments = table.fragment_count_of(row);
         match self {
             Self::Fragments(_) => fragments,
-            Self::Bytes(_) => BYTES_PER_ROW + BYTES_PER_FRAGMENT * fragments,
+            Self::Bytes(_) => BYTES_PER_FRAGMENT * fragments,
         }
     }
 }
@@ -109,7 +109,7 @@ impl SliceBudget {
 /// `peptide_idx` set to table rows.
 pub fn search(
     runner: &Runner,
-    table: &CompactPeptides,
+    table: &Arc<CompactPeptides>,
     predictions: &Predictions,
     files: &[IndexedSpectra],
     processor: &SpectrumProcessor,
@@ -153,15 +153,14 @@ pub fn search(
         }
         let rows = rows_reached_by(table, &queries, query_indices);
         let build = Phase::start();
-        let peptides = table.materialize_rows(rows.clone());
         let rt = predictions
             .rt()
             .and_then(|rt| runner.rt_slabbing(rt.slice(rows.clone())));
-        let db = runner
-            .parameters
-            .database
-            .clone()
-            .build_from_peptides_with_rt(peptides, rt);
+        let db = runner.parameters.database.clone().build_from_compact(
+            Arc::clone(table),
+            rows.clone(),
+            rt,
+        );
         let build = build.finish();
 
         let search = Phase::start();
@@ -212,7 +211,6 @@ pub fn search(
         for (index, features) in scored {
             features_by_query[index] = features;
         }
-        drop_in_parallel(db.peptides);
     }
 
     let features = in_spectrum_order(

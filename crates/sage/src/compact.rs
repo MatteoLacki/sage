@@ -563,6 +563,7 @@ impl CompactPeptides {
         self.resolve_proteins(&mut peptides);
         IndexedDatabase {
             peptides,
+            compact: None,
             fragment_mzs: Vec::new(),
             fragment_peptide_indices: Vec::new(),
             ion_kinds: self.parameters.ion_kinds.clone(),
@@ -1182,6 +1183,54 @@ MQKCPE
             "enzyme": {"cleave_at": "", "min_len": 3, "max_len": 8},
             "static_mods": {"[P": 7.5, "[A": 6.5, "]Q": 4.25, "]P": 3.75},
         }))
+    }
+
+    /// An index over compact rows holds what the same rows materialised give it: row
+    /// masses, fragments and every query's precursor range.
+    #[test]
+    fn index_over_compact_rows_equals_index_over_materialized_rows() {
+        use crate::fragment_grid::{FragmentLayout, GridShape};
+        use crate::mass::Tolerance;
+        let fasta = Fasta::parse(FASTA.into(), "rev_", true);
+        let grid = GridShape {
+            rows_per_block: 7,
+            fine_bits: 10,
+            cell_fragments: 2,
+        };
+        for layout in [FragmentLayout::Pages, FragmentLayout::Grid(grid)] {
+            let mut parameters = parameters(colliding_mods());
+            parameters.fragment_layout = layout;
+            parameters.bucket_size = 64;
+            let table = Arc::new(CompactPeptides::build(&parameters, &fasta).unwrap());
+            let rows = 3..table.rows.len() - 2;
+            let peptides = table.materialize_rows(rows.clone());
+            let built = parameters.clone().build_from_peptides_with_rt(peptides, None);
+            let compact = parameters
+                .clone()
+                .build_from_compact(Arc::clone(&table), rows.clone(), None);
+            assert!(compact.peptides.is_empty());
+            assert_eq!(built.row_count(), compact.row_count());
+            for row in 0..built.row_count() {
+                assert_eq!(built.row_mass(row).to_bits(), compact.row_mass(row).to_bits());
+            }
+            let fragments = |db: &IndexedDatabase| {
+                let mut fragments: Vec<(u32, u32)> = db
+                    .fragments()
+                    .map(|f| (f.peptide_index.0, f.fragment_mz.to_bits()))
+                    .collect();
+                fragments.sort_unstable();
+                fragments
+            };
+            assert_eq!(fragments(&built), fragments(&compact));
+            for row in 0..built.row_count() {
+                let mass = built.row_mass(row);
+                for tolerance in [Tolerance::Ppm(-10.0, 10.0), Tolerance::Da(-1.5, 0.5)] {
+                    let (a, b) = (built.query(mass, tolerance), compact.query(mass, tolerance));
+                    assert_eq!((a.pre_idx_lo, a.pre_idx_hi), (b.pre_idx_lo, b.pre_idx_hi));
+                    assert_eq!(a.candidate_rows(), b.candidate_rows());
+                }
+            }
+        }
     }
 
     #[test]
