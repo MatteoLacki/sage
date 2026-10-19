@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mass::monoisotopic;
 use crate::peptide::Peptide;
+use crate::peptide_view::PeptideView;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,16 +25,16 @@ pub struct Ion {
 }
 
 /// Generate B/Y ions for a candidate peptide under a given charge state
-pub struct IonSeries<'p> {
+pub struct IonSeries<'p, P: PeptideView + ?Sized = Peptide> {
     pub kind: Kind,
     cumulative_mass: f32,
-    peptide: &'p Peptide,
+    peptide: &'p P,
     idx: usize,
 }
 
-impl<'p> IonSeries<'p> {
+impl<'p, P: PeptideView + ?Sized> IonSeries<'p, P> {
     /// Create a new [`IonSeries`] iterator for a specified peptide
-    pub fn new(peptide: &'p Peptide, kind: Kind) -> Self {
+    pub fn new(peptide: &'p P, kind: Kind) -> Self {
         const C: f32 = 12.0;
         const O: f32 = 15.994914;
         const H: f32 = 1.007825;
@@ -41,15 +42,14 @@ impl<'p> IonSeries<'p> {
         const N: f32 = 14.003074;
         const NH3: f32 = N + H * 2.0 + PRO;
 
+        let nterm = peptide.nterm().unwrap_or_default();
         let cumulative_mass = match kind {
-            Kind::A => peptide.nterm.unwrap_or_default() - (C + O),
-            Kind::B => peptide.nterm.unwrap_or_default(),
-            Kind::C => peptide.nterm.unwrap_or_default() + NH3,
-            Kind::X => {
-                peptide.monoisotopic - peptide.nterm.unwrap_or_default() + (C + O - NH3 + N + H)
-            }
-            Kind::Y => peptide.monoisotopic - peptide.nterm.unwrap_or_default(),
-            Kind::Z => peptide.monoisotopic - peptide.nterm.unwrap_or_default() - NH3,
+            Kind::A => nterm - (C + O),
+            Kind::B => nterm,
+            Kind::C => nterm + NH3,
+            Kind::X => peptide.monoisotopic() - nterm + (C + O - NH3 + N + H),
+            Kind::Y => peptide.monoisotopic() - nterm,
+            Kind::Z => peptide.monoisotopic() - nterm - NH3,
         };
         Self {
             kind,
@@ -60,17 +60,17 @@ impl<'p> IonSeries<'p> {
     }
 }
 
-impl<'p> Iterator for IonSeries<'p> {
+impl<'p, P: PeptideView + ?Sized> Iterator for IonSeries<'p, P> {
     type Item = Ion;
 
     // Dynamic programming solution - memoize cumulative mass of
     // peptide fragment for fast fragment ion generation
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx >= self.peptide.sequence.len() - 1 {
+        if self.idx >= self.peptide.len() - 1 {
             return None;
         }
-        let r = self.peptide.sequence[self.idx];
-        let m = self.peptide.modifications[self.idx];
+        let r = self.peptide.residue(self.idx);
+        let m = self.peptide.modification(self.idx);
 
         self.cumulative_mass += match self.kind {
             Kind::A | Kind::B | Kind::C => monoisotopic(r) + m,

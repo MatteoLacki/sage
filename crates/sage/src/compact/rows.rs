@@ -32,10 +32,11 @@ struct Column<T: StoredElement> {
     storage: Storage<T>,
 }
 
-/// What keeps a [`Column`]'s values alive.
+/// What keeps a [`Column`]'s values alive (never read: the column reads through its
+/// pointer).
 enum Storage<T> {
-    Owned(Vec<T>),
-    Stored(SharedBytes),
+    Owned { _values: Vec<T> },
+    Stored { _bytes: SharedBytes },
 }
 
 // SAFETY: a column's values are never written after construction, and `storage`
@@ -48,7 +49,7 @@ impl<T: StoredElement> Column<T> {
         Self {
             values: values.as_ptr(),
             len: values.len(),
-            storage: Storage::Owned(values),
+            storage: Storage::Owned { _values: values },
         }
     }
 
@@ -72,7 +73,7 @@ impl<T: StoredElement> Column<T> {
         Ok(Self {
             values,
             len: rows,
-            storage: Storage::Stored(bytes),
+            storage: Storage::Stored { _bytes: bytes },
         })
     }
 
@@ -84,7 +85,7 @@ impl<T: StoredElement> Column<T> {
     }
 
     fn is_stored(&self) -> bool {
-        matches!(self.storage, Storage::Stored(_))
+        matches!(self.storage, Storage::Stored { .. })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -105,8 +106,8 @@ impl<T: StoredElement> Default for Column<T> {
 impl<T: StoredElement> std::fmt::Debug for Column<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.storage {
-            Storage::Owned(_) => "Owned",
-            Storage::Stored(_) => "Stored",
+            Storage::Owned { .. } => "Owned",
+            Storage::Stored { .. } => "Stored",
         };
         write!(f, "{kind}({} values)", self.len)
     }

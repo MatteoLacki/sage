@@ -24,6 +24,11 @@ use std::time::Instant;
 /// table row for row: mass bits, length, decoy flag, variable sites and the residues
 /// at `start`. Differing `start` offsets and `position`s are counted, not failed.
 ///
+/// With `--views N`, only build the table (`CompactPeptides::build`) and require
+/// every N-th row's `CompactView` to read as its materialised `Peptide` does
+/// (`peptide_view::first_difference`: residues, modification bits, termini, mass,
+/// decoy, missed cleavages, every ion).
+///
 /// Prints a TSV per length to stdout and `#`-prefixed summary lines; exits
 /// non-zero on any mismatch.
 fn main() -> anyhow::Result<()> {
@@ -85,6 +90,12 @@ fn main() -> anyhow::Result<()> {
                 .action(ArgAction::SetTrue)
                 .help("Also build the table directly (non-specific digests) and compare"),
         )
+        .arg(
+            Arg::new("views")
+                .long("views")
+                .value_parser(clap::value_parser!(usize))
+                .help("Only compare every N-th row's view against its materialised peptide"),
+        )
         .get_matches();
 
     let fasta_path = matches.get_one::<String>("fasta").unwrap();
@@ -113,6 +124,10 @@ fn main() -> anyhow::Result<()> {
 
     let fasta =
         sage_cloudpath::util::read_fasta(&params.fasta, &params.decoy_tag, params.generate_decoys)?;
+
+    if let Some(&every) = matches.get_one::<usize>("views") {
+        return check_views(&params, &fasta, every.max(1));
+    }
 
     let direct_table = match direct {
         true => {
@@ -332,4 +347,37 @@ fn without_duplicate_attributes(peptide: &Peptide) -> Peptide {
         missed_cleavages: 0,
         ..peptide.clone()
     }
+}
+
+/// Every `every`-th row of the table: its view against its materialised peptide.
+fn check_views(
+    params: &sage_core::database::Parameters,
+    fasta: &sage_core::fasta::Fasta,
+    every: usize,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let table = CompactPeptides::build(params, fasta)?;
+    let built = start.elapsed().as_secs_f64();
+    let start = Instant::now();
+    let rows: Vec<usize> = (0..table.rows.len()).step_by(every).collect();
+    let differences: Vec<(usize, String)> = rows
+        .par_iter()
+        .filter_map(|&row| {
+            let peptide = table.materialize(&table.rows.get(row));
+            sage_core::peptide_view::first_difference(&table.view(row), &peptide)
+                .map(|difference| (row, format!("{peptide}: {difference}")))
+        })
+        .collect();
+    for (row, difference) in differences.iter().take(20) {
+        println!("# row {row}: {difference}");
+    }
+    println!(
+        "# views: {} of {} rows checked (every {every}), {} differ; table built in {built:.1} s, checked in {:.1} s",
+        rows.len(),
+        table.rows.len(),
+        differences.len(),
+        start.elapsed().as_secs_f64()
+    );
+    anyhow::ensure!(differences.is_empty(), "{} views differ", differences.len());
+    Ok(())
 }

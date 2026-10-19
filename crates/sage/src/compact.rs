@@ -18,8 +18,10 @@ use std::sync::Arc;
 
 mod nonspecific;
 mod rows;
+mod view;
 
 pub use rows::{CompactRows, RowColumns, SharedBytes, StoredRows, CHUNK as ROWS_PER_MASS_CHUNK};
+pub use view::CompactView;
 
 /// Residue indices share a `u8` with the two peptide-terminus codes.
 const MAX_PEPTIDE_LENGTH: usize = VarSite::NTERM as usize;
@@ -342,6 +344,8 @@ pub struct CompactPeptides {
     /// Distinct variable-mod masses; a [`VarSite`] stores an index into this.
     variable_mod_masses: Vec<f32>,
     parameters: Parameters,
+    /// `parameters.static_mods` in the order `materialize` iterates them.
+    static_mods: view::StaticMods,
     no_protein: Arc<str>,
     /// `dumped_peptides_sha256` of the rows' masses, recorded when the table was
     /// stored, so a run reading it back need not hash every mass again.
@@ -373,11 +377,13 @@ impl CompactPeptides {
             ));
         }
 
+        let parameters = parameters.clone();
         Ok(Self {
             proteome: Proteome::new(fasta)?,
             rows: CompactRows::default(),
             variable_mod_masses,
-            parameters: parameters.clone(),
+            static_mods: view::StaticMods::new(&parameters.static_mods),
+            parameters,
             no_protein: Arc::from(""),
             stored_fingerprint: None,
         })
@@ -1137,5 +1143,71 @@ MQKCPE
     #[test]
     fn rows_are_sixteen_bytes() {
         assert_eq!(std::mem::size_of::<CompactPeptide>(), 16);
+    }
+
+    /// Every row's view reads as its materialised `Peptide` does: residues,
+    /// modification bits, termini, mass, decoy, missed cleavages and every ion.
+    fn assert_views_equal_materialized(fasta: &str, config: serde_json::Value) {
+        let fasta = Fasta::parse(fasta.into(), "rev_", true);
+        let parameters = parameters(config.clone());
+        let table = CompactPeptides::build(&parameters, &fasta).unwrap();
+        assert!(!table.rows.is_empty());
+        for row in 0..table.rows.len() {
+            let peptide = table.materialize(&table.rows.get(row));
+            if let Some(difference) =
+                crate::peptide_view::first_difference(&table.view(row), &peptide)
+            {
+                panic!("row {row} ({peptide}): {difference}; config {config}");
+            }
+        }
+    }
+
+    /// Static rules that compete for the same residue or terminus, with variable
+    /// sites on the same residues: which one sticks depends on the order they apply.
+    fn colliding_mods() -> serde_json::Value {
+        mods(serde_json::json!({
+            "enzyme": {"cleave_at": "", "min_len": 3, "max_len": 8},
+            "static_mods": {
+                "C": 57.021465, "^C": 10.5, "^M": 3.25, "[M": 42.010565, "M": 1.75,
+                "$K": 1.5, "]K": 2.5, "K": 0.125, "^": 229.162932, "]": -0.984016
+            },
+            "variable_mods": {"M": [15.9949], "C": [119.004099], "[": [42.010565], "^Q": [-17.026548], "$": [14.01565]},
+        }))
+    }
+
+    /// Protein-terminal residue rules with nothing competing, so only the row's
+    /// position decides whether they apply.
+    fn protein_terminal_mods() -> serde_json::Value {
+        mods(serde_json::json!({
+            "enzyme": {"cleave_at": "", "min_len": 3, "max_len": 8},
+            "static_mods": {"[P": 7.5, "[A": 6.5, "]Q": 4.25, "]P": 3.75},
+        }))
+    }
+
+    #[test]
+    fn views_equal_materialized_peptides() {
+        for config in [
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "KR", "restrict": "P", "missed_cleavages": 2, "min_len": 3, "max_len": 30},
+            })),
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "KR", "restrict": "P", "missed_cleavages": 1, "min_len": 4, "max_len": 20, "semi_enzymatic": true},
+            })),
+            mods(serde_json::json!({
+                "enzyme": {"cleave_at": "", "min_len": 5, "max_len": 8},
+                "static_mods": {"^": 229.162932, "C": 57.021465},
+                "variable_mods": {"M": [15.9949, 31.989829], "[": [42.010565], "$": [-0.984016], "^Q": [-17.026548]},
+            })),
+            colliding_mods(),
+            protein_terminal_mods(),
+        ] {
+            assert_views_equal_materialized(FASTA, config);
+        }
+        for config in nonspecific_configs()
+            .into_iter()
+            .chain([colliding_mods(), protein_terminal_mods()])
+        {
+            assert_views_equal_materialized(EDGE_FASTA, config);
+        }
     }
 }
