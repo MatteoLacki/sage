@@ -1,7 +1,7 @@
 use crate::compact::{CompactPeptides, CompactView};
 use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
-use crate::fragment_grid::{FragmentGrid, FragmentLayout, GridShape, RtSlabbing};
+use crate::fragment_grid::{census_every, FragmentGrid, FragmentLayout, GridShape, RtSlabbing};
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
@@ -289,6 +289,12 @@ impl Parameters {
         self.build_from_peptides(target_decoys)
     }
 
+    /// How many fragments `indexed_fragments` gives a peptide of `length` residues: one
+    /// per ion kind per backbone cleavage, minus the first `min_ion_index` of each kind.
+    pub fn indexed_fragment_count(&self, length: usize) -> usize {
+        self.ion_kinds.len() * length.saturating_sub(1).saturating_sub(self.min_ion_index)
+    }
+
     /// The theoretical fragments of `peptide` (row `idx`) that the fragment index holds.
     fn indexed_fragments<'a, P: PeptideView>(
         &'a self,
@@ -355,9 +361,20 @@ impl Parameters {
     ) -> IndexedDatabase {
         let rows = CompactSlice { table, rows };
         if let FragmentLayout::Grid(shape) = self.fragment_layout {
-            let grid = FragmentGrid::build(rows.len(), shape, rt, |row, out| {
+            let fragments_of = |row: usize, out: &mut Vec<Theoretical>| {
                 out.extend(self.indexed_fragments(row, &rows.view(row)))
-            });
+            };
+            let fragment_count = |row: usize| {
+                self.indexed_fragment_count(rows.table.rows.length(rows.rows.start + row))
+            };
+            let grid = FragmentGrid::build_sampled(
+                rows.len(),
+                shape,
+                rt,
+                &fragments_of,
+                Some(&fragment_count),
+                census_every(),
+            );
             return self.index_grid(grid, Rows::Compact(rows));
         }
         let fragments = (0..rows.len())
@@ -457,13 +474,17 @@ impl Parameters {
         shape: GridShape,
         rt: Option<RtSlabbing>,
     ) -> IndexedDatabase {
-        let grid = FragmentGrid::build(
+        let fragments_of = |row: usize, out: &mut Vec<Theoretical>| {
+            out.extend(self.indexed_fragments(row, &target_decoys[row]))
+        };
+        let fragment_count = |row: usize| self.indexed_fragment_count(target_decoys[row].len());
+        let grid = FragmentGrid::build_sampled(
             target_decoys.len(),
             shape,
             rt,
-            |row, out: &mut Vec<Theoretical>| {
-                out.extend(self.indexed_fragments(row, &target_decoys[row]))
-            },
+            &fragments_of,
+            Some(&fragment_count),
+            census_every(),
         );
         self.index_grid(grid, Rows::Peptides(target_decoys))
     }

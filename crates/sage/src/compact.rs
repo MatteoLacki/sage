@@ -548,8 +548,7 @@ impl CompactPeptides {
     }
 
     fn fragments_of_length(&self, length: usize) -> usize {
-        self.parameters.ion_kinds.len()
-            * (length.saturating_sub(1)).saturating_sub(self.parameters.min_ion_index)
+        self.parameters.indexed_fragment_count(length)
     }
 
     /// An `IndexedDatabase` holding only `rows` (ascending), with proteins, and no

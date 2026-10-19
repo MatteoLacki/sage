@@ -413,3 +413,40 @@ fewer fragments per (block, slab) and so fewer, wider cells; past ~4 slabs the m
 waste outweighs the rows pruned, hence `derived_slabs` divides the span by four windows
 (4 slabs here). One dataset only.
 
+
+## Sampled census (2026-10-19)
+
+A grid build generated every fragment twice: the census (counts per fine key for
+the cell table, per-block counts, lowest and highest key) and the placement. Timed on
+F9477 with the stored table (temporary timers, necromerge2
+`temp/peptide_views/grid_phases.patch`), the census was 4.9 of 11.9 s of class I
+builds and 40.5 of 106.3 s of class II builds (13% of the 310 s run).
+
+Only the per-block counts and the key range must be exact; cells need an
+approximate histogram, since any increasing cell table within the 2^16 width cap finds
+the same matches. `FragmentGrid::build_sampled` takes the block sizes from
+`fragment_count(row)` (`Parameters::indexed_fragment_count`, from the peptide length),
+builds the histogram from every `every`-th block and the last (target per cell scaled
+by the sampled share), and widens the sampled key range by 2^(fine_bits - 5) keys
+(1/32 octave). Placement checks every fragment against that range; one outside it
+makes the build start over counting every block (logged), so a sample can only cost
+time, never change a result. `CENSUS_EVERY` 4, `SAGE_GRID_CENSUS_EVERY` overrides
+(1 = the exact census); `FragmentGrid::build` (tests) counts every block.
+
+Checks: `sampled_census_finds_what_the_exact_census_finds` (same fragments and
+matches as the exact census at R 1/4/16, f 10/14, every 2/3/5; extremes placed in
+unsampled blocks force the fallback, giving the exact census's cells); dropping the
+fallback or the range check fails it. F9477 class I and II with the stored table,
+identical outputs at every 1, 4 and 8 (necromerge2 `temp/peptide_views/census.sh`):
+
+| | builds | searches | wall | fallbacks |
+|---|---:|---:|---:|---:|
+| class I, every block | 12.4 s | 62.3 s | 92.3 s | 0 |
+| class I, every 4th | 9.2 s | 66.0 s | 92.1 s | 0 |
+| class I, every 8th | 8.7 s | 61.0 s | 85.0 s | 1 (light slice) |
+| class II, every block | 104.8 s | 167.5 s | 310.8 s | 0 |
+| class II, every 4th | 74.1 s | 158.7 s | 268.4 s | 0 |
+| class II, every 8th | 74.3 s | 166.6 s | 279.2 s | 0 |
+
+Search times move within run-to-run noise (cell counts differ by a handful), and 8
+gains nothing over 4 on builds while falling back once on class I.
