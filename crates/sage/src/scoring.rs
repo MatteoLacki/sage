@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 thread_local! {
     static WINDOWS_SCRATCH: RefCell<Vec<(f32, Tolerance)>> = RefCell::new(Vec::new());
     static MATCHED_SCRATCH: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+    static RANGES_SCRATCH: RefCell<Vec<(f32, f32)>> = RefCell::new(Vec::new());
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -396,6 +397,10 @@ pub struct Scorer<'db> {
     /// validated invariant by the time `Scorer` ever runs, not something
     /// re-checked per spectrum.
     pub isotope_ladder: bool,
+    /// Merge a spectrum's overlapping fragment windows before the preliminary score, so a
+    /// fragment counts once however many peaks lie within tolerance of it (a peak matching
+    /// two fragments still counts for both). See `docs/ai/merged_fragment_windows.md`.
+    pub merge_fragment_windows: bool,
     pub score_type: ScoreType,
     pub ranking_score: RankingScore,
 
@@ -474,6 +479,54 @@ pub struct Scorer<'db> {
 /// searching fragment ions (1..N)
 /// If user has configured max_fragment_charge, potentially override precursor
 /// charge
+/// Replaces each run of overlapping (or touching) windows by one window covering their union,
+/// leaving windows that overlap nothing as they are; sorts first if the windows are not in
+/// order of their lower bounds. A merged window is `(hi, Da(0, hi - lo))`, whose
+/// `theoretical_range` is exactly `(lo, hi)`: `hi - lo` is exact for bounds within a factor of
+/// two of each other, and then so is `hi - (hi - lo)`.
+fn merge_overlapping_windows(windows: &mut Vec<(f32, Tolerance)>) {
+    RANGES_SCRATCH.with(|ranges| {
+        let mut ranges = ranges.borrow_mut();
+        ranges.clear();
+        ranges.extend(
+            windows
+                .iter()
+                .map(|&(mass, tolerance)| tolerance.theoretical_range(mass)),
+        );
+        if !ranges.is_sorted_by(|a, b| a.0 <= b.0) {
+            let mut order: Vec<usize> = (0..windows.len()).collect();
+            order.sort_by(|&a, &b| ranges[a].0.total_cmp(&ranges[b].0));
+            *windows = order.iter().map(|&i| windows[i]).collect();
+            *ranges = order.iter().map(|&i| ranges[i]).collect();
+        }
+        let mut kept = 0;
+        let mut first = 0;
+        while first < windows.len() {
+            let (lo, mut hi) = ranges[first];
+            let mut end = first + 1;
+            while end < windows.len() && ranges[end].0 <= hi {
+                hi = hi.max(ranges[end].1);
+                end += 1;
+            }
+            windows[kept] = match end - first {
+                1 => windows[first],
+                _ => {
+                    let merged = (hi, Tolerance::Da(0.0, hi - lo));
+                    debug_assert_eq!(
+                        merged.1.theoretical_range(merged.0),
+                        (lo, hi),
+                        "merged window bounds are exact"
+                    );
+                    merged
+                }
+            };
+            kept += 1;
+            first = end;
+        }
+        windows.truncate(kept);
+    });
+}
+
 fn max_fragment_charge(max_fragment_charge: Option<u8>, precursor_charge: u8) -> u8 {
     precursor_charge
         .min(
@@ -628,6 +681,7 @@ impl<'db> Scorer<'db> {
     fn matched_peaks_with_isotope(
         &self,
         query: &ProcessedSpectrum,
+        windows: &[(f32, Tolerance)],
         precursor_mass: f32,
         precursor_charge: u8,
         precursor_tol: Tolerance,
@@ -638,7 +692,6 @@ impl<'db> Scorer<'db> {
             precursor_tol,
         );
 
-        let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
         // Allocate space for all potential candidates - many potential candidates
         let potential = candidates.pre_idx_hi - candidates.pre_idx_lo + 1;
         let mut hits = InitialHits {
@@ -647,56 +700,22 @@ impl<'db> Scorer<'db> {
             preliminary: vec![PreScore::default(); potential],
         };
 
-        // Collect every (mass, fragment_tol) window for this whole
-        // spectrum (every peak x every fragment charge) up front, then
-        // search them in one batched call (`matched_candidates`; with pages,
-        // through `page_search_batch`) -- `page_search_batch` computes
-        // each page's precursor-scoped inner range once and reuses it
-        // across every window landing on that page, instead of redoing
-        // that binary search independently per (peak, charge) the way a
-        // `page_search` call per window did. `windows` is thread-local
-        // scratch, reused across calls, not freshly allocated each time
-        // (same reasoning as `page_search_batch`'s own internal scratch).
-        // See `docs/ai/reuse_index_bins.md`.
-        WINDOWS_SCRATCH.with(|windows| {
-            let mut windows = windows.borrow_mut();
-            windows.clear();
-            for (i, &mass) in query.peaks.masses().iter().enumerate() {
-                // `mass` already has this peak's own charge baked in
-                // (`(mz-PROTON)*z`, see spectrum.rs) whenever deisotoping
-                // resolved a charge for it (`peak_charges[i] != 0` --
-                // `0` is the distinct "no envelope found" sentinel).
-                // Re-multiplying that mass by a further candidate charge
-                // tests a hypothesis already ruled out by the envelope, so
-                // only the unscaled window is meaningful for those peaks.
-                // See docs/ai/fragment_charge_hypothesis.md.
-                match query.peak_charges.get(i) {
-                    Some(&z) if z >= 1 => windows.push((mass, self.fragment_tol)),
-                    _ => {
-                        for charge in 1..max_fragment_charge {
-                            windows.push((mass * charge as f32, self.fragment_tol));
-                        }
-                    }
-                }
-            }
-
-            MATCHED_SCRATCH.with(|matched| {
-                let mut matched = matched.borrow_mut();
-                matched.clear();
-                candidates.matched_candidates(
-                    &windows,
-                    self.compatible_predicted_rt(query),
-                    &mut matched,
-                );
-                let first_row = candidates.candidate_rows().start;
-                hits.add_matches(
-                    &matched,
-                    first_row,
-                    first_row - candidates.pre_idx_lo,
-                    precursor_charge,
-                    isotope_error,
-                );
-            });
+        MATCHED_SCRATCH.with(|matched| {
+            let mut matched = matched.borrow_mut();
+            matched.clear();
+            candidates.matched_candidates(
+                windows,
+                self.compatible_predicted_rt(query),
+                &mut matched,
+            );
+            let first_row = candidates.candidate_rows().start;
+            hits.add_matches(
+                &matched,
+                first_row,
+                first_row - candidates.pre_idx_lo,
+                precursor_charge,
+                isotope_error,
+            );
         });
         if hits.matched_peaks == 0 {
             return hits;
@@ -867,6 +886,38 @@ impl<'db> Scorer<'db> {
         )
     }
 
+    /// Every (mass, fragment_tol) window for this whole spectrum (every peak x every
+    /// fragment charge), merged where they overlap under `merge_fragment_windows`.
+    fn fragment_windows(
+        &self,
+        query: &ProcessedSpectrum,
+        precursor_charge: u8,
+        windows: &mut Vec<(f32, Tolerance)>,
+    ) {
+        let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
+        for (i, &mass) in query.peaks.masses().iter().enumerate() {
+            // `mass` already has this peak's own charge baked in
+            // (`(mz-PROTON)*z`, see spectrum.rs) whenever deisotoping
+            // resolved a charge for it (`peak_charges[i] != 0` --
+            // `0` is the distinct "no envelope found" sentinel).
+            // Re-multiplying that mass by a further candidate charge
+            // tests a hypothesis already ruled out by the envelope, so
+            // only the unscaled window is meaningful for those peaks.
+            // See docs/ai/fragment_charge_hypothesis.md.
+            match query.peak_charges.get(i) {
+                Some(&z) if z >= 1 => windows.push((mass, self.fragment_tol)),
+                _ => {
+                    for charge in 1..max_fragment_charge {
+                        windows.push((mass * charge as f32, self.fragment_tol));
+                    }
+                }
+            }
+        }
+        if self.merge_fragment_windows {
+            merge_overlapping_windows(windows);
+        }
+    }
+
     fn matched_peaks(
         &self,
         query: &ProcessedSpectrum,
@@ -874,29 +925,46 @@ impl<'db> Scorer<'db> {
         precursor_charge: u8,
         precursor_tol: Tolerance,
     ) -> InitialHits {
-        let isotope_errors = self.searched_isotope_errors();
-        if isotope_errors.start() != isotope_errors.end() {
-            let mut hits = isotope_errors.fold(InitialHits::default(), |mut hits, isotope| {
-                hits += self.matched_peaks_with_isotope(
+        // Collect every fragment window once for all isotope errors, then
+        // search them in one batched call per isotope error
+        // (`matched_candidates`; with pages, through `page_search_batch`) --
+        // `page_search_batch` computes each page's precursor-scoped inner
+        // range once and reuses it across every window landing on that page,
+        // instead of redoing that binary search independently per (peak,
+        // charge) the way a `page_search` call per window did. `windows` is
+        // thread-local scratch, reused across calls, not freshly allocated
+        // each time (same reasoning as `page_search_batch`'s own internal
+        // scratch). See `docs/ai/reuse_index_bins.md`.
+        WINDOWS_SCRATCH.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows.clear();
+            self.fragment_windows(query, precursor_charge, &mut windows);
+            let isotope_errors = self.searched_isotope_errors();
+            if isotope_errors.start() != isotope_errors.end() {
+                let mut hits = isotope_errors.fold(InitialHits::default(), |mut hits, isotope| {
+                    hits += self.matched_peaks_with_isotope(
+                        query,
+                        &windows,
+                        precursor_mass,
+                        precursor_charge,
+                        precursor_tol,
+                        isotope,
+                    );
+                    hits
+                });
+                self.trim_hits(&mut hits);
+                hits
+            } else {
+                self.matched_peaks_with_isotope(
                     query,
+                    &windows,
                     precursor_mass,
                     precursor_charge,
                     precursor_tol,
-                    isotope,
-                );
-                hits
-            });
-            self.trim_hits(&mut hits);
-            hits
-        } else {
-            self.matched_peaks_with_isotope(
-                query,
-                precursor_mass,
-                precursor_charge,
-                precursor_tol,
-                *isotope_errors.start(),
-            )
-        }
+                    *isotope_errors.start(),
+                )
+            }
+        })
     }
 
     /// The precursor isotope errors every candidate window is searched at: the
@@ -1796,6 +1864,7 @@ mod tests {
             iim_sigma: None,
             annotate_matches: false,
             isotope_ladder: false,
+            merge_fragment_windows: false,
             score_type: ScoreType::SageHyperScore,
             ranking_score: RankingScore::CombinedScore,
             predicted_fragment_intensity_index: None,
@@ -1993,6 +2062,77 @@ mod tests {
         scorer.observed_isotope_ladder(&PeakColumns::default(), 500.0, 1, 2, &mut ladder);
 
         assert_eq!(ladder, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Every m/z lies in one merged window when it lay in any of the windows, and in no
+    /// more than one; windows that overlapped nothing are kept as they were.
+    #[test]
+    fn merged_windows_hold_each_mz_once() {
+        let tolerance = Tolerance::Ppm(-12.8, 12.0);
+        let mut state = 17u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f32 / (1u64 << 31) as f32
+        };
+        for spectrum in 0..200 {
+            let mut masses: Vec<f32> = (0..60).map(|_| 200.0 + 1500.0 * next()).collect();
+            // Near-duplicate peaks: inside, at and just past one window width.
+            for i in 0..20 {
+                let width = 1e-6 * 25.0 * masses[i];
+                masses.push(masses[i] + width * [0.3, 1.0, 1.01, 2.5][i % 4]);
+            }
+            if spectrum % 2 == 0 {
+                masses.sort_by(f32::total_cmp);
+            }
+            let windows: Vec<(f32, Tolerance)> = masses.iter().map(|&m| (m, tolerance)).collect();
+            let mut merged = windows.clone();
+            merge_overlapping_windows(&mut merged);
+            let ranges = |windows: &[(f32, Tolerance)]| -> Vec<(f32, f32)> {
+                windows
+                    .iter()
+                    .map(|&(mass, tolerance)| tolerance.theoretical_range(mass))
+                    .collect()
+            };
+            let (before, after) = (ranges(&windows), ranges(&merged));
+            assert!(
+                after.windows(2).all(|pair| pair[0].1 < pair[1].0),
+                "disjoint, in order"
+            );
+            let probes = before
+                .iter()
+                .flat_map(|&(lo, hi)| {
+                    [
+                        lo,
+                        hi,
+                        f32::from_bits(lo.to_bits() - 1),
+                        f32::from_bits(hi.to_bits() + 1),
+                    ]
+                })
+                .chain((0..500).map(|_| 199.0 + 1502.0 * next()));
+            for mz in probes {
+                let holding = |ranges: &[(f32, f32)]| {
+                    ranges
+                        .iter()
+                        .filter(|&&(lo, hi)| lo <= mz && mz <= hi)
+                        .count()
+                };
+                assert_eq!(holding(&after), holding(&before).min(1), "m/z {mz}");
+            }
+            for (window, range) in windows.iter().zip(&before) {
+                let overlaps_another = before
+                    .iter()
+                    .filter(|&&(lo, hi)| lo <= range.1 && range.0 <= hi)
+                    .count()
+                    > 1;
+                if !overlaps_another {
+                    assert!(merged
+                        .iter()
+                        .any(|kept| kept.0.to_bits() == window.0.to_bits()));
+                }
+            }
+        }
     }
 
     #[test]

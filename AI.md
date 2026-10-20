@@ -74,6 +74,7 @@ lives in `docs/ai/`, one file per topic:
 | `docs/ai/fragment_charge_hypothesis.md` | Fragment charge-loop vs. resolved (deisotoped) peak charge: why testing extra candidate charges against an already-resolved peak is meaningless, the fix in `matched_peaks_with_isotope`/`remove_matched_peaks`/`score_candidate`, and why it's dormant while every job here pins `max_fragment_charge: 1` |
 | `docs/ai/tolerance_convention.md` | Every `Tolerance` is a window on `observed − theoretical`: `theoretical_range`/`observed_range` instead of `bounds`, the per-site table, mzML isolation-window conversion, the mirrored-window bug it fixed, upstream divergence |
 | `docs/ai/matched_fragment_closest_peak.md` | `closest_fragment_mz_calculated`/`closest_fragment_mz_experimental` in the matched-fragments export: `select_matched_peaks`/`PeakMatch` (one scan, both indices), tie-breaks, same-peak collapse, the charge-hypothesis filter on `closest`, and why raw m/z (not ppm) is stored |
+| `docs/ai/merged_fragment_windows.md` | `merge_fragment_windows`: a spectrum's overlapping fragment windows merged before the prescore so a fragment counts once however many peaks explain it (`merge_overlapping_windows`), exact merged bounds, F9477 effect on prescore, selection and IDs |
 
 Check `summarise/`-style freshness only matters for the top-level monorepo;
 within this vendored fork, treat each `docs/ai/*.md` file as current unless

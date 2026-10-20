@@ -65,6 +65,8 @@ pub struct Search {
     /// monoisotopic root and dropped from the peak array when
     /// `deisotope: true`, leaving nothing for the ladder to observe.
     pub isotope_ladder: bool,
+    /// See [`Input::merge_fragment_windows`].
+    pub merge_fragment_windows: bool,
     /// See [`Input::assume_sorted_peaks`].
     pub assume_sorted_peaks: bool,
     pub chimera: bool,
@@ -135,6 +137,11 @@ pub struct Input {
     /// See [`Search::isotope_ladder`]. Default `false`. Requires
     /// `deisotope: false` -- errors in `build()` otherwise.
     pub isotope_ladder: Option<bool>,
+    /// If `true`, a spectrum's overlapping fragment windows (peaks closer than the fragment
+    /// tolerance) are merged before the preliminary score, so a fragment counts once however
+    /// many peaks lie within tolerance of it. Default `false`: every (peak, fragment) pair
+    /// counts, as in sage.
+    pub merge_fragment_windows: Option<bool>,
     /// If `true`, trust that each `RawSpectrum`'s peaks already arrive
     /// ascending by m/z (as produced by the upstream parser) and skip
     /// `SpectrumProcessor::process`'s own mass-ascending sort, replacing it
@@ -780,6 +787,7 @@ impl Input {
             isotope_errors: self.isotope_errors.unwrap_or((0, 0)),
             deisotope: self.deisotope.unwrap_or(true),
             isotope_ladder: self.isotope_ladder.unwrap_or(false),
+            merge_fragment_windows: self.merge_fragment_windows.unwrap_or(false),
             assume_sorted_peaks: self.assume_sorted_peaks.unwrap_or(false),
             chimera: self.chimera.unwrap_or(false),
             wide_window: self.wide_window.unwrap_or(false),

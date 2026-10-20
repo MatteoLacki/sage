@@ -493,6 +493,7 @@ impl Runner {
                     iim_sigma: self.parameters.iim_sigma,
                     annotate_matches: self.parameters.annotate_matches,
                     isotope_ladder: self.parameters.isotope_ladder,
+                    merge_fragment_windows: self.parameters.merge_fragment_windows,
                     score_type: self.parameters.score_type,
                     ranking_score: self.parameters.ranking_score,
                     // Feature-only, never needed for prefiltering (see
@@ -1089,6 +1090,7 @@ impl Runner {
             iim_sigma: self.parameters.iim_sigma,
             annotate_matches: self.parameters.annotate_matches,
             isotope_ladder: self.parameters.isotope_ladder,
+            merge_fragment_windows: self.parameters.merge_fragment_windows,
             score_type: self.parameters.score_type,
             ranking_score: self.parameters.ranking_score,
             predicted_fragment_intensity_index: predictions.fragment_intensity_index.as_ref().map(

@@ -141,6 +141,7 @@ fn mk_scorer(db: &IndexedDatabase, precursor_tol: Tolerance) -> Scorer<'_> {
         iim_sigma: None,
         annotate_matches: false,
         isotope_ladder: false,
+        merge_fragment_windows: false,
         score_type: ScoreType::SageHyperScore,
         ranking_score: RankingScore::CombinedScore,
         predicted_fragment_intensity_index: None,
