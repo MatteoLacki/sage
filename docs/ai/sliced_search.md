@@ -6,10 +6,24 @@ Stage 2 of `plans/sliced_search.md` (necromerge2 root). With `database.sliced: t
 one slice of that table at a time. An unspecific human class I digest needs 42 GB as a
 monolithic index; sliced, it fits in a few GB (`database_size.md`).
 
-`input.rs` rejects two combinations:
-- **`sliced` with `prefilter`:** another way of bounding memory; they don't compose.
-- **`sliced` with `wide_window`:** each slice is extended by the widest candidate
-  window, which `wide_window` makes as wide as the isolation window.
+Since 2026-10-21 the sliced search is the default (`Input::build`): `database.sliced`
+unset means sliced unless one of three monolithic-only options is set, and `sliced: true`
+with any of them is rejected:
+- **`prefilter`:** another way of bounding memory; they don't compose, and sliced is the
+  exact one (prefilter's first pass ranks candidates within protein chunks).
+- **`wide_window`:** each slice is extended by the widest candidate window, which
+  `wide_window` makes as wide as the isolation window, and every charge of a spectrum is
+  pooled into one candidate list, which sliced splits per charge.
+- **`chimera`:** each further PSM is found after removing the previous PSM's peaks, so
+  the result depends on search order; sliced runs that loop per charge. Not supported on
+  purpose: deconvolving co-isolated peptides (NNLS or similar) is the better route.
+
+Measured on the F9477 best job (tryptic, one slice, same binary, 2026-10-21; necromerge2
+`temp/peptide_views/sliced_best/`): peak anonymous memory 6.75 GB monolithic, 3.84 GB
+sliced; wall 149.4 s monolithic pages, 161.4 s sliced pages, 106.4 s sliced grid (the
+grid makes the speed, slicing the memory). SAGE 1% spectra / peptidoforms / ions
+95,216 / 21,046 / 23,031 monolithic, 95,262 / 21,135 / 22,975 sliced; mokapot 122,144 /
+28,884 / 31,680 and 119,471 / 28,661 / 31,343 (per-charge trims, see below).
 
 ## Why a slice gives the same answer as the whole index
 

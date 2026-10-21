@@ -587,7 +587,26 @@ impl Input {
     }
 
     pub fn build(mut self) -> anyhow::Result<Search> {
-        let database = self.database.make_parameters();
+        let sliced = self.database.sliced;
+        let mut database = self.database.make_parameters();
+        let monolithic_only: Vec<&str> = [
+            ("database.prefilter", database.prefilter),
+            ("wide_window", self.wide_window.unwrap_or(false)),
+            ("chimera", self.chimera.unwrap_or(false)),
+        ]
+        .into_iter()
+        .filter_map(|(option, set)| set.then_some(option))
+        .collect();
+        match sliced {
+            Some(true) if !monolithic_only.is_empty() => anyhow::bail!(
+                "`database.sliced` cannot be combined with {}: the sliced search needs narrow \
+                 precursor windows, bounds memory itself, and scores every precursor charge \
+                 as its own query -- set `database.sliced: false`, or remove them.",
+                monolithic_only.join(", ")
+            ),
+            Some(_) => {}
+            None => database.sliced = monolithic_only.is_empty(),
+        }
 
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
@@ -628,18 +647,6 @@ impl Input {
         if self.compact_peptides.is_some() && !database.sliced {
             anyhow::bail!(
                 "`compact_peptides` is read by the sliced search only -- set `database.sliced: true`."
-            );
-        }
-        if database.sliced && database.prefilter {
-            anyhow::bail!(
-                "`database.sliced` and `database.prefilter` both bound the database's memory, \
-                 in incompatible ways -- set only one."
-            );
-        }
-        if database.sliced && self.wide_window.unwrap_or(false) {
-            anyhow::bail!(
-                "`database.sliced` needs narrow precursor windows: each slice is extended by \
-                 the widest window, which `wide_window` makes as wide as the isolation window."
             );
         }
         if self.unlimited_max_peaks.unwrap_or(false) && self.max_peaks.is_some() {
@@ -932,6 +939,36 @@ mod test {
             err.to_string().contains("predicted_rt") && err.to_string().contains("rt_tol_sec"),
             "expected error naming `predicted_rt` and `rt_tol_sec`, got: {err}"
         );
+    }
+
+    #[test]
+    fn sliced_is_the_default_unless_a_monolithic_only_option_is_set() {
+        let search = |set: &[(&str, bool)], sliced: Option<bool>| {
+            let mut json = mk_input_json();
+            for &(option, value) in set {
+                match option {
+                    "prefilter" => json["database"]["prefilter"] = serde_json::json!(value),
+                    _ => json[option] = serde_json::json!(value),
+                }
+            }
+            if let Some(sliced) = sliced {
+                json["database"]["sliced"] = serde_json::json!(sliced);
+            }
+            let input: Input = serde_json::from_value(json).unwrap();
+            input.build()
+        };
+        assert!(search(&[], None).unwrap().database.sliced);
+        assert!(!search(&[], Some(false)).unwrap().database.sliced);
+        for option in ["prefilter", "wide_window", "chimera"] {
+            assert!(!search(&[(option, true)], None).unwrap().database.sliced, "{option}");
+            assert!(search(&[(option, false)], None).unwrap().database.sliced, "{option}");
+            assert!(!search(&[(option, true)], Some(false)).unwrap().database.sliced);
+            let err = match search(&[(option, true)], Some(true)) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("sliced with {option} should error"),
+            };
+            assert!(err.contains("database.sliced") && err.contains(option), "{err}");
+        }
     }
 
     #[test]

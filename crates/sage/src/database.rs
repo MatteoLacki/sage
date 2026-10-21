@@ -97,7 +97,8 @@ pub struct Builder {
     /// Pre-filter the database with a minimal amount of memory at the cost of speed
     pub prefilter_low_memory: Option<bool>,
     /// Hold the peptides as a `CompactPeptides` table and build/search the fragment
-    /// index one precursor-mass slice at a time
+    /// index one precursor-mass slice at a time. Defaults to false here; `sage-cli`
+    /// defaults it to true unless `prefilter`, `wide_window` or `chimera` is set.
     pub sliced: Option<bool>,
 }
 
