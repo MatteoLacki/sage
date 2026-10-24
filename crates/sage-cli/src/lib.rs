@@ -1,5 +1,7 @@
 pub mod indexed_spectra;
 pub mod input;
+#[cfg(target_os = "linux")]
+pub mod native_prosit;
 pub mod output;
 pub mod process_cpu;
 pub mod process_memory;

@@ -16,6 +16,8 @@ pub mod peptide;
 pub mod peptide_view;
 pub mod predicted;
 pub mod protein_grouping;
+pub mod prosit;
+pub mod intensity_codec;
 pub mod scoring;
 pub mod slicing;
 pub mod spectrum;

@@ -25,6 +25,7 @@ use std::path::Path;
 
 use half::f16;
 use memmap2::Mmap;
+use sage_core::intensity_codec::{FragmentIntensities, SQRT8_BASEPEAK};
 
 use crate::predicted_properties::{read_fingerprint, MappedColumn, PredictedPropertiesError};
 
@@ -40,6 +41,10 @@ pub enum FragmentIntensityCacheError {
     WrongDtype(&'static str, String, &'static str),
     #[error("{0}: `start` and `end` differ in length")]
     UnequalColumns(String),
+    #[error("invalid fragment intensity format: {0}")]
+    InvalidFormat(String),
+    #[error("invalid fragment intensity metadata: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// The job-scoped, dense `(peptide_row, charge)` pointer index, mapped -- see
@@ -113,6 +118,9 @@ unsafe fn mmap_as_slice<T: Copy>(
     path: &Path,
 ) -> Result<(Mmap, &'static [T]), FragmentIntensityCacheError> {
     let file = File::open(path)?;
+    if file.metadata()?.len() % std::mem::size_of::<T>() as u64 != 0 {
+        return Err(FragmentIntensityCacheError::InvalidFormat(format!("{} has a partial element", path.display())));
+    }
     let mmap = Mmap::map(&file)?;
     let n = mmap.len() / std::mem::size_of::<T>();
     let ptr = mmap.as_ptr() as *const T;
@@ -121,7 +129,8 @@ unsafe fn mmap_as_slice<T: Copy>(
 }
 
 /// The shared, ever-growing `arrays.mmappet` dataset -- two flat mmapped
-/// columns (`annotation_id`: uint8, `predicted_intensity`: float16),
+/// columns (`annotation_id`: uint8, `predicted_intensity`: legacy float16 or
+/// explicitly declared `sqrt8_basepeak_v1` uint8),
 /// addressed by the `(start, end)` ranges the pointer index above resolves.
 /// Kept as one owned struct (not just two bare slices) so `Runner` can hold
 /// it for the lifetime of a run and hand `&'db` slices to `Scorer`.
@@ -130,7 +139,7 @@ pub struct FragmentIntensityArrays {
     _annotation_id_mmap: Mmap,
     _intensity_mmap: Mmap,
     pub annotation_id: &'static [u8],
-    pub predicted_intensity: &'static [f16],
+    pub predicted_intensity: FragmentIntensities<'static>,
 }
 
 impl FragmentIntensityArrays {
@@ -139,14 +148,40 @@ impl FragmentIntensityArrays {
     /// touches that cache's `index.sqlite3`/`write.lock`, only its arrays).
     pub fn open(dir: &Path) -> Result<Self, FragmentIntensityCacheError> {
         let schema = read_mmappet_schema(dir)?;
-        let i_intensity = mmappet_column_index(&schema, "predicted_intensity", "float16")?;
+        let metadata_path = dir.join("meta.json");
+        let metadata: serde_json::Value = if metadata_path.exists() {
+            serde_json::from_slice(&std::fs::read(&metadata_path)?)?
+        } else { serde_json::Value::Null };
+        let encoding = metadata.get("intensity_encoding").and_then(|v| v.as_str()).unwrap_or("fp16");
+        let sqrt8 = match encoding {
+            "fp16" => false,
+            SQRT8_BASEPEAK => {
+                if metadata.get("version").and_then(|v| v.as_u64()) != Some(2)
+                    || metadata.get("normalization").and_then(|v| v.as_str()) != Some("per_spectrum_base_peak")
+                    || metadata.get("rounding").and_then(|v| v.as_str()) != Some("nearest_even") {
+                    return Err(FragmentIntensityCacheError::InvalidFormat("sqrt8 requires version 2, base-peak normalization and nearest-even rounding metadata".into()));
+                }
+                true
+            }
+            other => return Err(FragmentIntensityCacheError::InvalidFormat(format!("unknown intensity encoding {other}"))),
+        };
+        let dtype = if sqrt8 { "uint8" } else { "float16" };
+        let i_intensity = mmappet_column_index(&schema, "predicted_intensity", dtype)?;
         let i_annotation = mmappet_column_index(&schema, "annotation_id", "uint8")?;
 
         // SAFETY: dtypes checked against schema.txt above.
         let (annotation_id_mmap, annotation_id) =
             unsafe { mmap_as_slice::<u8>(&dir.join(format!("{i_annotation}.bin")))? };
-        let (intensity_mmap, predicted_intensity) =
-            unsafe { mmap_as_slice::<f16>(&dir.join(format!("{i_intensity}.bin")))? };
+        let (intensity_mmap, predicted_intensity) = if sqrt8 {
+            let (map, codes) = unsafe { mmap_as_slice::<u8>(&dir.join(format!("{i_intensity}.bin")))? };
+            (map, FragmentIntensities::Sqrt8Basepeak(codes))
+        } else {
+            let (map, values) = unsafe { mmap_as_slice::<f16>(&dir.join(format!("{i_intensity}.bin")))? };
+            (map, FragmentIntensities::Fp16(values))
+        };
+        if annotation_id.len() != predicted_intensity.len() {
+            return Err(FragmentIntensityCacheError::InvalidFormat("intensities and annotation IDs differ in length".into()));
+        }
 
         Ok(Self {
             _annotation_id_mmap: annotation_id_mmap,
@@ -198,7 +233,7 @@ mod tests {
         let arrays = FragmentIntensityArrays::open(&dir).unwrap();
         assert_eq!(arrays.annotation_id, &annotation_id);
         assert_eq!(arrays.predicted_intensity.len(), 3);
-        assert!((arrays.predicted_intensity[1].to_f32() - 0.5).abs() < 1e-3);
+        assert!((arrays.predicted_intensity.value(1) - 0.5).abs() < 1e-3);
     }
 
     #[test]
@@ -211,5 +246,26 @@ mod tests {
 
         let err = FragmentIntensityArrays::open(&dir).unwrap_err();
         assert!(matches!(err, FragmentIntensityCacheError::WrongDtype(..)));
+    }
+
+    #[test]
+    fn sqrt8_requires_explicit_metadata_and_matching_columns() {
+        let dir = temp_dir("sqrt8");
+        std::fs::write(dir.join("schema.txt"), "uint8 predicted_intensity\nuint8 annotation_id\n").unwrap();
+        std::fs::write(dir.join("0.bin"), [0, 128, 255]).unwrap();
+        std::fs::write(dir.join("1.bin"), [0, 90, 173]).unwrap();
+        assert!(FragmentIntensityArrays::open(&dir).is_err());
+        std::fs::write(dir.join("meta.json"), r#"{"version":2,"intensity_encoding":"sqrt8_scaled_v1","normalization":"per_spectrum_base_peak","rounding":"nearest_even"}"#).unwrap();
+        assert!(FragmentIntensityArrays::open(&dir).is_err());
+        std::fs::write(dir.join("meta.json"), r#"{"version":2,"intensity_encoding":"sqrt8_basepeak_v1","normalization":"per_spectrum_base_peak","rounding":"nearest_even"}"#).unwrap();
+        {
+            let arrays = FragmentIntensityArrays::open(&dir).unwrap();
+            assert_eq!(arrays.predicted_intensity.codes().unwrap(), [0, 128, 255]);
+            assert_eq!(arrays.predicted_intensity.value(0), 0.0);
+            assert_eq!(arrays.predicted_intensity.value(2), 1.0);
+        }
+        std::fs::write(dir.join("1.bin"), [0, 90]).unwrap();
+        assert!(FragmentIntensityArrays::open(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
