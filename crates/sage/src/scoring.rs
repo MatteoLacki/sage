@@ -1,5 +1,6 @@
 use crate::database::{IndexedDatabase, IndexedQuery, PeptideIx, PeptideRef};
 use crate::heap::bounded_min_heapify;
+use crate::intensity_codec::FragmentIntensities;
 use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
@@ -8,6 +9,7 @@ use crate::predicted::{PredictedRanges, PredictedValues};
 #[cfg(test)]
 use crate::spectrum::Peak;
 use crate::spectrum::{PeakColumns, Precursor, ProcessedSpectrum};
+#[cfg(test)]
 use half::f16;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -468,10 +470,11 @@ pub struct Scorer<'db> {
     /// `ms2_similarity::fragment_annotation_id`), sliced per candidate via
     /// `predicted_fragment_intensity_index`'s `(start, end)`.
     pub predicted_fragment_intensity_annotation_id: Option<&'db [u8]>,
-    /// The shared `arrays.mmappet` predicted-intensity column (native FP16
-    /// from Prosit `compact_trt`), parallel to
+    /// The shared `arrays.mmappet` predicted-intensity column (FP16 or
+    /// normalized sqrt8), parallel to
     /// `predicted_fragment_intensity_annotation_id`.
-    pub predicted_fragment_intensity: Option<&'db [f16]>,
+    // Decoding is local to the requested spectrum; encoded libraries stay mapped.
+    pub predicted_fragment_intensity: Option<FragmentIntensities<'db>>,
 }
 
 #[inline(always)]
@@ -1358,7 +1361,7 @@ impl<'db> Scorer<'db> {
         for i in start..end {
             let slot = annotation_id[i] as usize;
             if slot < N_FRAGMENT_SLOTS {
-                dense[slot] = intensity[i].to_f32();
+                dense[slot] = intensity.value(i);
             }
         }
         (true, dense)
@@ -1921,7 +1924,7 @@ mod tests {
             scorer.max_fragment_charge = Some(1);
             scorer.predicted_fragment_intensity_index = Some(PredictedRanges::new(&starts, &ends));
             scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
-            scorer.predicted_fragment_intensity = Some(&intensities);
+            scorer.predicted_fragment_intensity = Some(FragmentIntensities::Fp16(&intensities));
             let (score, fragments) = scorer.score_candidate(
                 &query,
                 &PreScore {
@@ -1951,6 +1954,31 @@ mod tests {
             assert!((score.ms2_entropy_similarity - 1.0).abs() < 1e-6);
             assert!((score.ms2_pearson_corr - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn sqrt8_dense_predictions_preserve_missing_rows_and_sliced_offsets() {
+        let database = IndexedDatabase::default();
+        let mut scorer = mk_isotope_test_scorer(&database);
+        let starts = [0, -1, 3];
+        let ends = [3, -1, 5];
+        let annotations = [0, 90, 173, 1, 89];
+        let codes = [255, 128, 0, 0, 255];
+        let ranges = PredictedRanges::new(&starts, &ends);
+        scorer.predicted_fragment_intensity_index = Some(ranges);
+        scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
+        scorer.predicted_fragment_intensity = Some(FragmentIntensities::Sqrt8Basepeak(&codes));
+        let (found, dense) = scorer.build_predicted_dense(0, 1);
+        assert!(found);
+        assert_eq!(dense[0], 1.0);
+        assert!((dense[90] - 0.25).abs() < 0.002);
+        assert_eq!(dense[173], 0.0);
+        assert!(!scorer.build_predicted_dense(1, 1).0);
+        let last = scorer.build_predicted_dense(2, 1);
+        scorer.predicted_fragment_intensity_index = Some(ranges.slice(2..3));
+        assert_eq!(scorer.build_predicted_dense(0, 1), last);
+        assert_eq!(last.1[89], 1.0);
+        assert_eq!(last.1[1], 0.0);
     }
 
     #[test]
