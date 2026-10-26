@@ -131,6 +131,23 @@ fn resolve_predicted_iim(
     Ok(values.clone())
 }
 
+/// Checks that the per-charge prediction file at `path` (`--predicted-iim`,
+/// `--predicted-fragment-intensity-index`) covers exactly this search's
+/// `precursor_charge`. Its slot `row * charge_span + charge - min_charge` means the
+/// same charge here only when both ranges are equal; the length check in `resolve_*`
+/// can't tell, since e.g. 2..=4 and 1..=3 both span three charges.
+fn verify_prediction_charge_range(path: &str, (min_charge, max_charge): (u8, u8)) -> anyhow::Result<()> {
+    let (file_min_charge, file_max_charge) =
+        sage_cloudpath::predicted_properties::read_charge_range(std::path::Path::new(path))?;
+    anyhow::ensure!(
+        (file_min_charge, file_max_charge) == (min_charge, max_charge),
+        "`{path}` was predicted for precursor charges {file_min_charge}..={file_max_charge}, \
+         but this search's precursor_charge is {min_charge}..={max_charge} -- regenerate it \
+         over the search's range"
+    );
+    Ok(())
+}
+
 /// Same shape as `resolve_predicted_iim`, for the fragment-intensity pointer index
 /// (`(peptide_row, charge) -> (start, end)`, start `-1` where the shared cache has no
 /// entry for that pair -- see `docs/ai/predicted_fragment_intensity.md`).
@@ -288,6 +305,7 @@ impl Runner {
                     std::path::Path::new(path),
                 )
                 .with_context(|| format!("Failed to read predicted IIM from `{path}`"))?;
+                verify_prediction_charge_range(path, parameters.precursor_charge)?;
                 info!(
                     "mapped {} predicted iim rows (positional, dense over peptide x charge)",
                     map.1.len()
@@ -305,6 +323,7 @@ impl Runner {
                 .with_context(|| {
                     format!("Failed to read predicted fragment-intensity index from `{path}`")
                 })?;
+                verify_prediction_charge_range(path, parameters.precursor_charge)?;
                 info!(
                     "mapped {} predicted fragment-intensity index rows (positional, dense over peptide x charge)",
                     map.1.start.len()

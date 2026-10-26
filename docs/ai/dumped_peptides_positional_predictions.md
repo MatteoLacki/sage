@@ -67,6 +67,16 @@ Row count is checked too (`values.len()` against `db.peptides.len()` or
 `db.peptides.len() * charge_span`), catching a mismatch before the
 fingerprint pass even needs to run.
 
+The per-charge files (`--predicted-iim`, `--predicted-fragment-intensity-index`)
+also carry `min_charge`/`max_charge` in their `meta.json` (`write_positional`'s
+`charge_range`; `predict_prosit` writes the same keys), and `Runner::new` requires
+them to equal the search's `precursor_charge` (`verify_prediction_charge_range`,
+2026-10-26). The length check alone passed a file predicted for 2..=4 in a 1..=3
+search (both span three charges), so every slot read the next charge's prediction;
+the pipeline can produce that mismatch because IIM takes `[recalibration.iim]`'s
+`min_charge`/`max_charge` when set. Files without the keys are refused, so ones
+written before this change must be regenerated.
+
 ## Known limitation: chunked prefiltering
 
 `prefilter_peptides`'s per-fasta-chunk digest is a strict subset of any

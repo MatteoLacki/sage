@@ -14,7 +14,8 @@
 //! `meta.json` sidecar carrying `dumped_peptides_sha256` (see
 //! `dumped_peptides_fingerprint`) -- the caller (`sage-cli`'s `Runner`) must
 //! check it against the current run's own digest before trusting these
-//! positions.
+//! positions. A per-charge file's `meta.json` also carries the `min_charge`/
+//! `max_charge` its slots cover (`read_charge_range`).
 
 use memmap2::Mmap;
 use std::marker::PhantomData;
@@ -35,6 +36,8 @@ pub enum PredictedPropertiesError {
     BadLength(String, &'static str, &'static str),
     #[error("{0} is missing `dumped_peptides_sha256` in its meta.json -- regenerate it with a current `feature-prediction` build")]
     MissingFingerprint(String),
+    #[error("{0} is missing `min_charge`/`max_charge` in its meta.json -- regenerate it with a current `feature-prediction` or `predict_prosit` build")]
+    MissingChargeRange(String),
 }
 
 /// Element types a mapped column can hold, by their numpy dtype name.
@@ -122,6 +125,21 @@ pub fn read_fingerprint(dir: &Path) -> Result<String, PredictedPropertiesError> 
         .ok_or_else(|| PredictedPropertiesError::MissingFingerprint(dir.display().to_string()))
 }
 
+/// The `(min_charge, max_charge)` in `dir/meta.json`: the precursor charges the slots
+/// of a per-charge file (dense over `(peptide_row, charge)`) cover.
+pub fn read_charge_range(dir: &Path) -> Result<(u8, u8), PredictedPropertiesError> {
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    match (meta_charge(&meta, "min_charge"), meta_charge(&meta, "max_charge")) {
+        (Some(min_charge), Some(max_charge)) => Ok((min_charge, max_charge)),
+        _ => Err(PredictedPropertiesError::MissingChargeRange(dir.display().to_string())),
+    }
+}
+
+fn meta_charge(meta: &serde_json::Value, key: &str) -> Option<u8> {
+    let charge = meta.get(key)?.as_u64()?;
+    u8::try_from(charge).ok()
+}
+
 /// Column `rt` (float64, minutes), one row per `dumped_peptides` row, in that same
 /// order. Returns the `dumped_peptides` fingerprint alongside the mapped values.
 pub fn read_predicted_rt(
@@ -197,5 +215,21 @@ mod tests {
             read_predicted_rt(&dir),
             Err(PredictedPropertiesError::MissingFingerprint(..))
         ));
+    }
+
+    #[test]
+    fn reads_charge_range_and_rejects_its_absence() {
+        let dir = temp_dir("charges");
+        write_rt(&dir, "float64", &[1.0]);
+        assert!(matches!(
+            read_charge_range(&dir),
+            Err(PredictedPropertiesError::MissingChargeRange(..))
+        ));
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"dumped_peptides_sha256": "abc", "min_charge": 2, "max_charge": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(read_charge_range(&dir).unwrap(), (2, 4));
     }
 }
