@@ -413,6 +413,19 @@ byte-for-byte identical before and after, confirming they were never
 exposed. Runtime: 423s (vs. 412s before this fix -- +2.7%, within
 run-to-run noise for this machine).
 
+## Input is a SPECLIB, its encoding declared (2026-10-26)
+
+The two flags now always take a SPECLIB's `index.mmappet` and `arrays.mmappet`
+(necromerge2 `plans/speclib_only.md`): the pipeline no longer exports a pointer index
+into the shared fragment cache; `git/featureprediction`'s
+`feature-prediction-make-speclib` converts a filled cache into a SPECLIB, and
+`predict_prosit` writes them on the prediction server. `FragmentIntensityArrays::open`
+used to read an arrays directory without `meta.json`, or without `intensity_encoding`,
+as float16 (the raw cache). It now requires `intensity_encoding`: `fp16` (float16
+values) or `sqrt8_basepeak_v1` (uint8 codes, version 2, base-peak normalization,
+nearest-even rounding); anything else, or nothing, is `InvalidFormat` telling the user
+to regenerate the file as a SPECLIB. Both encodings stay readable.
+
 ## Explicitly out of scope here
 
 - The `getWeights`/`freqs`-dependent `weighted*` variants (see above) —

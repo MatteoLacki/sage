@@ -1,17 +1,17 @@
-//! Reader for `git/featureprediction`'s fragment-intensity `PredictionCache`
+//! Reader for a SPECLIB's predicted fragment intensities, as written by
+//! `git/featureprediction`'s `feature-prediction-make-speclib` or `predict_prosit`
 //! (see `necromerge2`'s `docs/ai/predicted_fragment_intensity.md`).
 //!
 //! Two separate inputs, given as explicit paths:
-//!   - a small, job-scoped pointer index, positional not `sequence`-keyed
+//!   - the pointer index (`index.mmappet`), positional not `sequence`-keyed
 //!     since 2026-09-08 (see `docs/ai/dumped_peptides_positional_predictions.md`):
-//!     an mmappet dataset with `start`/`end` (int64, sentinel -1 for "no cache
-//!     entry") -- half-open row range into the shared arrays below, dense over
+//!     an mmappet dataset with `start`/`end` (int64, sentinel -1 for "no
+//!     prediction") -- half-open row range into the arrays below, dense over
 //!     `(peptide_row, charge)` in the same layout `Scorer::iim_dense_slot`
-//!     uses -- mapped in place. Produced by
-//!     `feature-prediction-export-fragments-for-sage`. Its `meta.json` carries a
+//!     uses -- mapped in place. Its `meta.json` carries a
 //!     `dumped_peptides_sha256` the caller must check (see
 //!     `dumped_peptides_fingerprint`).
-//!   - the shared, ever-growing `arrays.mmappet/` directory (schema.txt +
+//!   - the `arrays.mmappet/` directory (schema.txt +
 //!     `0.bin`/`1.bin`, same on-disk format `pmsms.rs` reads for
 //!     `pmsms.mmappet`/precursors `.mmappet` -- schema/mmap-slice helpers
 //!     are duplicated here, not shared with `pmsms.rs`, since that module's
@@ -129,8 +129,8 @@ unsafe fn mmap_as_slice<T: Copy>(
 }
 
 /// The shared, ever-growing `arrays.mmappet` dataset -- two flat mmapped
-/// columns (`annotation_id`: uint8, `predicted_intensity`: legacy float16 or
-/// explicitly declared `sqrt8_basepeak_v1` uint8),
+/// columns (`annotation_id`: uint8, `predicted_intensity`: float16 or uint8, as
+/// its `meta.json`'s `intensity_encoding` declares: `fp16` or `sqrt8_basepeak_v1`),
 /// addressed by the `(start, end)` ranges the pointer index above resolves.
 /// Kept as one owned struct (not just two bare slices) so `Runner` can hold
 /// it for the lifetime of a run and hand `&'db` slices to `Scorer`.
@@ -143,16 +143,22 @@ pub struct FragmentIntensityArrays {
 }
 
 impl FragmentIntensityArrays {
-    /// `dir` is the `arrays.mmappet` directory itself (a subdirectory of
-    /// `git/featureprediction`'s `PredictionCache` -- this reader never
-    /// touches that cache's `index.sqlite3`/`write.lock`, only its arrays).
+    /// `dir` is the SPECLIB's `arrays.mmappet` directory itself.
     pub fn open(dir: &Path) -> Result<Self, FragmentIntensityCacheError> {
         let schema = read_mmappet_schema(dir)?;
         let metadata_path = dir.join("meta.json");
-        let metadata: serde_json::Value = if metadata_path.exists() {
-            serde_json::from_slice(&std::fs::read(&metadata_path)?)?
-        } else { serde_json::Value::Null };
-        let encoding = metadata.get("intensity_encoding").and_then(|v| v.as_str()).unwrap_or("fp16");
+        let undeclared = || {
+            FragmentIntensityCacheError::InvalidFormat(format!(
+                "{} declares no `intensity_encoding` in its meta.json -- regenerate it as a \
+                 SPECLIB with `feature-prediction-make-speclib` or `predict_prosit`",
+                dir.display()
+            ))
+        };
+        if !metadata_path.exists() {
+            return Err(undeclared());
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+        let encoding = metadata.get("intensity_encoding").and_then(|v| v.as_str()).ok_or_else(undeclared)?;
         let sqrt8 = match encoding {
             "fp16" => false,
             SQRT8_BASEPEAK => {
@@ -215,6 +221,7 @@ mod tests {
     fn write_dataset(dir: &Path, annotation_id: &[u8], intensity: &[f16]) {
         std::fs::write(dir.join("schema.txt"), "float16 predicted_intensity\nuint8 annotation_id\n")
             .unwrap();
+        std::fs::write(dir.join("meta.json"), r#"{"intensity_encoding":"fp16"}"#).unwrap();
         let mut f0 = File::create(dir.join("0.bin")).unwrap();
         for v in intensity {
             f0.write_all(&v.to_le_bytes()).unwrap();
@@ -241,11 +248,26 @@ mod tests {
         let dir = temp_dir("wrong_dtype");
         std::fs::write(dir.join("schema.txt"), "float32 predicted_intensity\nuint8 annotation_id\n")
             .unwrap();
+        std::fs::write(dir.join("meta.json"), r#"{"intensity_encoding":"fp16"}"#).unwrap();
         std::fs::write(dir.join("0.bin"), []).unwrap();
         std::fs::write(dir.join("1.bin"), []).unwrap();
 
         let err = FragmentIntensityArrays::open(&dir).unwrap_err();
         assert!(matches!(err, FragmentIntensityCacheError::WrongDtype(..)));
+    }
+
+    #[test]
+    fn requires_a_declared_intensity_encoding() {
+        let dir = temp_dir("undeclared");
+        write_dataset(&dir, &[3u8], &[f16::from_f32(1.0)]);
+        std::fs::remove_file(dir.join("meta.json")).unwrap();
+        let err = FragmentIntensityArrays::open(&dir).unwrap_err();
+        assert!(err.to_string().contains("declares no `intensity_encoding`"), "{err}");
+
+        std::fs::write(dir.join("meta.json"), r#"{"version":1}"#).unwrap();
+        let err = FragmentIntensityArrays::open(&dir).unwrap_err();
+        assert!(err.to_string().contains("declares no `intensity_encoding`"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
