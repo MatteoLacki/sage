@@ -31,21 +31,22 @@ impl<'a> PredictedValues<'a> {
     }
 }
 
-/// How a SPECLIB numbers its (peptide row, precursor charge) slots: its manifest's
-/// `slot_order`.
+/// Where a SPECLIB part keeps the value of (peptide row, precursor charge): its
+/// `meta.json`'s `position_of_row_and_charge` equation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotOrder {
-    /// `charge_major_v1`: slot = (charge − min_charge) · rows + row.
     ChargeMajor,
-    /// `row_major_v1`: slot = row · charge_span + (charge − min_charge).
     RowMajor,
 }
 
 impl SlotOrder {
-    pub fn from_token(token: &str) -> Option<Self> {
-        match token {
-            "charge_major_v1" => Some(Self::ChargeMajor),
-            "row_major_v1" => Some(Self::RowMajor),
+    pub const CHARGE_MAJOR: &'static str = "(charge - min_charge) * row_count + row";
+    pub const ROW_MAJOR: &'static str = "row * (max_charge - min_charge + 1) + (charge - min_charge)";
+
+    pub fn from_equation(equation: &str) -> Option<Self> {
+        match equation {
+            Self::CHARGE_MAJOR => Some(Self::ChargeMajor),
+            Self::ROW_MAJOR => Some(Self::RowMajor),
             _ => None,
         }
     }
@@ -176,10 +177,16 @@ mod tests {
     }
 
     #[test]
-    fn tokens() {
-        assert_eq!(SlotOrder::from_token("charge_major_v1"), Some(SlotOrder::ChargeMajor));
-        assert_eq!(SlotOrder::from_token("row_major_v1"), Some(SlotOrder::RowMajor));
-        assert_eq!(SlotOrder::from_token("peptide_row * charge_span + charge - min_charge"), None);
+    fn equations() {
+        assert_eq!(
+            SlotOrder::from_equation("(charge - min_charge) * row_count + row"),
+            Some(SlotOrder::ChargeMajor)
+        );
+        assert_eq!(
+            SlotOrder::from_equation("row * (max_charge - min_charge + 1) + (charge - min_charge)"),
+            Some(SlotOrder::RowMajor)
+        );
+        assert_eq!(SlotOrder::from_equation("charge_major_v1"), None);
     }
 
     #[test]

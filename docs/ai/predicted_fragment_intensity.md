@@ -450,6 +450,13 @@ readers refuse anything but `format` `speclib`, `format_version` 3
 - `predict_prosit` still writes format 2; its two output-checking tests are ignored until
   it moves (`plans/speclib_server_handoff.md`).
 
+## Format 4 (2026-10-28)
+
+Each part's `meta.json` states equations instead of tokens: the slot order is
+`position_of_row_and_charge`, the index layout `fragments_at_position`, the encoding
+`predicted_intensity` (`SlotOrder::from_equation`, `fragment_intensity_cache.rs`); SAGE reads
+only the equations it implements. necromerge2 `plans/speclib_store.md`.
+
 ## Explicitly out of scope here
 
 - The `getWeights`/`freqs`-dependent `weighted*` variants (see above) —

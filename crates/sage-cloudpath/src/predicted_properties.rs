@@ -38,12 +38,12 @@ pub enum PredictedPropertiesError {
     MissingChargeRange(String),
     #[error("{0} is not part of a SPECLIB of format version {SPECLIB_FORMAT_VERSION} (its meta.json says format {1}, version {2}) -- regenerate it with `feature-prediction-make-speclib` or `predict_prosit`")]
     NotSpeclib(String, String, String),
-    #[error("{0} has slot_order {1}, which this SAGE does not read (charge_major_v1, row_major_v1)")]
+    #[error("{0} has position_of_row_and_charge {1}, which this SAGE does not read")]
     UnknownSlotOrder(String, String),
 }
 
 /// The SPECLIB format version this SAGE reads.
-pub const SPECLIB_FORMAT_VERSION: u64 = 3;
+pub const SPECLIB_FORMAT_VERSION: u64 = 4;
 
 /// Element types a mapped column can hold, by their numpy dtype name.
 pub trait ColumnType: Copy + Send + Sync + 'static {
@@ -177,12 +177,12 @@ pub fn read_speclib_manifest(dir: &Path) -> Result<serde_json::Value, PredictedP
     Ok(meta)
 }
 
-/// How the SPECLIB dataset in `dir` numbers its (peptide row, charge) slots.
+/// Where the SPECLIB dataset in `dir` keeps each (peptide row, charge).
 pub fn read_slot_order(dir: &Path) -> Result<SlotOrder, PredictedPropertiesError> {
     let meta = read_speclib_manifest(dir)?;
-    let token = meta.get("slot_order").and_then(|value| value.as_str());
-    token.and_then(SlotOrder::from_token).ok_or_else(|| {
-        PredictedPropertiesError::UnknownSlotOrder(dir.display().to_string(), format!("{token:?}"))
+    let equation = meta.get("position_of_row_and_charge").and_then(|value| value.as_str());
+    equation.and_then(SlotOrder::from_equation).ok_or_else(|| {
+        PredictedPropertiesError::UnknownSlotOrder(dir.display().to_string(), format!("{equation:?}"))
     })
 }
 
@@ -275,7 +275,7 @@ mod tests {
         std::fs::write(dir.join("meta.json"), meta).unwrap();
     }
 
-    const IIM_META: &str = r#"{"format": "speclib", "format_version": 3, "slot_order": "charge_major_v1", "dumped_peptides_sha256": "abc", "min_charge": 2, "max_charge": 2}"#;
+    const IIM_META: &str = r#"{"format": "speclib", "format_version": 4, "position_of_row_and_charge": "(charge - min_charge) * row_count + row", "dumped_peptides_sha256": "abc", "min_charge": 2, "max_charge": 2}"#;
 
     #[test]
     fn maps_speclib_iim_and_its_slot_order() {
@@ -289,19 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn refuses_iim_outside_speclib_format_3() {
+    fn refuses_iim_outside_speclib_format_4() {
         let dir = temp_dir("iim_refused");
         write_iim(&dir, "float64", IIM_META);
         assert!(matches!(
             read_predicted_iim(&dir),
             Err(PredictedPropertiesError::WrongDtype(..))
         ));
-        write_iim(&dir, "float32", &IIM_META.replace(r#""format_version": 3"#, r#""format_version": 2"#));
+        write_iim(&dir, "float32", &IIM_META.replace(r#""format_version": 4"#, r#""format_version": 3"#));
         assert!(matches!(
             read_predicted_iim(&dir),
             Err(PredictedPropertiesError::NotSpeclib(..))
         ));
-        write_iim(&dir, "float32", &IIM_META.replace("charge_major_v1", "ion_table_v1"));
+        write_iim(&dir, "float32", &IIM_META.replace("(charge - min_charge) * row_count + row", "row"));
         assert!(matches!(
             read_slot_order(&dir),
             Err(PredictedPropertiesError::UnknownSlotOrder(..))

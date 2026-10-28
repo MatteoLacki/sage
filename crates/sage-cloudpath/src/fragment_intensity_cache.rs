@@ -24,7 +24,7 @@ use std::path::Path;
 
 use half::f16;
 use memmap2::Mmap;
-use sage_core::intensity_codec::{FragmentIntensities, SQRT8_BASEPEAK};
+use sage_core::intensity_codec::FragmentIntensities;
 
 use crate::predicted_properties::{
     read_fingerprint, read_speclib_manifest, MappedColumn, PredictedPropertiesError,
@@ -52,13 +52,25 @@ pub struct FragmentIntensityIndex {
     pub start: MappedColumn<u64>,
 }
 
+/// The `meta.json` equations this reader implements.
+const FRAGMENTS_AT_POSITION: &str = "arrays[start[position] : start[position + 1]]";
+const SQRT8: &str = "round_half_even(255 * sqrt(intensity / max(intensity at position)))";
+const FP16: &str = "intensity as float16";
+
 /// Map the index in `dir`. Returns the `dumped_peptides` fingerprint alongside it
 /// -- the caller must check it against the current run's own digest before trusting
 /// these positions.
 pub fn read_fragment_intensity_index(
     dir: &Path,
 ) -> Result<(String, FragmentIntensityIndex), FragmentIntensityCacheError> {
-    read_speclib_manifest(dir)?;
+    let meta = read_speclib_manifest(dir)?;
+    let equation = meta.get("fragments_at_position").and_then(|v| v.as_str());
+    if equation != Some(FRAGMENTS_AT_POSITION) {
+        return Err(FragmentIntensityCacheError::InvalidFormat(format!(
+            "{} has fragments_at_position {equation:?}, which this SAGE does not read",
+            dir.display()
+        )));
+    }
     let fingerprint = read_fingerprint(dir)?;
     let start = MappedColumn::open(dir, "start")?;
     Ok((fingerprint, FragmentIntensityIndex { start }))
@@ -138,26 +150,15 @@ impl FragmentIntensityArrays {
     pub fn open(dir: &Path) -> Result<Self, FragmentIntensityCacheError> {
         let schema = read_mmappet_schema(dir)?;
         let manifest = read_speclib_manifest(dir)?;
-        let undeclared = || {
-            FragmentIntensityCacheError::InvalidFormat(format!(
-                "{} declares no `fragments.intensity_encoding` in its meta.json -- \
-                 regenerate it with `feature-prediction-make-speclib` or `predict_prosit`",
-                dir.display()
-            ))
-        };
-        let metadata = manifest.get("fragments").ok_or_else(undeclared)?;
-        let encoding = metadata.get("intensity_encoding").and_then(|v| v.as_str()).ok_or_else(undeclared)?;
-        let sqrt8 = match encoding {
-            "fp16" => false,
-            SQRT8_BASEPEAK => {
-                if metadata.get("version").and_then(|v| v.as_u64()) != Some(2)
-                    || metadata.get("normalization").and_then(|v| v.as_str()) != Some("per_spectrum_base_peak")
-                    || metadata.get("rounding").and_then(|v| v.as_str()) != Some("nearest_even") {
-                    return Err(FragmentIntensityCacheError::InvalidFormat("sqrt8 requires version 2, base-peak normalization and nearest-even rounding metadata".into()));
-                }
-                true
+        let sqrt8 = match manifest.get("predicted_intensity").and_then(|v| v.as_str()) {
+            Some(SQRT8) => true,
+            Some(FP16) => false,
+            other => {
+                return Err(FragmentIntensityCacheError::InvalidFormat(format!(
+                    "{} has predicted_intensity {other:?}, which this SAGE does not read",
+                    dir.display()
+                )))
             }
-            other => return Err(FragmentIntensityCacheError::InvalidFormat(format!("unknown intensity encoding {other}"))),
         };
         let dtype = if sqrt8 { "uint8" } else { "float16" };
         let i_intensity = mmappet_column_index(&schema, "predicted_intensity", dtype)?;
@@ -206,19 +207,19 @@ mod tests {
         dir
     }
 
-    /// A format-3 manifest whose `fragments` table is `fragments`.
-    fn write_manifest(dir: &Path, fragments: &str) {
-        std::fs::write(
-            dir.join("meta.json"),
-            format!(r#"{{"format":"speclib","format_version":3,"fragments":{fragments}}}"#),
-        )
-        .unwrap();
+    /// A format-4 fragments part's meta.json with `predicted_intensity` = `equation`.
+    fn write_manifest(dir: &Path, equation: &str) {
+        let meta = serde_json::json!({
+            "format": "speclib", "format_version": 4, "part": "fragments",
+            "predicted_intensity": equation,
+        });
+        std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
     }
 
     fn write_dataset(dir: &Path, annotation_id: &[u8], intensity: &[f16]) {
         std::fs::write(dir.join("schema.txt"), "float16 predicted_intensity\nuint8 annotation_id\n")
             .unwrap();
-        write_manifest(dir, r#"{"intensity_encoding":"fp16"}"#);
+        write_manifest(dir, FP16);
         let mut f0 = File::create(dir.join("0.bin")).unwrap();
         for v in intensity {
             f0.write_all(&v.to_le_bytes()).unwrap();
@@ -245,7 +246,7 @@ mod tests {
         let dir = temp_dir("wrong_dtype");
         std::fs::write(dir.join("schema.txt"), "float32 predicted_intensity\nuint8 annotation_id\n")
             .unwrap();
-        write_manifest(&dir, r#"{"intensity_encoding":"fp16"}"#);
+        write_manifest(&dir, FP16);
         std::fs::write(dir.join("0.bin"), []).unwrap();
         std::fs::write(dir.join("1.bin"), []).unwrap();
 
@@ -257,13 +258,13 @@ mod tests {
     fn requires_a_declared_intensity_encoding() {
         let dir = temp_dir("undeclared");
         write_dataset(&dir, &[3u8], &[f16::from_f32(1.0)]);
-        std::fs::write(dir.join("meta.json"), r#"{"intensity_encoding":"fp16"}"#).unwrap();
+        std::fs::write(dir.join("meta.json"), r#"{"format":"speclib","format_version":3}"#).unwrap();
         let err = FragmentIntensityArrays::open(&dir).unwrap_err();
-        assert!(err.to_string().contains("not part of a SPECLIB of format version 3"), "{err}");
+        assert!(err.to_string().contains("not part of a SPECLIB of format version 4"), "{err}");
 
-        write_manifest(&dir, r#"{"version":1}"#);
+        write_manifest(&dir, "fp16");
         let err = FragmentIntensityArrays::open(&dir).unwrap_err();
-        assert!(err.to_string().contains("declares no `fragments.intensity_encoding`"), "{err}");
+        assert!(err.to_string().contains("predicted_intensity Some(\"fp16\")"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -274,9 +275,9 @@ mod tests {
         std::fs::write(dir.join("0.bin"), [0, 128, 255]).unwrap();
         std::fs::write(dir.join("1.bin"), [0, 90, 173]).unwrap();
         assert!(FragmentIntensityArrays::open(&dir).is_err());
-        write_manifest(&dir, r#"{"version":2,"intensity_encoding":"sqrt8_scaled_v1","normalization":"per_spectrum_base_peak","rounding":"nearest_even"}"#);
+        write_manifest(&dir, "sqrt8_basepeak_v1");
         assert!(FragmentIntensityArrays::open(&dir).is_err());
-        write_manifest(&dir, r#"{"version":2,"intensity_encoding":"sqrt8_basepeak_v1","normalization":"per_spectrum_base_peak","rounding":"nearest_even"}"#);
+        write_manifest(&dir, SQRT8);
         {
             let arrays = FragmentIntensityArrays::open(&dir).unwrap();
             assert_eq!(arrays.predicted_intensity.codes().unwrap(), [0, 128, 255]);
