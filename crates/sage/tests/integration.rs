@@ -177,7 +177,7 @@ fn candidate_unreachable_without_custom_window() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 30.0);
 
     let precursor = Precursor {
@@ -206,7 +206,7 @@ fn candidate_unreachable_without_custom_window() {
 fn raw_isolation_window_is_not_a_precursor_tolerance() {
     let db = mk_ppm_window_database();
     let (_, peaks) = target_peaks(&db);
-    let target_mass = db[target_peaks(&db).0].monoisotopic;
+    let target_mass = db.row_mass(target_peaks(&db).0.0 as usize);
     let precursor = Precursor {
         mz: shifted_precursor_mz(target_mass, 30.0),
         charge: Some(1),
@@ -239,7 +239,7 @@ fn candidate_reachable_with_wide_custom_window() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 30.0);
 
     let precursor = Precursor {
@@ -310,7 +310,7 @@ fn candidate_unreachable_outside_rt_tol() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -356,7 +356,7 @@ fn candidate_reachable_within_rt_tol() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -406,7 +406,7 @@ fn delta_rt_z2_external_computed_from_sigma() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -453,7 +453,7 @@ fn delta_rt_z2_external_zero_without_sigma() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -494,7 +494,7 @@ fn candidate_unreachable_outside_iim_tol() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -535,7 +535,7 @@ fn candidate_reachable_within_iim_tol() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -580,7 +580,7 @@ fn delta_ims_z2_external_computed_from_sigma() {
     let (target_idx, peaks) = target_peaks(&db);
     assert!(!peaks.is_empty(), "expected real fragment peaks for target");
 
-    let target_mass = db[target_idx].monoisotopic;
+    let target_mass = db.row_mass(target_idx.0 as usize);
     let mz = shifted_precursor_mz(target_mass, 0.0);
     let precursor = Precursor {
         mz,
@@ -656,7 +656,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
             .expect("iso2 present in digest") as u32,
     );
     assert_eq!(
-        db[iso1].monoisotopic, db[iso2].monoisotopic,
+        db.row_mass(iso1.0 as usize), db.row_mass(iso2.0 as usize),
         "I<->L substitution must be exactly isomeric for this test to isolate RT"
     );
 
@@ -670,7 +670,7 @@ fn combined_score_ranks_rt_tied_hyperscore_candidates() {
         .collect();
     assert!(!peaks.is_empty(), "expected real fragment peaks for iso1");
 
-    let mz = shifted_precursor_mz(db[iso1].monoisotopic, 0.0);
+    let mz = shifted_precursor_mz(db.row_mass(iso1.0 as usize), 0.0);
     let precursor = Precursor {
         mz,
         charge: Some(1),
@@ -753,7 +753,7 @@ fn ranking_score_hyperscore_ignores_rt_penalty() {
         .collect();
     assert!(!peaks.is_empty(), "expected real fragment peaks for iso1");
 
-    let mz = shifted_precursor_mz(db[iso1].monoisotopic, 0.0);
+    let mz = shifted_precursor_mz(db.row_mass(iso1.0 as usize), 0.0);
     let precursor = Precursor {
         mz,
         charge: Some(1),
@@ -818,7 +818,7 @@ fn score_target(
         })
         .collect();
     let precursor = Precursor {
-        mz: shifted_precursor_mz(db[target_idx].monoisotopic, precursor_ppm),
+        mz: shifted_precursor_mz(db.row_mass(target_idx.0 as usize), precursor_ppm),
         charge: Some(1),
         inverse_ion_mobility: iim,
         ..Default::default()

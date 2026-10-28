@@ -37,8 +37,9 @@ bit for bit, mass included:
 4. `monoisotopic += modification_mass()`.
 5. `reverse` for decoys.
 
-`proteins` is left empty. `resolve_proteins(&mut [Peptide])` fills it, meant for the
-few peptides that end up in PSMs. It runs sage's own `EnzymeParameters::digest` per
+`proteins` is left empty. `protein_lists(rows)` gives them, meant for the few peptides
+that end up in PSMs; a sliced search's reported peptides are `reported(rows)`, read as
+views with those lists, never materialised. It runs sage's own `EnzymeParameters::digest` per
 protein and keeps the proteins whose digest yields the peptide's target form with the
 same modifications. That reproduces both `group_digests`' grouping and
 `reorder_peptides`' merge across positions.

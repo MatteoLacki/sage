@@ -47,7 +47,10 @@ pub struct CompactView<'t> {
 impl CompactPeptides {
     /// Row `row` as a [`PeptideView`]: what `materialize` would build, read in place.
     pub fn view(&self, row: usize) -> CompactView<'_> {
-        let row = self.rows.get(row);
+        self.view_of(self.rows.get(row))
+    }
+
+    pub fn view_of(&self, row: CompactPeptide) -> CompactView<'_> {
         CompactView {
             table: self,
             row,
@@ -56,7 +59,24 @@ impl CompactPeptides {
     }
 }
 
-impl CompactView<'_> {
+impl<'t> CompactView<'t> {
+    /// The target this row reverses, read from the same row; a target itself.
+    pub fn target(&self) -> CompactView<'t> {
+        CompactView {
+            row: self.row.target_of(),
+            ..*self
+        }
+    }
+
+    /// The target's residues: the proteome window the row reads.
+    pub fn target_residues(&self) -> &'t [u8] {
+        self.target
+    }
+
+    pub fn semi_enzymatic(&self) -> bool {
+        self.row.is_semi_enzymatic()
+    }
+
     fn last(&self) -> usize {
         self.target.len() - 1
     }

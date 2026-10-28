@@ -4,6 +4,7 @@
 //! Lin et al., https://pubmed.ncbi.nlm.nih.gov/36166314/
 //! Savitski et al., https://pubmed.ncbi.nlm.nih.gov/25987413/
 
+use crate::peptide_view::PeptideView;
 use crate::database::{IndexedDatabase, PeptideIx};
 use crate::lfq::PrecursorId;
 use crate::ml::kde::Estimator;
@@ -123,15 +124,15 @@ impl<Ix: Default + Send> Competition<Ix> {
 pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     let mut map: FnvHashMap<String, Competition<PeptideIx>> = FnvHashMap::default();
     for feat in features.iter() {
-        let peptide = &db[feat.peptide_idx];
+        let peptide = db.peptide(feat.peptide_idx);
         // Only reverse the peptide sequence if we generated decoys ourselves
-        let key = match db.generate_decoys && peptide.decoy {
-            true => peptide.reverse().to_string(),
+        let key = match db.generate_decoys && peptide.decoy() {
+            true => peptide.target_string(),
             false => peptide.to_string(),
         };
 
         let entry = map.entry(key).or_default();
-        match peptide.decoy {
+        match peptide.decoy() {
             true => {
                 entry.reverse = entry.reverse.max(feat.discriminant_score);
                 entry.reverse_ix = Some(feat.peptide_idx);
@@ -157,10 +158,10 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     // else the assumptions of picked protein FDR are invalid. Shared peptides are
     // still reported, albeit with protein FDR = 1.0
     let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
-    for feat in features.iter().filter(|x| db[x.peptide_idx].proteins.len() == 1) {
-        let decoy = db[feat.peptide_idx].decoy;
-        let entry = map.entry(&db[feat.peptide_idx].proteins).or_default();
-        let proteins = db[feat.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+    for feat in features.iter().filter(|x| db.proteins(x.peptide_idx).len() == 1) {
+        let decoy = db.peptide(feat.peptide_idx).decoy();
+        let entry = map.entry(db.proteins(feat.peptide_idx)).or_default();
+        let proteins = db.protein_names(feat.peptide_idx);
         match decoy {
             true => {
                 entry.reverse = entry.reverse.max(feat.discriminant_score);
@@ -175,8 +176,8 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
 
     let (scores, passing) = Competition::assign_q_value(map, 0.01);
 
-    features.par_iter_mut().filter(|x| db[x.peptide_idx].proteins.len() == 1).for_each(|feat| {
-        let proteins = db[feat.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+    features.par_iter_mut().filter(|x| db.proteins(x.peptide_idx).len() == 1).for_each(|feat| {
+        let proteins = db.protein_names(feat.peptide_idx);
         feat.protein_q = scores[&proteins];
     });
 
@@ -192,7 +193,7 @@ pub fn picked_protein_group(db: &IndexedDatabase, features: &mut [Feature]) -> u
         .iter()
         .filter(|x| x.num_protein_groups == 1 && x.protein_groups.is_some())
     {
-        let decoy = db[feat.peptide_idx].decoy;
+        let decoy = db.peptide(feat.peptide_idx).decoy();
         let entry = map.entry(feat.protein_groups.clone()).or_default();
         match decoy {
             true => {

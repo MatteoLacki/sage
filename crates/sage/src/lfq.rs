@@ -1,6 +1,7 @@
 use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::mass::{composition, Composition, Tolerance, NEUTRON};
 use crate::ml::{matrix::Matrix, retention_alignment::Alignment};
+use crate::peptide_view::PeptideView;
 use crate::scoring::Feature;
 use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
@@ -248,11 +249,9 @@ impl FeatureMap {
                         };
 
                         let mut grid = scores.entry((id, entry.decoy)).or_insert_with(|| {
-                            let p = &db[entry.peptide];
-                            let composition = p
-                                .sequence
-                                .iter()
-                                .map(|r| composition(*r))
+                            let p = db.peptide(entry.peptide);
+                            let composition = (0..p.len())
+                                .map(|index| composition(p.residue(index)))
                                 .sum::<Composition>();
                             let dist = crate::isotopes::peptide_isotopes(
                                 composition.carbon,
@@ -278,11 +277,9 @@ impl FeatureMap {
                         };
 
                         let mut grid = scores.entry((id, entry.decoy)).or_insert_with(|| {
-                            let p = &db[entry.peptide];
-                            let composition = p
-                                .sequence
-                                .iter()
-                                .map(|r| composition(*r))
+                            let p = db.peptide(entry.peptide);
+                            let composition = (0..p.len())
+                                .map(|index| composition(p.residue(index)))
                                 .sum::<Composition>();
                             let dist = crate::isotopes::peptide_isotopes(
                                 composition.carbon,

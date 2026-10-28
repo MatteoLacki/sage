@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::modification::ModificationSpecificity;
+use crate::peptide_view::PeptideView;
 use crate::{
     enzyme::{Digest, DigestGroup, Position},
     mass::{monoisotopic, H2O},
@@ -79,20 +80,7 @@ impl Peptide {
     }
 
     pub fn proteins(&self, decoy_tag: &str, generate_decoys: bool) -> String {
-        if self.decoy {
-            self.proteins
-                .iter()
-                .map(|s| {
-                    if generate_decoys {
-                        format!("{}{}", decoy_tag, s)
-                    } else {
-                        s.to_string()
-                    }
-                })
-                .join(";")
-        } else {
-            self.proteins.iter().join(";")
-        }
+        protein_names(&self.proteins, self.decoy, decoy_tag, generate_decoys)
     }
 
     pub fn modification_count(&self, target: ModificationSpecificity, mass: f32) -> usize {
@@ -401,23 +389,39 @@ fn write_mod(f: &mut std::fmt::Formatter<'_>, m: f32) -> std::fmt::Result {
     }
 }
 
+/// A peptide as sage reports it: residues with `[UNIMOD:n]` (or `[+mass]`) after each
+/// modified one, terminal modifications joined by `-`.
+pub fn write_peptide(f: &mut std::fmt::Formatter<'_>, peptide: &impl PeptideView) -> std::fmt::Result {
+    if let Some(m) = peptide.nterm() {
+        write_mod(f, m)?;
+        write!(f, "-")?;
+    }
+    for index in 0..peptide.len() {
+        write!(f, "{}", peptide.residue(index) as char)?;
+        let m = peptide.modification(index);
+        if m != 0.0 {
+            write_mod(f, m)?;
+        }
+    }
+    if let Some(m) = peptide.cterm() {
+        write!(f, "-")?;
+        write_mod(f, m)?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for Peptide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(m) = self.nterm {
-            write_mod(f, m)?;
-            write!(f, "-")?;
-        }
-        for (c, m) in self.sequence.iter().zip(self.modifications.iter()) {
-            write!(f, "{}", *c as char)?;
-            if *m != 0.0 {
-                write_mod(f, *m)?;
-            }
-        }
-        if let Some(m) = self.cterm {
-            write!(f, "-")?;
-            write_mod(f, m)?;
-        }
-        Ok(())
+        write_peptide(f, self)
+    }
+}
+
+/// `proteins` as sage reports them: `;`-joined, a decoy's prefixed with `decoy_tag`
+/// when sage generated the decoys.
+pub fn protein_names(proteins: &[Arc<str>], decoy: bool, decoy_tag: &str, generate_decoys: bool) -> String {
+    match decoy && generate_decoys {
+        true => proteins.iter().map(|s| format!("{decoy_tag}{s}")).join(";"),
+        false => proteins.iter().join(";"),
     }
 }
 

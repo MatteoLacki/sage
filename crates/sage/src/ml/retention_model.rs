@@ -6,7 +6,7 @@
 use super::{gauss::Gauss, matrix::Matrix};
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
-use crate::peptide::Peptide;
+use crate::peptide_view::PeptideView;
 use crate::scoring::Feature;
 use rayon::prelude::*;
 
@@ -39,10 +39,10 @@ const INTERCEPT: usize = FEATURES - 1;
 impl RetentionModel {
     /// One-hot encoding of peptide sequences into feature vector
     /// Note that this currently does not take into account any modifications
-    fn embed(peptide: &Peptide, map: &[usize; 26]) -> [f64; FEATURES] {
+    fn embed(peptide: &impl PeptideView, map: &[usize; 26]) -> [f64; FEATURES] {
         let mut embedding = [0.0; FEATURES];
-        let cterm = peptide.sequence.len().saturating_sub(3);
-        for (aa_idx, residue) in peptide.sequence.iter().enumerate() {
+        let cterm = peptide.len().saturating_sub(3);
+        for (aa_idx, residue) in peptide.residues().into_iter().enumerate() {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
             // Embed N- and C-terminal AA's (2 on each end, excluding K/R)
@@ -52,8 +52,8 @@ impl RetentionModel {
                 _ => {}
             }
         }
-        embedding[PEPTIDE_LEN] = peptide.sequence.len() as f64;
-        embedding[PEPTIDE_MASS] = (peptide.monoisotopic as f64).ln_1p();
+        embedding[PEPTIDE_LEN] = peptide.len() as f64;
+        embedding[PEPTIDE_MASS] = (peptide.monoisotopic() as f64).ln_1p();
         embedding[INTERCEPT] = 1.0;
         embedding
     }
@@ -80,7 +80,7 @@ impl RetentionModel {
         let features = training_set
             .par_iter()
             .filter(|feat| feat.label == 1 && feat.spectrum_q <= 0.01)
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &map))
+            .flat_map_iter(|psm| Self::embed(&db.peptide(psm.peptide_idx), &map))
             .collect::<Vec<_>>();
 
         let rows = features.len() / FEATURES;
@@ -110,7 +110,7 @@ impl RetentionModel {
 
     /// Predict retention times for a collection of PSMs
     pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &Feature) -> f64 {
-        let v = Self::embed(&db[psm.peptide_idx], &self.map);
+        let v = Self::embed(&db.peptide(psm.peptide_idx), &self.map);
         v.into_iter()
             .zip(&self.beta)
             .fold(0.0f64, |sum, (x, y)| sum + x * y)

@@ -9,6 +9,7 @@
 //! J. Proteome Res., 6(9), 3549-3557. https://doi.org/10.1021/pr070230d
 
 use crate::database::{IndexedDatabase, PeptideIx};
+use crate::peptide_view::PeptideView;
 use crate::scoring::Feature;
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
@@ -167,12 +168,11 @@ impl ProteinGrouper {
             .into_iter()
             .sorted()
             .map(|pep_ix| {
-                let peptide = &db[pep_ix];
-                peptide
-                    .proteins
+                let decoy = db.peptide(pep_ix).decoy();
+                db.proteins(pep_ix)
                     .iter()
                     .map(|name| {
-                        let key = (name.clone(), peptide.decoy);
+                        let key = (name.clone(), decoy);
                         let next_id = ProteinIx(protein_index.len() as u32);
                         *protein_index.entry(key).or_insert(next_id)
                     })
@@ -264,11 +264,12 @@ struct ProteinGroupLookup {
 
 impl ProteinGroupLookup {
     /// Get the sorted, semicolon-delimited protein group string for a peptide
-    fn group_string(&self, peptide: &crate::peptide::Peptide, db: &IndexedDatabase) -> Option<String> {
-        let group_set: FnvHashSet<&ProteinGroup> = peptide
-            .proteins
+    fn group_string(&self, peptide: PeptideIx, db: &IndexedDatabase) -> Option<String> {
+        let decoy = db.peptide(peptide).decoy();
+        let group_set: FnvHashSet<&ProteinGroup> = db
+            .proteins(peptide)
             .iter()
-            .filter_map(|name| self.protein_to_groups.get(&(name.clone(), peptide.decoy)))
+            .filter_map(|name| self.protein_to_groups.get(&(name.clone(), decoy)))
             .flat_map(|indices| indices.iter().map(|&i| &self.groups[i as usize]))
             .collect();
 
@@ -313,9 +314,8 @@ pub fn generate_protein_groups(
         .par_iter_mut()
         .filter(|f| f.protein_groups.is_none())
         .for_each(|feat| {
-            let pep = &db[feat.peptide_idx];
-            feat.protein_groups = Some(pep.proteins(&db.decoy_tag, db.generate_decoys));
-            feat.num_protein_groups = pep.proteins.len() as u32;
+            feat.protein_groups = Some(db.protein_names(feat.peptide_idx));
+            feat.num_protein_groups = db.proteins(feat.peptide_idx).len() as u32;
         });
     info!(
         "Grouped and inferred proteins in {:?}ms",
@@ -351,8 +351,7 @@ fn annotate_features(
         .par_iter_mut()
         .filter(|f| f.protein_groups.is_none())
         .map(|feat| {
-            let pep = &db[feat.peptide_idx];
-            match lookup.group_string(pep, db) {
+            match lookup.group_string(feat.peptide_idx, db) {
                 Some(groups) => {
                     feat.num_protein_groups = groups.matches(';').count() as u32 + 1;
                     feat.protein_groups = Some(groups);

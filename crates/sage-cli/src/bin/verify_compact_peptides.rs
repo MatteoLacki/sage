@@ -225,7 +225,7 @@ fn compact_gb(rows: usize) -> f64 {
     (rows * std::mem::size_of::<CompactPeptide>()) as f64 / 1e9
 }
 
-/// Every field but `proteins`, which `materialize` leaves to `resolve_proteins`.
+/// Every field but `proteins`, which `materialize` leaves to `protein_lists`.
 fn same_fields(materialized: &Peptide, expected: &Peptide) -> bool {
     Peptide {
         proteins: Vec::new(),
@@ -240,15 +240,12 @@ fn protein_mismatches(
     expected: &[Peptide],
     checked_rows: &[usize],
 ) -> usize {
-    let mut resolved: Vec<Peptide> = checked_rows
-        .par_iter()
-        .map(|&row| table.materialize(&rows[row]))
-        .collect();
-    table.resolve_proteins(&mut resolved);
-    resolved
+    let checked: Vec<CompactPeptide> = checked_rows.iter().map(|&row| rows[row]).collect();
+    table
+        .protein_lists(&checked)
         .iter()
         .zip(checked_rows)
-        .filter(|(peptide, &row)| peptide.proteins != expected[row].proteins)
+        .filter(|(proteins, &row)| **proteins != expected[row].proteins)
         .count()
 }
 
@@ -268,7 +265,10 @@ fn compare_with_full_digest(table: &CompactPeptides, expected: &[Peptide]) -> us
         .into_par_iter()
         .map(|row| table.materialize(&table.rows.get(row)))
         .collect();
-    table.resolve_proteins(&mut materialized);
+    let rows: Vec<CompactPeptide> = table.rows.iter().collect();
+    for (peptide, proteins) in materialized.iter_mut().zip(table.protein_lists(&rows)) {
+        peptide.proteins = proteins;
+    }
 
     let field_mismatches = materialized
         .par_iter()

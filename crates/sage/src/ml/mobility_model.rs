@@ -6,7 +6,7 @@
 use super::{gauss::Gauss, matrix::Matrix};
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
-use crate::peptide::Peptide;
+use crate::peptide_view::PeptideView;
 use crate::scoring::Feature;
 use rayon::prelude::*;
 
@@ -94,13 +94,13 @@ const INTERCEPT: usize = FEATURES - 1;
 impl MobilityModel {
     /// One-hot encoding of peptide sequences into feature vector
     /// Note that this currently does not take into account any modifications
-    fn embed(peptide: &Peptide, charge: &u8, map: &[usize; 26]) -> [f64; FEATURES] {
+    fn embed(peptide: &impl PeptideView, charge: &u8, map: &[usize; 26]) -> [f64; FEATURES] {
         let mut embedding = [0.0; FEATURES];
-        let cterm = peptide.sequence.len().saturating_sub(3);
-        let pep_length = peptide.sequence.len() as f64;
+        let cterm = peptide.len().saturating_sub(3);
+        let pep_length = peptide.len() as f64;
 
         //let default_first_val = 1.0f64;
-        for (aa_idx, residue) in peptide.sequence.iter().enumerate() {
+        for (aa_idx, residue) in peptide.residues().into_iter().enumerate() {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
             // Embed N- and C-terminal AA's
@@ -141,9 +141,9 @@ impl MobilityModel {
         let charge_feature: f64 = *charge as f64;
         embedding[PEPTIDE_CHARGE] = charge_feature;
         embedding[INV_PEPTIDE_CHARGE] = 1. / charge_feature;
-        embedding[PEPTIDE_LEN] = peptide.sequence.len() as f64;
-        embedding[PEPTIDE_MASS] = (peptide.monoisotopic as f64) / 1000.0;
-        embedding[PEPTIDE_MZ] = ((peptide.monoisotopic as f64) / charge_feature) / 1000.0;
+        embedding[PEPTIDE_LEN] = peptide.len() as f64;
+        embedding[PEPTIDE_MASS] = (peptide.monoisotopic() as f64) / 1000.0;
+        embedding[PEPTIDE_MZ] = ((peptide.monoisotopic() as f64) / charge_feature) / 1000.0;
         embedding[INTERCEPT] = 1.0;
         embedding
     }
@@ -170,7 +170,7 @@ impl MobilityModel {
         let features = training_set
             .par_iter()
             .filter(|feat| feat.label == 1 && feat.spectrum_q <= 0.01)
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
+            .flat_map_iter(|psm| Self::embed(&db.peptide(psm.peptide_idx), &psm.charge, &map))
             .collect::<Vec<_>>();
 
         let rows = features.len() / FEATURES;
@@ -201,7 +201,7 @@ impl MobilityModel {
 
     /// Predict retention times for a collection of PSMs
     pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &Feature) -> f64 {
-        let v = Self::embed(&db[psm.peptide_idx], &psm.charge, &self.map);
+        let v = Self::embed(&db.peptide(psm.peptide_idx), &psm.charge, &self.map);
         v.into_iter()
             .zip(&self.beta)
             .fold(0.0f64, |sum, (x, y)| sum + x * y)
@@ -212,6 +212,7 @@ impl MobilityModel {
 mod test {
     use super::*;
     use crate::enzyme::Digest;
+    use crate::peptide::Peptide;
 
     #[test]
     fn test_feature_embed() {

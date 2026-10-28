@@ -31,6 +31,10 @@ pub trait PeptideView {
 
     fn missed_cleavages(&self) -> u8;
 
+    fn residues(&self) -> Vec<u8> {
+        (0..self.len()).map(|index| self.residue(index)).collect()
+    }
+
     /// 1 for targets, -1 for decoys.
     fn label(&self) -> i32 {
         match self.decoy() {

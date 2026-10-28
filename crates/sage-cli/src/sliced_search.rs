@@ -428,7 +428,7 @@ fn rank_across_charges(
 
 /// Renumber `features` from table rows to a database holding only their peptides,
 /// in table-row order, and return that database.
-pub fn reported_database(table: &CompactPeptides, features: &mut [Feature]) -> IndexedDatabase {
+pub fn reported_database(table: &Arc<CompactPeptides>, features: &mut [Feature]) -> IndexedDatabase {
     let mut rows: Vec<usize> = features.iter().map(|f| f.peptide_idx.0 as usize).collect();
     rows.par_sort_unstable();
     rows.dedup();
@@ -440,5 +440,5 @@ pub fn reported_database(table: &CompactPeptides, features: &mut [Feature]) -> I
         feature.peptide_idx = PeptideIx(position as u32);
     });
     info!("reporting {} distinct peptides", rows.len());
-    table.database_for_rows(&rows)
+    table.reported(rows)
 }

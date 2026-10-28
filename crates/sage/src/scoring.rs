@@ -1825,7 +1825,7 @@ mod tests {
         let mut database = builder.make_parameters().build(fasta);
         for kinds in [vec![Kind::B, Kind::Y], vec![Kind::Y, Kind::B]] {
             database.ion_kinds = kinds;
-            let peptide = &database[PeptideIx(0)];
+            let peptide = &database.peptides[0];
             let n = peptide.sequence.len() - 1;
             let mut peaks = Vec::new();
             let mut annotations = Vec::new();
@@ -1937,7 +1937,7 @@ mod tests {
     #[test]
     fn closest_and_most_intense_fragment_mz_are_independent() {
         let database = charge_hypothesis_test_db();
-        let peptide = &database[PeptideIx(0)];
+        let peptide = &database.peptides[0];
         let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
 
         // Two peaks in b1's tolerance window: a closer, weaker one and a
@@ -2145,7 +2145,7 @@ mod tests {
     #[test]
     fn resolved_multiply_charged_peak_only_tests_charge_one() {
         let database = charge_hypothesis_test_db();
-        let peptide = &database[PeptideIx(0)];
+        let peptide = &database.peptides[0];
         let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
 
         // Pretend deisotoping resolved this peak to charge 2, so its stored
@@ -2181,7 +2181,7 @@ mod tests {
     #[test]
     fn confirmed_charge_one_peak_only_tests_charge_one() {
         let database = charge_hypothesis_test_db();
-        let peptide = &database[PeptideIx(0)];
+        let peptide = &database.peptides[0];
         let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
 
         // Same setup as resolved_multiply_charged_peak_only_tests_charge_one,
@@ -2217,7 +2217,7 @@ mod tests {
     #[test]
     fn unresolved_peak_still_tests_multiple_fragment_charges() {
         let database = charge_hypothesis_test_db();
-        let peptide = &database[PeptideIx(0)];
+        let peptide = &database.peptides[0];
         let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
 
         // Same peak mass as above, but charge genuinely unresolved (the 0
@@ -2252,7 +2252,7 @@ mod tests {
     #[test]
     fn closest_fragment_mz_respects_charge_hypothesis_filter() {
         let database = charge_hypothesis_test_db();
-        let peptide = &database[PeptideIx(0)];
+        let peptide = &database.peptides[0];
         let b1 = IonSeries::new(peptide, Kind::B).next().unwrap().monoisotopic_mass;
 
         // At the charge==2 iteration: a closer peak with a *resolved*

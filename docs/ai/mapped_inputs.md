@@ -33,7 +33,7 @@ chunk, `dumped_peptides_sha256`, the digest settings, the distinct variable-mod
 masses as bit patterns, a SHA-256 of the proteome).
 
 The proteome is not stored. `compact_store::open` builds it from the run's own FASTA
-(tens of MB, needed anyway by `materialize`/`resolve_proteins`) and refuses the table
+(tens of MB, needed anyway by `materialize`/`protein_lists`) and refuses the table
 unless three things match: the digest settings (decoy_tag, enzyme, generate_decoys,
 max_variable_mods, peptide min/max mass, static and variable mods: the keys of the
 pipeline's `dump_peptides_config.json`, compared after printing both through JSON so

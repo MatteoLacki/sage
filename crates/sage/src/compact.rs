@@ -3,10 +3,11 @@
 //! `PeptideIx(i)` a monolithic search would assign. A full [`Peptide`] is only
 //! created on demand, by [`CompactPeptides::materialize`].
 
-use crate::database::{IndexedDatabase, Parameters};
+use crate::database::{IndexedDatabase, Parameters, ReportedPeptides};
 use crate::enzyme::{Digest, EnzymeParameters, Position};
 use crate::fasta::Fasta;
 use crate::peptide::{Peptide, Site};
+use crate::peptide_view::PeptideView;
 use dashmap::DashMap;
 use fnv::{FnvBuildHasher, FnvHashMap};
 use rayon::prelude::*;
@@ -297,6 +298,14 @@ impl CompactPeptide {
         }
     }
 
+    /// The target row this decoy row reverses; a target row itself.
+    fn target_of(self) -> CompactPeptide {
+        CompactPeptide {
+            flags: self.flags & !Self::DECOY,
+            ..self
+        }
+    }
+
     fn position_code(position: Position) -> u8 {
         match position {
             Position::Nterm => 0,
@@ -500,7 +509,7 @@ impl CompactPeptides {
 
     /// The [`Peptide`] `Parameters::digest` holds for `row`, built by the same code
     /// path (`Peptide::try_from(Digest)`, variable sites, static mods, `reverse`).
-    /// `proteins` is left empty; see [`CompactPeptides::resolve_proteins`].
+    /// `proteins` is left empty; see [`CompactPeptides::protein_lists`].
     pub fn materialize(&self, row: &CompactPeptide) -> Peptide {
         let digest = Digest {
             decoy: false,
@@ -551,54 +560,44 @@ impl CompactPeptides {
         self.parameters.indexed_fragment_count(length)
     }
 
-    /// An `IndexedDatabase` holding only `rows` (ascending), with proteins, and no
-    /// fragment index: what reporting needs once the search is over. Peptide `i` of
-    /// it is row `rows[i]`.
-    pub fn database_for_rows(&self, rows: &[usize]) -> IndexedDatabase {
-        let mut peptides: Vec<Peptide> = rows
-            .par_iter()
-            .map(|&row| self.materialize(&self.rows.get(row)))
-            .collect();
-        self.resolve_proteins(&mut peptides);
+    /// The peptides a sliced search reports: `rows` (ascending) with their proteins, and
+    /// no fragment index. Peptide `i` of it is row `rows[i]`.
+    pub fn reported(self: &Arc<Self>, rows: Vec<usize>) -> IndexedDatabase {
+        let proteins = self.protein_lists(&rows.iter().map(|&row| self.rows.get(row)).collect::<Vec<_>>());
         IndexedDatabase {
-            peptides,
-            compact: None,
-            fragment_mzs: Vec::new(),
-            fragment_peptide_indices: Vec::new(),
+            reported: Some(ReportedPeptides {
+                table: Arc::clone(self),
+                rows,
+                proteins,
+            }),
             ion_kinds: self.parameters.ion_kinds.clone(),
-            min_value: Vec::new(),
             potential_mods: self.parameters.variable_mod_list(),
             bucket_size: self.parameters.bucket_size,
             generate_decoys: self.parameters.generate_decoys,
             decoy_tag: self.parameters.decoy_tag.clone(),
-            grid: None,
+            ..Default::default()
         }
     }
 
-    /// Fill `proteins` exactly as `Parameters::digest` would: every protein whose own
-    /// digest yields the peptide's target form with the same modifications.
-    pub fn resolve_proteins(&self, peptides: &mut [Peptide]) {
-        if peptides.is_empty() {
-            return;
+    /// Each row's proteins, sorted, exactly as `Parameters::digest` finds them: every
+    /// protein whose own digest yields the row's target form with the same modifications.
+    pub fn protein_lists(&self, rows: &[CompactPeptide]) -> Vec<Vec<Arc<str>>> {
+        let mut lists = vec![Vec::new(); rows.len()];
+        if rows.is_empty() {
+            return lists;
         }
-        let targets: Vec<Cow<Peptide>> = peptides
-            .par_iter()
-            .map(|peptide| match peptide.decoy {
-                true => Cow::Owned(peptide.reverse()),
-                false => Cow::Borrowed(peptide),
-            })
-            .collect();
-        let mut peptides_by_sequence: FnvHashMap<&[u8], Vec<usize>> = FnvHashMap::default();
+        let targets: Vec<CompactView> = rows.iter().map(|&row| self.view_of(row).target()).collect();
+        let mut rows_by_sequence: FnvHashMap<&[u8], Vec<usize>> = FnvHashMap::default();
         for (index, target) in targets.iter().enumerate() {
-            peptides_by_sequence
-                .entry(&target.sequence[..])
+            rows_by_sequence
+                .entry(target.target_residues())
                 .or_default()
                 .push(index);
         }
 
         let mut enzyme = self.parameters.enzyme.clone();
-        enzyme.min_len = targets.iter().map(|t| t.sequence.len()).min();
-        enzyme.max_len = targets.iter().map(|t| t.sequence.len()).max();
+        enzyme.min_len = targets.iter().map(|t| t.len()).min();
+        enzyme.max_len = targets.iter().map(|t| t.len()).max();
         let enzyme: EnzymeParameters = enzyme.into();
         let variable_mods = self.parameters.variable_mod_list();
 
@@ -608,7 +607,7 @@ impl CompactPeptides {
                 let accession = self.proteome.accessions[protein].clone();
                 let mut found = Vec::new();
                 for digest in enzyme.digest(self.proteome.protein_sequence(protein), accession) {
-                    let Some(indices) = peptides_by_sequence.get(digest.sequence.as_bytes()) else {
+                    let Some(indices) = rows_by_sequence.get(digest.sequence.as_bytes()) else {
                         continue;
                     };
                     let Ok(unmodified) = Peptide::try_from(digest) else {
@@ -628,16 +627,12 @@ impl CompactPeptides {
                 found
             })
             .collect();
-        drop(targets);
 
         for (index, protein) in matches {
-            peptides[index]
-                .proteins
-                .push(self.proteome.accessions[protein].clone());
+            lists[index].push(self.proteome.accessions[protein].clone());
         }
-        peptides
-            .par_iter_mut()
-            .for_each(|peptide| peptide.proteins.sort_unstable());
+        lists.par_iter_mut().for_each(|list| list.sort_unstable());
+        lists
     }
 
     /// Replace `rows` with the merge of per-length runs (one length per run, each in
@@ -767,11 +762,11 @@ pub fn drop_in_parallel<T: Send>(items: Vec<T>) {
     items.into_par_iter().for_each(drop);
 }
 
-fn has_same_modified_form(a: &Peptide, b: &Peptide) -> bool {
-    a.sequence == b.sequence
-        && a.modifications == b.modifications
-        && a.nterm == b.nterm
-        && a.cterm == b.cterm
+fn has_same_modified_form(a: &impl PeptideView, b: &impl PeptideView) -> bool {
+    a.len() == b.len()
+        && (0..a.len()).all(|i| a.residue(i) == b.residue(i) && a.modification(i) == b.modification(i))
+        && a.nterm() == b.nterm()
+        && a.cterm() == b.cterm()
 }
 
 /// Ascending, distinct masses that split all runs together into about `chunks`
@@ -808,7 +803,7 @@ fn chunk_bounds(run: &[CompactPeptide], pivots: &[f32]) -> Vec<usize> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::database::Builder;
+    use crate::database::{Builder, PeptideIx};
 
     const FASTA: &str = "\
 >sp|P1|ONE
@@ -895,7 +890,10 @@ MCQPEPTIDEK
             .iter()
             .map(|row| table.materialize(&row))
             .collect();
-        table.resolve_proteins(&mut actual);
+        let rows: Vec<CompactPeptide> = table.rows.iter().collect();
+        for (peptide, proteins) in actual.iter_mut().zip(table.protein_lists(&rows)) {
+            peptide.proteins = proteins;
+        }
 
         assert_eq!(actual.len(), expected.len());
         for (row, ((actual, expected), compact)) in actual
@@ -1112,22 +1110,30 @@ MQKCPE
     }
 
     #[test]
-    fn database_for_rows_holds_exactly_those_rows() {
+    fn reported_peptides_read_as_sage_digests_them() {
         let fasta = Fasta::parse(FASTA.into(), "rev_", true);
         let parameters = parameters(tryptic());
         let expected = parameters.digest(&fasta);
-        let table = CompactPeptides::build(&parameters, &fasta).unwrap();
+        let table = Arc::new(CompactPeptides::build(&parameters, &fasta).unwrap());
         let rows: Vec<usize> = (0..table.rows.len()).step_by(3).collect();
-        let database = table.database_for_rows(&rows);
-        assert_eq!(database.peptides.len(), rows.len());
-        for (peptide, &row) in database.peptides.iter().zip(&rows) {
+        let database = table.reported(rows.clone());
+        assert_eq!(database.row_count(), rows.len());
+        for (index, &row) in rows.iter().enumerate() {
+            let (peptide, expected) = (database.peptide(PeptideIx(index as u32)), &expected[row]);
+            assert_eq!(peptide.to_string(), expected.to_string());
+            assert_eq!(peptide.target_string(), match expected.decoy {
+                true => expected.reverse().to_string(),
+                false => expected.to_string(),
+            });
+            assert_eq!(peptide.decoy(), expected.decoy);
+            assert_eq!(database.proteins(PeptideIx(index as u32)), &expected.proteins[..]);
             assert_eq!(
-                without_duplicate_attributes(peptide),
-                without_duplicate_attributes(&expected[row])
+                database.protein_names(PeptideIx(index as u32)),
+                expected.proteins("rev_", true)
             );
         }
         assert_eq!(database.decoy_tag, "rev_");
-        assert!(database.fragment_mzs.is_empty());
+        assert!(database.fragment_mzs.is_empty() && database.peptides.is_empty());
     }
 
     #[test]

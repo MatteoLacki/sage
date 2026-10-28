@@ -5,7 +5,7 @@ use crate::fragment_grid::{census_every, FragmentGrid, FragmentLayout, GridShape
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
-use crate::peptide::Peptide;
+use crate::peptide::{protein_names, write_peptide, Peptide};
 use crate::peptide_view::PeptideView;
 use dashmap::DashSet;
 use fnv::FnvBuildHasher;
@@ -456,6 +456,7 @@ impl Parameters {
         IndexedDatabase {
             peptides,
             compact,
+            reported: None,
             fragment_mzs,
             fragment_peptide_indices,
             min_value,
@@ -498,6 +499,7 @@ impl Parameters {
             potential_mods: self.variable_mod_list(),
             peptides,
             compact,
+            reported: None,
             fragment_mzs: Vec::new(),
             fragment_peptide_indices: Vec::new(),
             min_value: Vec::new(),
@@ -551,11 +553,45 @@ impl CompactSlice {
     }
 }
 
+/// The peptides a sliced search reports: rows of its compact table, with their proteins.
+pub struct ReportedPeptides {
+    pub table: Arc<CompactPeptides>,
+    pub rows: Vec<usize>,
+    pub proteins: Vec<Vec<Arc<str>>>,
+}
+
 /// One of an index's peptides: a built [`Peptide`] or a compact row read in place.
 #[derive(Clone, Copy)]
 pub enum PeptideRef<'a> {
     Built(&'a Peptide),
     Compact(CompactView<'a>),
+}
+
+impl PeptideRef<'_> {
+    /// The display string of the target this decoy reverses; a target's own.
+    pub fn target_string(&self) -> String {
+        match self {
+            PeptideRef::Built(peptide) if peptide.decoy => peptide.reverse().to_string(),
+            PeptideRef::Compact(view) => PeptideRef::Compact(view.target()).to_string(),
+            _ => self.to_string(),
+        }
+    }
+
+    pub fn semi_enzymatic(&self) -> bool {
+        match self {
+            PeptideRef::Built(peptide) => peptide.semi_enzymatic,
+            PeptideRef::Compact(view) => view.semi_enzymatic(),
+        }
+    }
+}
+
+impl std::fmt::Display for PeptideRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeptideRef::Built(peptide) => write_peptide(f, *peptide),
+            PeptideRef::Compact(view) => write_peptide(f, view),
+        }
+    }
 }
 
 impl PeptideView for PeptideRef<'_> {
@@ -639,6 +675,8 @@ pub struct IndexedDatabase {
     pub peptides: Vec<Peptide>,
     /// The rows of a compact table this index was built over, read in place.
     pub compact: Option<CompactSlice>,
+    /// Set instead of `peptides` and `compact` once a sliced search is over.
+    pub reported: Option<ReportedPeptides>,
     /// Parallel columns, ordered by peptide index within each fragment-mass page; empty
     /// when the fragments are in `grid`.
     pub fragment_mzs: Vec<f32>,
@@ -685,6 +723,9 @@ impl IndexedDatabase {
 
     /// Number of peptide rows.
     pub fn row_count(&self) -> usize {
+        if let Some(reported) = &self.reported {
+            return reported.rows.len();
+        }
         match &self.compact {
             Some(rows) => rows.len(),
             None => self.peptides.len(),
@@ -701,10 +742,31 @@ impl IndexedDatabase {
 
     /// Peptide `index`, built or read in place.
     pub fn peptide(&self, index: PeptideIx) -> PeptideRef<'_> {
+        if let Some(reported) = &self.reported {
+            return PeptideRef::Compact(reported.table.view(reported.rows[index.0 as usize]));
+        }
         match &self.compact {
             Some(rows) => PeptideRef::Compact(rows.view(index.0 as usize)),
             None => PeptideRef::Built(&self.peptides[index.0 as usize]),
         }
+    }
+
+    /// The proteins peptide `index` occurs in; known for built and reported peptides.
+    pub fn proteins(&self, index: PeptideIx) -> &[Arc<str>] {
+        match &self.reported {
+            Some(reported) => &reported.proteins[index.0 as usize],
+            None => &self.peptides[index.0 as usize].proteins,
+        }
+    }
+
+    /// `proteins(index)` as sage reports them (see [`protein_names`]).
+    pub fn protein_names(&self, index: PeptideIx) -> String {
+        protein_names(
+            self.proteins(index),
+            self.peptide(index).decoy(),
+            &self.decoy_tag,
+            self.generate_decoys,
+        )
     }
 
     pub fn size(&self) -> usize {
@@ -756,14 +818,6 @@ impl IndexedDatabase {
             .unwrap();
         }
         wtr.flush().unwrap();
-    }
-}
-
-impl std::ops::Index<PeptideIx> for IndexedDatabase {
-    type Output = Peptide;
-
-    fn index(&self, index: PeptideIx) -> &Self::Output {
-        &self.peptides[index.0 as usize]
     }
 }
 
@@ -842,10 +896,10 @@ impl IndexedQuery<'_> {
                     // e.g. used to be `self.db[frag.peptide_index].monoisotopic >= precursor_lo`
                     (frag.peptide_index.0 > self.pre_idx_lo as u32
                         || (frag.peptide_index.0 == self.pre_idx_lo as u32
-                            && self.db[frag.peptide_index].monoisotopic >= precursor_lo))
+                            && self.db.row_mass(frag.peptide_index.0 as usize) >= precursor_lo))
                         && (frag.peptide_index.0 < self.pre_idx_hi as u32
                             || (frag.peptide_index.0 == self.pre_idx_hi as u32
-                                && self.db[frag.peptide_index].monoisotopic <= precursor_hi))
+                                && self.db.row_mass(frag.peptide_index.0 as usize) <= precursor_hi))
                         && frag.fragment_mz >= fragment_lo
                         && frag.fragment_mz <= fragment_hi
                 })
@@ -1264,7 +1318,7 @@ mod test {
             for &(center, tolerance) in windows {
                 let (frag_lo, frag_hi) = tolerance.theoretical_range(center);
                 for f in fragments {
-                    let precursor = db[f.peptide_index].monoisotopic;
+                    let precursor = db.row_mass(f.peptide_index.0 as usize);
                     if precursor >= lo
                         && precursor <= hi
                         && f.fragment_mz >= frag_lo

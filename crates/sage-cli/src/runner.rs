@@ -1384,7 +1384,7 @@ impl Runner {
 
         let telemetry = telemetry::Telemetry::new(
             self.parameters,
-            self.database.peptides.len(),
+            self.database.row_count(),
             self.database.size(),
             parquet,
             run_time,
@@ -1397,17 +1397,13 @@ impl Runner {
 
         record.push_field(itoa::Buffer::new().format(feature.psm_id).as_bytes());
 
-        let peptide = &self.database[feature.peptide_idx];
+        let peptide = self.database.peptide(feature.peptide_idx);
         record.push_field(peptide.to_string().as_bytes());
-        record.push_field(
-            peptide
-                .proteins(&self.database.decoy_tag, self.database.generate_decoys)
-                .as_bytes(),
-        );
+        record.push_field(self.database.protein_names(feature.peptide_idx).as_bytes());
         record.push_field(feature.protein_groups.as_deref().unwrap_or("").as_bytes());
         record.push_field(
             itoa::Buffer::new()
-                .format(peptide.proteins.len())
+                .format(self.database.proteins(feature.peptide_idx).len())
                 .as_bytes(),
         );
         record.push_field(
@@ -1430,7 +1426,7 @@ impl Runner {
         );
         record.push_field(
             itoa::Buffer::new()
-                .format(peptide.semi_enzymatic as u8)
+                .format(peptide.semi_enzymatic() as u8)
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.isotope_error).as_bytes());
@@ -1824,7 +1820,7 @@ impl Runner {
             .unwrap_or(&feature.spec_id);
 
         let mut record = csv::ByteRecord::new();
-        let peptide = &self.database[feature.peptide_idx];
+        let peptide = self.database.peptide(feature.peptide_idx);
         record.push_field(itoa::Buffer::new().format(feature.psm_id).as_bytes());
         record.push_field(itoa::Buffer::new().format(feature.label).as_bytes());
         record.push_field(scannr.as_bytes());
@@ -1881,7 +1877,7 @@ impl Runner {
         );
         record.push_field(
             itoa::Buffer::new()
-                .format(peptide.semi_enzymatic as u8)
+                .format(peptide.semi_enzymatic() as u8)
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.isotope_error).as_bytes());
@@ -2030,11 +2026,7 @@ impl Runner {
                 .as_bytes(),
         );
         record.push_field(peptide.to_string().as_bytes());
-        record.push_field(
-            peptide
-                .proteins(&self.database.decoy_tag, self.database.generate_decoys)
-                .as_bytes(),
-        );
+        record.push_field(self.database.protein_names(feature.peptide_idx).as_bytes());
         record
     }
 
@@ -2198,13 +2190,9 @@ impl Runner {
                     PrecursorId::Combined(x) => (x, None),
                     PrecursorId::Charged((x, charge)) => (x, Some(charge as i32)),
                 };
-                record.push_field(self.database[peptide_ix].to_string().as_bytes());
+                record.push_field(self.database.peptide(peptide_ix).to_string().as_bytes());
                 record.push_field(itoa::Buffer::new().format(charge.unwrap_or(-1)).as_bytes());
-                record.push_field(
-                    self.database[peptide_ix]
-                        .proteins(&self.database.decoy_tag, self.database.generate_decoys)
-                        .as_bytes(),
-                );
+                record.push_field(self.database.protein_names(peptide_ix).as_bytes());
                 record.push_field(ryu::Buffer::new().format(peak.q_value).as_bytes());
                 record.push_field(ryu::Buffer::new().format(peak.score).as_bytes());
                 record.push_field(ryu::Buffer::new().format(peak.spectral_angle).as_bytes());
@@ -2280,7 +2268,7 @@ impl Runner {
                         && f.peptide_q <= global_q_value_filter
                         && filenames[f.file_id] == *filename
                 }) {
-                    peptides.insert(self.database[feature.peptide_idx].to_string());
+                    peptides.insert(self.database.peptide(feature.peptide_idx).to_string());
                 }
                 num_peptide_targets_per_file.push(peptides.len());
             }
@@ -2294,10 +2282,7 @@ impl Runner {
                         && f.protein_q <= global_q_value_filter
                         && filenames[f.file_id] == *filename
                 }) {
-                    proteins.insert(
-                        self.database[feature.peptide_idx]
-                            .proteins(&self.database.decoy_tag, self.database.generate_decoys),
-                    );
+                    proteins.insert(self.database.protein_names(feature.peptide_idx));
                 }
                 num_protein_targets_per_file.push(proteins.len());
             }

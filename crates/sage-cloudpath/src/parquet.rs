@@ -19,6 +19,7 @@ use parquet::{
     file::{properties::WriterProperties, writer::SerializedFileWriter},
     schema::types::Type,
 };
+use sage_core::peptide_view::PeptideView;
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
@@ -195,18 +196,15 @@ pub fn serialize_features(
         );
         write_col!(|f: &Feature| f.spec_id.as_str().into(), ByteArrayType);
         write_col!(
-            |f: &Feature| database[f.peptide_idx].to_string().as_bytes().into(),
+            |f: &Feature| database.peptide(f.peptide_idx).to_string().as_bytes().into(),
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx].sequence.as_ref().into(),
+            |f: &Feature| database.peptide(f.peptide_idx).residues().as_slice().into(),
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx]
-                .proteins(&database.decoy_tag, database.generate_decoys)
-                .as_str()
-                .into(),
+            |f: &Feature| database.protein_names(f.peptide_idx).as_str().into(),
             ByteArrayType
         );
         write_col!(
@@ -214,7 +212,7 @@ pub fn serialize_features(
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx].proteins.len() as i32,
+            |f: &Feature| database.proteins(f.peptide_idx).len() as i32,
             Int32Type
         );
         write_col!(num_protein_groups, Int32Type);
@@ -226,7 +224,7 @@ pub fn serialize_features(
         write_col!(peptide_len, Int32Type);
         write_col!(missed_cleavages, Int32Type);
         write_col!(
-            |f: &Feature| database[f.peptide_idx].semi_enzymatic,
+            |f: &Feature| database.peptide(f.peptide_idx).semi_enzymatic(),
             BoolType
         );
         write_col!(ms2_intensity, FloatType);
@@ -538,7 +536,7 @@ pub fn serialize_lfq<H: BuildHasher>(
                 let peptide_idx = match id {
                     PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
                 };
-                let val = database[*peptide_idx].to_string().as_bytes().into();
+                let val = database.peptide(*peptide_idx).to_string().as_bytes().into();
                 std::iter::repeat(val).take(filenames.len())
             })
             .collect::<Vec<_>>();
@@ -555,7 +553,7 @@ pub fn serialize_lfq<H: BuildHasher>(
                 let peptide_idx = match id {
                     PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
                 };
-                let val = database[*peptide_idx].sequence.as_ref().into();
+                let val = database.peptide(*peptide_idx).residues().as_slice().into();
                 std::iter::repeat(val).take(filenames.len())
             })
             .collect::<Vec<_>>();
@@ -593,10 +591,7 @@ pub fn serialize_lfq<H: BuildHasher>(
                 let peptide_idx = match id {
                     PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
                 };
-                let val = database[*peptide_idx]
-                    .proteins(&database.decoy_tag, database.generate_decoys)
-                    .as_str()
-                    .into();
+                let val = database.protein_names(*peptide_idx).as_str().into();
                 std::iter::repeat(val).take(filenames.len())
             })
             .collect::<Vec<_>>();
