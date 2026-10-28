@@ -54,8 +54,8 @@ lives in `docs/ai/`, one file per topic:
 | File | Covers |
 |------|--------|
 | `docs/ai/pmsms_input.md` | `pmsms`/precursors binary input (`--tof2mz` mandatory, float32 or float64), fragment recalibration as a recalibrated table plus per-precursor `fragment_shift_ppm`, per-precursor ppm tolerance, per-fragment (spline) ppm tolerance, MS1/MS2 intensity PIN columns |
-| `docs/ai/predicted_rt_iim.md` | `--predicted-rt`/`--predicted-iim` hard-eviction filtering, dense peptide-index lookup, external RT/IIM as LDA features, `combined_score` soft ranking penalty |
-| `docs/ai/predicted_fragment_intensity.md` | `--predicted-fragment-intensity-*`: optional MS2 fragment-intensity reader (job-scoped pointer parquet + shared `arrays.mmappet`), feature-only (no hard filter), `ms2_entropy_similarity` |
+| `docs/ai/predicted_rt_iim.md` | `--predicted-rt`/`--predicted-iim` hard-eviction filtering, dense peptide-index lookup, external RT/IIM as LDA features, `combined_score` soft ranking penalty; IIM from a SPECLIB as float32 and the `peptide_row` results column (2026-10-27) |
+| `docs/ai/predicted_fragment_intensity.md` | `--predicted-fragment-intensity-*`: optional MS2 fragment-intensity reader (a SPECLIB's index + `arrays.mmappet`; format 3 since 2026-10-27: start-only index, charge- or row-major `Slots`), feature-only (no hard filter), `ms2_entropy_similarity` |
 | `docs/ai/native_prosit.md` | `predict_prosit`: compact peptide views → Rust tokens → native TensorRT → Sage mmappet predictions; modification policy, positional/annotation contracts, durability, and measured throughput |
 | `docs/ai/unimod.md` | `[UNIMOD:<id>]` modification notation support (`crates/sage/src/unimod.rs`) |
 | `docs/ai/dump_peptides.md` | `dump_peptides` binary's mass-sorted output (for a separate consumer); necroflow's structural (not content-addressed) provenance hashing |

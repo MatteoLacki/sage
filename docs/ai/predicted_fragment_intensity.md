@@ -426,6 +426,30 @@ values) or `sqrt8_basepeak_v1` (uint8 codes, version 2, base-peak normalization,
 nearest-even rounding); anything else, or nothing, is `InvalidFormat` telling the user
 to regenerate the file as a SPECLIB. Both encodings stay readable.
 
+## SPECLIB format 3: start-only index, slot orders (2026-10-27)
+
+necromerge2 `plans/speclib_rt_iim.md`; the format is in `git/featureprediction`'s
+`docs/ai/speclib.md`. Every dataset's `meta.json` is the SPECLIB's manifest, and the
+readers refuse anything but `format` `speclib`, `format_version` 3
+(`predicted_properties::read_speclib_manifest`).
+
+- **Index:** one `start` column (uint64, one per slot plus the end), slot `i` being
+  `start[i]..start[i + 1]`; an empty range is no prediction (`SlotRanges`,
+  `crates/sage/src/predicted.rs`). The int64 start/end pair with −1/−1 is gone. A
+  predicted slot left with no fragment, which format 2 told apart, now reads as no
+  prediction; `make_speclib` produced none on F9477.
+- **Slots** are numbered by the manifest's `slot_order` (`read_slot_order`): `charge_major_v1`
+  (slot = (z − min) · rows + row) or `row_major_v1` (row · charge_span + z − min); any other
+  token is `UnknownSlotOrder`. `Slots` holds the order, the table's row count, the charge
+  range and the scorer's first row, so a slice of the sliced search maps its local peptide
+  to the global slot itself. That replaces slicing the arrays per slice
+  (`rows.start · C..rows.end · C`), which only works row-major: a slice's ions are not
+  contiguous charge-major. `Scorer::iim_dense_slot` is gone; IIM and fragments share `Slots`.
+- **Encoding** moved under the manifest's `fragments` table
+  (`fragments.intensity_encoding`, with `version`/`normalization`/`rounding`).
+- `predict_prosit` still writes format 2; its two output-checking tests are ignored until
+  it moves (`plans/speclib_server_handoff.md`).
+
 ## Explicitly out of scope here
 
 - The `getWeights`/`freqs`-dependent `weighted*` variants (see above) —

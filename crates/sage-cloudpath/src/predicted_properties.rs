@@ -1,23 +1,21 @@
 //! Readers for externally-predicted peptide RT/IIM properties (see
-//! `necromerge2`'s `git/featureprediction` and
-//! `plans/rt_iim_independent_dimensions.md`). RT and IIM are two
-//! independent, separately-loadable files -- RT has no charge dimension
+//! `necromerge2`'s `git/featureprediction` and `plans/speclib_rt_iim.md`). RT and
+//! IIM are two independent, separately-loadable files -- RT has no charge dimension
 //! (Chronologer_RT doesn't take one), IIM does.
 //!
-//! Both are positional, not `sequence`-keyed (2026-09-08 -- see
-//! `docs/ai/dumped_peptides_positional_predictions.md`): row `i` of
-//! `predicted_rt.mmappet` is peptide row `i` of the `dumped_peptides`
-//! both files were derived from; `predicted_iim.mmappet` is dense over
-//! `(peptide_row, charge)` in the same `peptide_idx * charge_span +
-//! (charge - min_charge)` layout `Scorer::iim_dense_slot` already uses.
-//! Each is an mmappet dataset (`schema.txt` + `0.bin`) mapped in place, with a
-//! `meta.json` sidecar carrying `dumped_peptides_sha256` (see
-//! `dumped_peptides_fingerprint`) -- the caller (`sage-cli`'s `Runner`) must
-//! check it against the current run's own digest before trusting these
-//! positions. A per-charge file's `meta.json` also carries the `min_charge`/
-//! `max_charge` its slots cover (`read_charge_range`).
+//! Both are positional, not `sequence`-keyed: row `i` of the per-run calibrated
+//! `predicted_rt.mmappet` (float64 minutes) is peptide row `i` of the
+//! `dumped_peptides` it was derived from; IIM is a SPECLIB's `iim.mmappet`
+//! (float32 1/K0), one value per (peptide row, charge) slot in the SPECLIB's
+//! `slot_order` (`read_slot_order`). Each is an mmappet dataset (`schema.txt` +
+//! `0.bin`) mapped in place, with a `meta.json` carrying `dumped_peptides_sha256`
+//! (see `dumped_peptides_fingerprint`) -- the caller (`sage-cli`'s `Runner`) must
+//! check it against the current run's own digest before trusting these positions.
+//! A per-charge file's `meta.json` also carries the `min_charge`/`max_charge` its
+//! slots cover (`read_charge_range`).
 
 use memmap2::Mmap;
+use sage_core::predicted::SlotOrder;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,7 +36,14 @@ pub enum PredictedPropertiesError {
     MissingFingerprint(String),
     #[error("{0} is missing `min_charge`/`max_charge` in its meta.json -- regenerate it with a current `feature-prediction` or `predict_prosit` build")]
     MissingChargeRange(String),
+    #[error("{0} is not part of a SPECLIB of format version {SPECLIB_FORMAT_VERSION} (its meta.json says format {1}, version {2}) -- regenerate it with `feature-prediction-make-speclib` or `predict_prosit`")]
+    NotSpeclib(String, String, String),
+    #[error("{0} has slot_order {1}, which this SAGE does not read (charge_major_v1, row_major_v1)")]
+    UnknownSlotOrder(String, String),
 }
+
+/// The SPECLIB format version this SAGE reads.
+pub const SPECLIB_FORMAT_VERSION: u64 = 3;
 
 /// Element types a mapped column can hold, by their numpy dtype name.
 pub trait ColumnType: Copy + Send + Sync + 'static {
@@ -51,6 +56,14 @@ impl ColumnType for f64 {
 
 impl ColumnType for i64 {
     const DTYPE: &'static str = "int64";
+}
+
+impl ColumnType for f32 {
+    const DTYPE: &'static str = "float32";
+}
+
+impl ColumnType for u64 {
+    const DTYPE: &'static str = "uint64";
 }
 
 /// One column of an mmappet dataset, mapped read-only; clones share the mapping.
@@ -148,12 +161,38 @@ pub fn read_predicted_rt(
     Ok((read_fingerprint(dir)?, MappedColumn::open(dir, "rt")?))
 }
 
-/// Column `iim` (float64, 1/K0), dense over `(peptide_row, charge)` -- see module
-/// docs for the slot layout. Returns the `dumped_peptides` fingerprint alongside the
+/// A SPECLIB dataset's `meta.json` (its manifest), refused unless it declares
+/// SPECLIB format version [`SPECLIB_FORMAT_VERSION`].
+pub fn read_speclib_manifest(dir: &Path) -> Result<serde_json::Value, PredictedPropertiesError> {
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let format = meta.get("format").and_then(|value| value.as_str());
+    let version = meta.get("format_version").and_then(|value| value.as_u64());
+    if format != Some("speclib") || version != Some(SPECLIB_FORMAT_VERSION) {
+        return Err(PredictedPropertiesError::NotSpeclib(
+            dir.display().to_string(),
+            format!("{format:?}"),
+            format!("{version:?}"),
+        ));
+    }
+    Ok(meta)
+}
+
+/// How the SPECLIB dataset in `dir` numbers its (peptide row, charge) slots.
+pub fn read_slot_order(dir: &Path) -> Result<SlotOrder, PredictedPropertiesError> {
+    let meta = read_speclib_manifest(dir)?;
+    let token = meta.get("slot_order").and_then(|value| value.as_str());
+    token.and_then(SlotOrder::from_token).ok_or_else(|| {
+        PredictedPropertiesError::UnknownSlotOrder(dir.display().to_string(), format!("{token:?}"))
+    })
+}
+
+/// Column `iim` (float32, 1/K0) of a SPECLIB's `iim.mmappet`, one value per slot
+/// (`read_slot_order`). Returns the `dumped_peptides` fingerprint alongside the
 /// mapped values.
 pub fn read_predicted_iim(
     dir: &Path,
-) -> Result<(String, MappedColumn<f64>), PredictedPropertiesError> {
+) -> Result<(String, MappedColumn<f32>), PredictedPropertiesError> {
+    read_speclib_manifest(dir)?;
     Ok((read_fingerprint(dir)?, MappedColumn::open(dir, "iim")?))
 }
 
@@ -205,10 +244,6 @@ mod tests {
             read_predicted_rt(&dir),
             Err(PredictedPropertiesError::WrongDtype(..))
         ));
-        assert!(matches!(
-            read_predicted_iim(&dir),
-            Err(PredictedPropertiesError::MissingColumn(..))
-        ));
         write_rt(&dir, "float64", &[1.0]);
         std::fs::write(dir.join("meta.json"), "{}").unwrap();
         assert!(matches!(
@@ -231,5 +266,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_charge_range(&dir).unwrap(), (2, 4));
+    }
+
+    fn write_iim(dir: &Path, dtype: &str, meta: &str) {
+        std::fs::write(dir.join("schema.txt"), format!("{dtype} iim")).unwrap();
+        let bytes: Vec<u8> = [1.25f32, f32::NAN].iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join("0.bin"), bytes).unwrap();
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
+    }
+
+    const IIM_META: &str = r#"{"format": "speclib", "format_version": 3, "slot_order": "charge_major_v1", "dumped_peptides_sha256": "abc", "min_charge": 2, "max_charge": 2}"#;
+
+    #[test]
+    fn maps_speclib_iim_and_its_slot_order() {
+        let dir = temp_dir("iim");
+        write_iim(&dir, "float32", IIM_META);
+        let (fingerprint, iim) = read_predicted_iim(&dir).unwrap();
+        assert_eq!(fingerprint, "abc");
+        assert_eq!(iim.as_slice()[0], 1.25);
+        assert!(iim.as_slice()[1].is_nan());
+        assert_eq!(read_slot_order(&dir).unwrap(), SlotOrder::ChargeMajor);
+    }
+
+    #[test]
+    fn refuses_iim_outside_speclib_format_3() {
+        let dir = temp_dir("iim_refused");
+        write_iim(&dir, "float64", IIM_META);
+        assert!(matches!(
+            read_predicted_iim(&dir),
+            Err(PredictedPropertiesError::WrongDtype(..))
+        ));
+        write_iim(&dir, "float32", &IIM_META.replace(r#""format_version": 3"#, r#""format_version": 2"#));
+        assert!(matches!(
+            read_predicted_iim(&dir),
+            Err(PredictedPropertiesError::NotSpeclib(..))
+        ));
+        write_iim(&dir, "float32", &IIM_META.replace("charge_major_v1", "ion_table_v1"));
+        assert!(matches!(
+            read_slot_order(&dir),
+            Err(PredictedPropertiesError::UnknownSlotOrder(..))
+        ));
     }
 }

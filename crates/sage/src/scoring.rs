@@ -5,7 +5,7 @@ use crate::ion_series::{Ion, IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::ms2_similarity::{self, N_FRAGMENT_SLOTS};
 use crate::peptide_view::PeptideView;
-use crate::predicted::{PredictedRanges, PredictedValues};
+use crate::predicted::{PredictedValues, SlotRanges, SlotValues};
 #[cfg(test)]
 use crate::spectrum::Peak;
 use crate::spectrum::{PeakColumns, Precursor, ProcessedSpectrum};
@@ -152,6 +152,11 @@ impl AddAssign<InitialHits> for InitialHits {
 pub struct Feature {
     #[serde(skip_serializing)]
     pub peptide_idx: PeptideIx,
+    /// The peptide's row in this run's whole peptide table, set once the search is
+    /// over (`peptide_idx` is then renumbered over the reported peptides); `None`
+    /// when the search did not see the whole table (prefilter).
+    #[serde(skip_serializing)]
+    pub peptide_row: Option<u32>,
     // psm_id help to match with matched fragments table.
     pub psm_id: usize,
     pub peptide_len: usize,
@@ -416,9 +421,9 @@ pub struct Scorer<'db> {
     /// search, a real measured ~37% `run_sage` overhead before this. See
     /// `plans/rt_iim_independent_dimensions.md`.
     pub predicted_rt: Option<PredictedValues<'db>>,
-    /// Externally-predicted IIM, dense-indexed via [`iim_dense_slot`] (one
-    /// slot per `(peptide index, charge)` combination in
-    /// `[min_precursor_charge, max_precursor_charge]`), used to evict
+    /// Externally-predicted IIM, one value per SPECLIB slot (`(peptide row, charge)`
+    /// in `[min_precursor_charge, max_precursor_charge]`, numbered by the SPECLIB's
+    /// `slot_order`), used to evict
     /// candidates whose `observed − predicted` IIM falls outside
     /// `mobility_tol`. `mobility_tol` is required (validated at
     /// config-load time) whenever this is `Some`. Independent of
@@ -429,7 +434,7 @@ pub struct Scorer<'db> {
     /// array — 23x, and smaller too (no per-entry key storage or
     /// hashmap load-factor overhead). See
     /// `plans/rt_iim_independent_dimensions.md`.
-    pub predicted_iim: Option<PredictedValues<'db>>,
+    pub predicted_iim: Option<SlotValues<'db>>,
     /// Robust (MAD-based) scale of the `predicted_rt` residual as a
     /// function of observed `scan_start_time`, already converted to minutes
     /// (`sage-cli/src/input.rs`'s `spline_secs_to_minutes` at config-load
@@ -457,14 +462,13 @@ pub struct Scorer<'db> {
     /// via `git/featureprediction`) -- **feature-only, no hard filtering**
     /// (contrast `predicted_rt`/`predicted_iim` above): used solely to
     /// compute `Feature::ms2_entropy_similarity`, never to evict or re-rank
-    /// candidates. Dense-indexed by `(peptide index, charge)` via the same
-    /// [`iim_dense_slot`] shape `predicted_iim` uses -- each entry is a
-    /// `(start, end)` half-open row range into
+    /// candidates. One range per SPECLIB slot, the same slots `predicted_iim` uses --
+    /// each a half-open row range into
     /// `predicted_fragment_intensity_annotation_id`/`_intensity` below.
     /// Positional like `predicted_rt`/`predicted_iim` (avoids `Peptide::
     /// to_string()` per candidate). See
     /// `docs/ai/predicted_fragment_intensity.md`.
-    pub predicted_fragment_intensity_index: Option<PredictedRanges<'db>>,
+    pub predicted_fragment_intensity_index: Option<SlotRanges<'db>>,
     /// The shared, ever-growing `arrays.mmappet` annotation-id column
     /// (`git/featureprediction`'s SAGE-order fragment-slot numbering, see
     /// `ms2_similarity::fragment_annotation_id`), sliced per candidate via
@@ -732,28 +736,6 @@ impl<'db> Scorer<'db> {
         hits
     }
 
-    /// Maps `(peptide_idx, charge)` to a slot in a dense
-    /// `predicted_iim`-shaped array of length `n_peptides *
-    /// (max_charge - min_charge + 1)`, or `None` if `charge` falls outside
-    /// `[min_charge, max_charge]` entirely (can't have an entry — same
-    /// permissive treatment as a missing key would get from a map). Shared
-    /// between `Runner::resolve_predicted_iim` (which builds the array)
-    /// and `evict_rt_iim_mismatches` (which reads it) so the indexing
-    /// arithmetic can't drift between the two call sites. See
-    /// `plans/rt_iim_independent_dimensions.md`.
-    pub fn iim_dense_slot(
-        peptide_idx: usize,
-        charge: u8,
-        min_charge: u8,
-        max_charge: u8,
-    ) -> Option<usize> {
-        if charge < min_charge || charge > max_charge {
-            return None;
-        }
-        let charge_span = (max_charge - min_charge + 1) as usize;
-        Some(peptide_idx * charge_span + (charge - min_charge) as usize)
-    }
-
     /// Evict candidates (in place) whose `observed − predicted` RT and/or
     /// IIM falls outside `rt_tol`/`mobility_tol` (the `Tolerance`
     /// convention, see `mass.rs`), observed being `query`'s values. Each
@@ -812,14 +794,9 @@ impl<'db> Scorer<'db> {
                     .map_or(true, |rt| rt >= lo && rt <= hi)
             });
             let iim_ok = compatible_predicted_iim.map_or(true, |(lo, hi)| {
-                Self::iim_dense_slot(
-                    peptide_idx,
-                    sc.precursor_charge,
-                    self.min_precursor_charge,
-                    self.max_precursor_charge,
-                )
-                .and_then(|slot| self.predicted_iim.map(|dense| dense.get(slot)))
-                .map_or(true, |iim| iim >= lo && iim <= hi)
+                self.predicted_iim
+                    .and_then(|iim| iim.get(peptide_idx, sc.precursor_charge))
+                    .map_or(true, |iim| iim >= lo && iim <= hi)
             });
 
             if !rt_ok || !iim_ok {
@@ -867,17 +844,12 @@ impl<'db> Scorer<'db> {
             .and_then(|p| p.inverse_ion_mobility);
         let (predicted_ims_external, delta_ims_z2_external) =
             match (self.predicted_iim, self.iim_sigma, observed_ims) {
-                (Some(dense), Some(sigma), Some(observed)) if sigma > 0.0 => Self::iim_dense_slot(
-                    peptide_idx,
-                    charge,
-                    self.min_precursor_charge,
-                    self.max_precursor_charge,
-                )
-                .map(|slot| dense.get(slot))
-                .map_or((0.0, 0.0), |ims| {
-                    let z = (observed - ims) / sigma;
-                    (ims, z * z)
-                }),
+                (Some(iim), Some(sigma), Some(observed)) if sigma > 0.0 => iim
+                    .get(peptide_idx, charge)
+                    .map_or((0.0, 0.0), |ims| {
+                        let z = (observed - ims) / sigma;
+                        (ims, z * z)
+                    }),
                 _ => (0.0, 0.0),
             };
 
@@ -1228,6 +1200,7 @@ impl<'db> Scorer<'db> {
                 num_protein_groups: 0,
                 fragments,
                 protein_group_q: 1.0,
+                peptide_row: None,
             })
         }
     }
@@ -1328,18 +1301,7 @@ impl<'db> Scorer<'db> {
         }
         let by_slot = self.predicted_fragment_intensity_index.unwrap();
 
-        let slot = Self::iim_dense_slot(
-            peptide_idx,
-            charge,
-            self.min_precursor_charge,
-            self.max_precursor_charge,
-        );
-        if slot.is_none() {
-            return (false, dense);
-        }
-        let slot = slot.unwrap();
-
-        let Some((start, end)) = by_slot.get(slot) else {
+        let Some((start, end)) = by_slot.get(peptide_idx, charge) else {
             return (false, dense);
         };
 
@@ -1709,32 +1671,7 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iim_dense_slot_in_range() {
-        // charges 2..=4, charge_span 3 -- peptide 0's slots are 0,1,2 for
-        // charge 2,3,4; peptide 1's are 3,4,5; etc.
-        assert_eq!(Scorer::iim_dense_slot(0, 2, 2, 4), Some(0));
-        assert_eq!(Scorer::iim_dense_slot(0, 3, 2, 4), Some(1));
-        assert_eq!(Scorer::iim_dense_slot(0, 4, 2, 4), Some(2));
-        assert_eq!(Scorer::iim_dense_slot(1, 2, 2, 4), Some(3));
-        assert_eq!(Scorer::iim_dense_slot(5, 4, 2, 4), Some(17));
-    }
-
-    #[test]
-    fn iim_dense_slot_out_of_range() {
-        assert_eq!(Scorer::iim_dense_slot(0, 1, 2, 4), None);
-        assert_eq!(Scorer::iim_dense_slot(0, 5, 2, 4), None);
-    }
-
-    #[test]
-    fn iim_dense_slot_single_charge_span() {
-        // charge_span 1 -- exactly the mk_scorer test fixture shape used
-        // in crates/sage/tests/integration.rs's IIM eviction tests.
-        assert_eq!(Scorer::iim_dense_slot(0, 1, 1, 1), Some(0));
-        assert_eq!(Scorer::iim_dense_slot(7, 1, 1, 1), Some(7));
-        assert_eq!(Scorer::iim_dense_slot(0, 2, 1, 1), None);
-    }
+    use crate::predicted::{SlotOrder, Slots};
 
     #[test]
     fn add_matches_counts_like_a_per_match_callback() {
@@ -1917,12 +1854,21 @@ mod tests {
                 peaks: peaks.into(),
                 ..Default::default()
             };
-            let starts = vec![0i64; database.peptides.len()];
-            let ends = vec![annotations.len() as i64; database.peptides.len()];
+            // Peptide 0 at charge 1 holds every fragment; the other slots are empty.
+            let starts: Vec<u64> = std::iter::once(0)
+                .chain(std::iter::repeat(annotations.len() as u64).take(database.peptides.len()))
+                .collect();
+            let slots = Slots {
+                order: SlotOrder::RowMajor,
+                rows: database.peptides.len(),
+                first_row: 0,
+                min_charge: 1,
+                max_charge: 1,
+            };
             let mut scorer = mk_isotope_test_scorer(&database);
             scorer.annotate_matches = true;
             scorer.max_fragment_charge = Some(1);
-            scorer.predicted_fragment_intensity_index = Some(PredictedRanges::new(&starts, &ends));
+            scorer.predicted_fragment_intensity_index = Some(SlotRanges::new(&starts, slots));
             scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
             scorer.predicted_fragment_intensity = Some(FragmentIntensities::Fp16(&intensities));
             let (score, fragments) = scorer.score_candidate(
@@ -1960,12 +1906,18 @@ mod tests {
     fn sqrt8_dense_predictions_preserve_missing_rows_and_sliced_offsets() {
         let database = IndexedDatabase::default();
         let mut scorer = mk_isotope_test_scorer(&database);
-        let starts = [0, -1, 3];
-        let ends = [3, -1, 5];
+        // Slot 0 is 0..3, slot 1 is empty (no prediction), slot 2 is 3..5.
+        let starts = [0, 3, 3, 5];
         let annotations = [0, 90, 173, 1, 89];
         let codes = [255, 128, 0, 0, 255];
-        let ranges = PredictedRanges::new(&starts, &ends);
-        scorer.predicted_fragment_intensity_index = Some(ranges);
+        let slots = Slots {
+            order: SlotOrder::RowMajor,
+            rows: 3,
+            first_row: 0,
+            min_charge: 1,
+            max_charge: 1,
+        };
+        scorer.predicted_fragment_intensity_index = Some(SlotRanges::new(&starts, slots));
         scorer.predicted_fragment_intensity_annotation_id = Some(&annotations);
         scorer.predicted_fragment_intensity = Some(FragmentIntensities::Sqrt8Basepeak(&codes));
         let (found, dense) = scorer.build_predicted_dense(0, 1);
@@ -1975,7 +1927,8 @@ mod tests {
         assert_eq!(dense[173], 0.0);
         assert!(!scorer.build_predicted_dense(1, 1).0);
         let last = scorer.build_predicted_dense(2, 1);
-        scorer.predicted_fragment_intensity_index = Some(ranges.slice(2..3));
+        scorer.predicted_fragment_intensity_index =
+            Some(SlotRanges::new(&starts, slots.from_row(2)));
         assert_eq!(scorer.build_predicted_dense(0, 1), last);
         assert_eq!(last.1[89], 1.0);
         assert_eq!(last.1[1], 0.0);

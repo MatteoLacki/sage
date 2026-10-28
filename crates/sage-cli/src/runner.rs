@@ -20,7 +20,7 @@ use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
 use sage_core::peptide::Peptide;
-use sage_core::predicted::{PredictedRanges, PredictedValues};
+use sage_core::predicted::{PredictedValues, SlotOrder, SlotRanges, SlotValues, Slots};
 use sage_core::scoring::Fragments;
 use sage_core::scoring::{Feature, Scorer};
 use sage_core::spectrum::{MS1Spectra, ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
@@ -60,8 +60,8 @@ impl PeptideRows {
 #[derive(Default)]
 pub struct Predictions {
     rt: Option<MappedColumn<f64>>,
-    iim: Option<MappedColumn<f64>>,
-    fragment_intensity_index: Option<FragmentIntensityIndex>,
+    iim: Option<(MappedColumn<f32>, Slots)>,
+    fragment_intensity_index: Option<(FragmentIntensityIndex, Slots)>,
 }
 
 impl Predictions {
@@ -108,34 +108,44 @@ fn resolve_predicted_rt(
     Ok(values.clone())
 }
 
-/// Checks a positional `predicted_iim.mmappet` (dense over `(peptide_row, charge)`,
-/// see `sage_core::scoring::Scorer::iim_dense_slot` for the exact slot layout both
-/// sides share): fingerprint and one value per slot -- see
+/// The slots of this run's peptide `rows` at precursor charges `min_charge..=max_charge`,
+/// numbered as `order` says.
+fn table_slots(rows: &PeptideRows, order: SlotOrder, (min_charge, max_charge): (u8, u8)) -> Slots {
+    Slots {
+        order,
+        rows: rows.count,
+        first_row: 0,
+        min_charge,
+        max_charge,
+    }
+}
+
+/// Checks a SPECLIB's `iim.mmappet` (one value per (peptide row, charge) slot):
+/// fingerprint and one value per slot -- see
 /// `docs/ai/dumped_peptides_positional_predictions.md`.
 fn resolve_predicted_iim(
     rows: &PeptideRows,
-    (fingerprint, values): &(String, MappedColumn<f64>),
-    min_charge: u8,
-    max_charge: u8,
-) -> anyhow::Result<MappedColumn<f64>> {
-    verify_dumped_peptides_fingerprint(rows, fingerprint, "predicted_iim.mmappet")?;
-    let charge_span = (max_charge - min_charge + 1) as usize;
+    (fingerprint, values, order): &(String, MappedColumn<f32>, SlotOrder),
+    charges: (u8, u8),
+) -> anyhow::Result<(MappedColumn<f32>, Slots)> {
+    verify_dumped_peptides_fingerprint(rows, fingerprint, "iim.mmappet")?;
+    let slots = table_slots(rows, *order, charges);
     anyhow::ensure!(
-        values.len() == rows.count * charge_span,
-        "predicted_iim.mmappet has {} rows, expected {} peptides x {} charges ({})",
+        values.len() == slots.count(),
+        "iim.mmappet has {} rows, expected {} peptides x {} charges ({})",
         values.len(),
         rows.count,
-        charge_span,
-        rows.count * charge_span
+        slots.charge_span(),
+        slots.count()
     );
-    Ok(values.clone())
+    Ok((values.clone(), slots))
 }
 
 /// Checks that the per-charge prediction file at `path` (`--predicted-iim`,
 /// `--predicted-fragment-intensity-index`) covers exactly this search's
-/// `precursor_charge`. Its slot `row * charge_span + charge - min_charge` means the
-/// same charge here only when both ranges are equal; the length check in `resolve_*`
-/// can't tell, since e.g. 2..=4 and 1..=3 both span three charges.
+/// `precursor_charge`. Its slots mean the same charges here only when both ranges are
+/// equal; the length check in `resolve_*` can't tell, since e.g. 2..=4 and 1..=3 both
+/// span three charges.
 fn verify_prediction_charge_range(path: &str, (min_charge, max_charge): (u8, u8)) -> anyhow::Result<()> {
     let (file_min_charge, file_max_charge) =
         sage_cloudpath::predicted_properties::read_charge_range(std::path::Path::new(path))?;
@@ -148,26 +158,24 @@ fn verify_prediction_charge_range(path: &str, (min_charge, max_charge): (u8, u8)
     Ok(())
 }
 
-/// Same shape as `resolve_predicted_iim`, for the fragment-intensity pointer index
-/// (`(peptide_row, charge) -> (start, end)`, start `-1` where the shared cache has no
-/// entry for that pair -- see `docs/ai/predicted_fragment_intensity.md`).
+/// Same shape as `resolve_predicted_iim`, for a SPECLIB's `index.mmappet`: one start
+/// per slot plus the end (see `docs/ai/predicted_fragment_intensity.md`).
 fn resolve_predicted_fragment_intensity(
     rows: &PeptideRows,
-    (fingerprint, index): &(String, FragmentIntensityIndex),
-    min_charge: u8,
-    max_charge: u8,
-) -> anyhow::Result<FragmentIntensityIndex> {
-    verify_dumped_peptides_fingerprint(rows, fingerprint, "fragment_intensity_for_sage.mmappet")?;
-    let charge_span = (max_charge - min_charge + 1) as usize;
+    (fingerprint, index, order): &(String, FragmentIntensityIndex, SlotOrder),
+    charges: (u8, u8),
+) -> anyhow::Result<(FragmentIntensityIndex, Slots)> {
+    verify_dumped_peptides_fingerprint(rows, fingerprint, "index.mmappet")?;
+    let slots = table_slots(rows, *order, charges);
     anyhow::ensure!(
-        index.start.len() == rows.count * charge_span,
-        "fragment_intensity_for_sage.mmappet has {} rows, expected {} peptides x {} charges ({})",
+        index.start.len() == slots.count() + 1,
+        "index.mmappet has {} starts, expected one per slot ({} peptides x {} charges) plus the end ({})",
         index.start.len(),
         rows.count,
-        charge_span,
-        rows.count * charge_span
+        slots.charge_span(),
+        slots.count() + 1
     );
-    Ok(index.clone())
+    Ok((index.clone(), slots))
 }
 
 pub struct Runner {
@@ -187,17 +195,16 @@ pub struct Runner {
     /// Read-only, shared across the parallel spectra search via
     /// `&self`/`Scorer` borrows, same as `database`.
     pub predicted_rt: Option<(String, MappedColumn<f64>)>,
-    /// Externally-predicted, positional IIM (dense over `(peptide_row,
-    /// charge)`), mapped once from `parameters.predicted_iim` if set —
+    /// Externally-predicted IIM, one value per SPECLIB slot, with the SPECLIB's
+    /// slot order, mapped once from `parameters.predicted_iim` if set —
     /// independent of `predicted_rt`.
-    pub predicted_iim: Option<(String, MappedColumn<f64>)>,
-    /// Externally-predicted, positional `(peptide_row, charge) ->
-    /// (start, end)` pointer index into
-    /// `predicted_fragment_intensity_arrays`, mapped once from
+    pub predicted_iim: Option<(String, MappedColumn<f32>, SlotOrder)>,
+    /// A SPECLIB's index of fragment ranges per slot into
+    /// `predicted_fragment_intensity_arrays`, with its slot order, mapped once from
     /// `parameters.predicted_fragment_intensity_index` if set. Feature-only
     /// (see `docs/ai/predicted_fragment_intensity.md`) — independent of
     /// `predicted_rt`/`predicted_iim`.
-    pub predicted_fragment_intensity_index: Option<(String, FragmentIntensityIndex)>,
+    pub predicted_fragment_intensity_index: Option<(String, FragmentIntensityIndex, SlotOrder)>,
     /// The shared `arrays.mmappet` mmapped arrays
     /// `predicted_fragment_intensity_index`'s ranges address, loaded once
     /// from `parameters.predicted_fragment_intensity_cache` if set. Owned
@@ -301,34 +308,36 @@ impl Runner {
 
         let predicted_iim = match &parameters.predicted_iim {
             Some(path) => {
-                let map = sage_cloudpath::predicted_properties::read_predicted_iim(
-                    std::path::Path::new(path),
-                )
-                .with_context(|| format!("Failed to read predicted IIM from `{path}`"))?;
+                let dir = std::path::Path::new(path);
+                let (fingerprint, values) =
+                    sage_cloudpath::predicted_properties::read_predicted_iim(dir)
+                        .with_context(|| format!("Failed to read predicted IIM from `{path}`"))?;
+                let order = sage_cloudpath::predicted_properties::read_slot_order(dir)?;
                 verify_prediction_charge_range(path, parameters.precursor_charge)?;
                 info!(
-                    "mapped {} predicted iim rows (positional, dense over peptide x charge)",
-                    map.1.len()
+                    "mapped {} predicted iim slots ({order:?})",
+                    values.len()
                 );
-                Some(map)
+                Some((fingerprint, values, order))
             }
             None => None,
         };
 
         let predicted_fragment_intensity_index = match &parameters.predicted_fragment_intensity_index {
             Some(path) => {
-                let map = sage_cloudpath::fragment_intensity_cache::read_fragment_intensity_index(
-                    std::path::Path::new(path),
-                )
-                .with_context(|| {
-                    format!("Failed to read predicted fragment-intensity index from `{path}`")
-                })?;
+                let dir = std::path::Path::new(path);
+                let (fingerprint, index) =
+                    sage_cloudpath::fragment_intensity_cache::read_fragment_intensity_index(dir)
+                        .with_context(|| {
+                            format!("Failed to read predicted fragment-intensity index from `{path}`")
+                        })?;
+                let order = sage_cloudpath::predicted_properties::read_slot_order(dir)?;
                 verify_prediction_charge_range(path, parameters.precursor_charge)?;
                 info!(
-                    "mapped {} predicted fragment-intensity index rows (positional, dense over peptide x charge)",
-                    map.1.start.len()
+                    "mapped {} predicted fragment-intensity slot starts ({order:?})",
+                    index.start.len()
                 );
-                Some(map)
+                Some((fingerprint, index, order))
             }
             None => None,
         };
@@ -1049,7 +1058,7 @@ impl Runner {
             return Ok(Predictions::default());
         }
         let rows = self.peptide_rows();
-        let (min_charge, max_charge) = self.parameters.precursor_charge;
+        let charges = self.parameters.precursor_charge;
         Ok(Predictions {
             rt: self
                 .predicted_rt
@@ -1059,12 +1068,12 @@ impl Runner {
             iim: self
                 .predicted_iim
                 .take()
-                .map(|map| resolve_predicted_iim(&rows, &map, min_charge, max_charge))
+                .map(|map| resolve_predicted_iim(&rows, &map, charges))
                 .transpose()?,
             fragment_intensity_index: self
                 .predicted_fragment_intensity_index
                 .take()
-                .map(|map| resolve_predicted_fragment_intensity(&rows, &map, min_charge, max_charge))
+                .map(|map| resolve_predicted_fragment_intensity(&rows, &map, charges))
                 .transpose()?,
         })
     }
@@ -1079,8 +1088,6 @@ impl Runner {
     ) -> Scorer<'a> {
         let rows = first_row..first_row + db.row_count();
         let (min_charge, max_charge) = self.parameters.precursor_charge;
-        let charge_span = (max_charge - min_charge + 1) as usize;
-        let charge_slots = rows.start * charge_span..rows.end * charge_span;
         Scorer {
             db,
             precursor_tol: self.parameters.precursor_tol,
@@ -1102,7 +1109,7 @@ impl Runner {
             predicted_iim: predictions
                 .iim
                 .as_ref()
-                .map(|iim| PredictedValues::new(&iim.as_slice()[charge_slots.clone()])),
+                .map(|(iim, slots)| SlotValues::new(iim.as_slice(), slots.from_row(first_row))),
             rt_tol: self.parameters.rt_tol.clone(),
             mobility_tol: self.parameters.mobility_tol.clone(),
             rt_sigma: self.parameters.rt_sigma.clone(),
@@ -1113,12 +1120,7 @@ impl Runner {
             score_type: self.parameters.score_type,
             ranking_score: self.parameters.ranking_score,
             predicted_fragment_intensity_index: predictions.fragment_intensity_index.as_ref().map(
-                |index| {
-                    PredictedRanges::new(
-                        &index.start.as_slice()[charge_slots.clone()],
-                        &index.end.as_slice()[charge_slots.clone()],
-                    )
-                },
+                |(index, slots)| SlotRanges::new(index.start.as_slice(), slots.from_row(first_row)),
             ),
             // Borrowed, not taken -- the owning `FragmentIntensityArrays` (with its
             // mmap handles) must stay alive on `self` for the rest of this run.
@@ -1203,6 +1205,11 @@ impl Runner {
         };
         self.log_unused_raw_precursor_windows();
         drop(predictions);
+        if !self.parameters.database.prefilter || self.compact.is_some() {
+            for feature in &mut outputs.features {
+                feature.peptide_row = Some(feature.peptide_idx.0);
+            }
+        }
         if let Some(table) = self.compact.take() {
             self.database = sliced_search::reported_database(&table, &mut outputs.features);
         }
@@ -1558,6 +1565,12 @@ impl Runner {
                 .format(feature.ms2_top6_matched_intensity)
                 .as_bytes(),
         );
+        // -1: the search did not see the whole peptide table (prefilter).
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.peptide_row.map_or(-1, i64::from))
+                .as_bytes(),
+        );
         record
     }
 
@@ -1701,6 +1714,7 @@ impl Runner {
             "ms2_hypergeometric_probability",
             "ms2_intersection",
             "ms2_top6_matched_intensity",
+            "peptide_row",
         ];
 
         let headers = csv::ByteRecord::from(csv_headers);

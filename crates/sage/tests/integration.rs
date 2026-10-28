@@ -4,7 +4,7 @@ use quickcheck_macros::quickcheck;
 use sage_core::database::{Builder, IndexedDatabase, PeptideIx};
 use sage_core::fasta::Fasta;
 use sage_core::mass::{Tolerance, PROTON};
-use sage_core::predicted::PredictedValues;
+use sage_core::predicted::{PredictedValues, SlotOrder, SlotValues, Slots};
 use sage_core::scoring::{RankingScore, ScoreType, Scorer};
 use sage_core::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use sage_core::spline::{Extrapolation, LinearSpline, ValueTolSpline};
@@ -116,6 +116,17 @@ fn target_peaks(db: &IndexedDatabase) -> (PeptideIx, Vec<Peak>) {
         .collect();
 
     (target_idx, peaks)
+}
+
+/// One predicted IIM slot per peptide of `db`: `mk_scorer` searches charge 1 only.
+fn iim_slots(db: &IndexedDatabase) -> Slots {
+    Slots {
+        order: SlotOrder::RowMajor,
+        rows: db.peptides.len(),
+        first_row: 0,
+        min_charge: 1,
+        max_charge: 1,
+    }
 }
 
 fn mk_scorer(db: &IndexedDatabase, precursor_tol: Tolerance) -> Scorer<'_> {
@@ -500,12 +511,12 @@ fn candidate_unreachable_outside_iim_tol() {
         ..Default::default()
     };
 
-    let mut predicted_iim = vec![f64::NAN; db.peptides.len()];
-    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    let mut predicted_iim = vec![f32::NAN; db.peptides.len()];
+    let slot = iim_slots(&db).get(target_idx.0 as usize, 1).unwrap();
     predicted_iim[slot] = 1.5; // far outside [0.9, 1.1]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
-    scorer.predicted_iim = Some(PredictedValues::new(&predicted_iim));
+    scorer.predicted_iim = Some(SlotValues::new(&predicted_iim, iim_slots(&db)));
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.predicted_rt = None;
     scorer.rt_tol = None;
@@ -541,12 +552,12 @@ fn candidate_reachable_within_iim_tol() {
         ..Default::default()
     };
 
-    let mut predicted_iim = vec![f64::NAN; db.peptides.len()];
-    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    let mut predicted_iim = vec![f32::NAN; db.peptides.len()];
+    let slot = iim_slots(&db).get(target_idx.0 as usize, 1).unwrap();
     predicted_iim[slot] = 1.05; // inside [0.9, 1.1]
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
-    scorer.predicted_iim = Some(PredictedValues::new(&predicted_iim));
+    scorer.predicted_iim = Some(SlotValues::new(&predicted_iim, iim_slots(&db)));
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.predicted_rt = None;
     scorer.rt_tol = None;
@@ -561,7 +572,7 @@ fn candidate_reachable_within_iim_tol() {
 }
 
 /// IIM counterpart of `delta_rt_z2_external_computed_from_sigma` — same
-/// shape, `Scorer::iim_dense_slot` indexing instead of a flat per-peptide
+/// shape, `Slots` indexing instead of a flat per-peptide
 /// array.
 #[test]
 fn delta_ims_z2_external_computed_from_sigma() {
@@ -586,12 +597,12 @@ fn delta_ims_z2_external_computed_from_sigma() {
         ..Default::default()
     };
 
-    let mut predicted_iim = vec![f64::NAN; db.peptides.len()];
-    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    let mut predicted_iim = vec![f32::NAN; db.peptides.len()];
+    let slot = iim_slots(&db).get(target_idx.0 as usize, 1).unwrap();
     predicted_iim[slot] = 1.05;
 
     let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
-    scorer.predicted_iim = Some(PredictedValues::new(&predicted_iim));
+    scorer.predicted_iim = Some(SlotValues::new(&predicted_iim, iim_slots(&db)));
     scorer.mobility_tol = Some(flat_value_tol_spline(-0.1, 0.1));
     scorer.iim_sigma = Some(0.02); // unitless (1/K0), no conversion
 
@@ -852,12 +863,12 @@ fn iim_window_is_on_observed_minus_predicted() {
     let db = mk_ppm_window_database();
     let (target_idx, _) = target_peaks(&db);
     let observed_iim = 1.0;
-    let slot = Scorer::iim_dense_slot(target_idx.0 as usize, 1, 1, 1).unwrap();
+    let slot = iim_slots(&db).get(target_idx.0 as usize, 1).unwrap();
     for (predicted, kept) in [(0.98f32, true), (1.02f32, false)] {
-        let mut predicted_iim = vec![f64::NAN; db.peptides.len()];
-        predicted_iim[slot] = predicted as f64;
+        let mut predicted_iim = vec![f32::NAN; db.peptides.len()];
+        predicted_iim[slot] = predicted;
         let mut scorer = mk_scorer(&db, Tolerance::Ppm(-50.0, 50.0));
-        scorer.predicted_iim = Some(PredictedValues::new(&predicted_iim));
+        scorer.predicted_iim = Some(SlotValues::new(&predicted_iim, iim_slots(&db)));
         scorer.mobility_tol = Some(flat_value_tol_spline(-0.01, 0.03));
         let found = score_target(&scorer, &db, 0.0, 0.0, 10.0, Some(observed_iim)).is_some();
         assert_eq!(

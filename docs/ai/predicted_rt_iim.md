@@ -54,6 +54,23 @@ optional `database`-shaped JSON (enzyme/mods/mass bounds/decoy_tag) — for
 `git/featureprediction` (a separate repo/pipeline stage) to generate
 RT/IIM predictions from.
 
+## IIM from a SPECLIB, float32; `peptide_row` in the results (2026-10-27)
+
+necromerge2 `plans/speclib_rt_iim.md`. `--predicted-iim` now takes a SPECLIB's
+`iim.mmappet`: `iim` is float32 (IM2Deep's 1/K0; the pipeline wrote float64 before), one
+value per slot in the SPECLIB's `slot_order`, NaN where there is no prediction (evicted,
+as NaN always was). `Scorer::predicted_iim` is a `SlotValues` (`crates/sage/src/predicted.rs`),
+looked up by (peptide, charge) through `Slots` -- the same slots as the fragment index.
+`--predicted-rt` is unchanged: the per-run calibrated `predicted_rt.mmappet` (float64
+minutes) the pipeline derives from the SPECLIB's HI.
+
+`results.sage.tsv` has a last column, `peptide_row`: the PSM's row in the run's whole
+peptide table, recorded before the sliced search renumbers `peptide_idx` over the reported
+peptides (`Feature::peptide_row`, set in `Runner::run`); −1 when the search saw only part
+of the table (`database.prefilter`). It is how the pipeline finds a PSM's predictions in a
+SPECLIB without the peptide's sequence string. Not in the PIN: as a mokapot feature it would
+leak mass (rows are mass-ordered).
+
 ## Eviction lookup: dense peptide-index arrays, not string-keyed maps
 
 `--predicted-rt`/`--predicted-iim` load `HashMap<String, f32>`/
