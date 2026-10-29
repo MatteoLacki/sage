@@ -14,7 +14,7 @@ use half::f16;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::ops::AddAssign;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     static WINDOWS_SCRATCH: RefCell<Vec<(f32, Tolerance)>> = RefCell::new(Vec::new());
@@ -157,7 +157,8 @@ pub struct Feature {
     /// when the search did not see the whole table (prefilter).
     #[serde(skip_serializing)]
     pub peptide_row: Option<u32>,
-    // psm_id help to match with matched fragments table.
+    /// Row number in the written results, set just before writing; links the PSM to its
+    /// matched fragments and pin row.
     pub psm_id: usize,
     pub peptide_len: usize,
     /// Spectrum id
@@ -302,12 +303,6 @@ pub struct Fragments {
     pub pmsms_rows: Vec<i64>,
     #[serde(skip_serializing)]
     pub closest_pmsms_rows: Vec<i64>,
-}
-
-static PSM_COUNTER: AtomicUsize = AtomicUsize::new(1);
-
-fn increment_psm_counter() -> usize {
-    PSM_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Stirling's approximation for log factorial
@@ -1079,7 +1074,6 @@ impl<'db> Scorer<'db> {
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
             let fragments: Option<Fragments> = score_vector[idx].1.take();
-            let psm_id = increment_psm_counter();
 
             let peptide = self.db.peptide(score.peptide);
             let precursor_mass = mz * score.precursor_charge as f32;
@@ -1126,7 +1120,7 @@ impl<'db> Scorer<'db> {
 
             features.push(Feature {
                 // Identifiers
-                psm_id,
+                psm_id: 0,
                 peptide_idx: score.peptide,
                 spec_id: query.id.clone(),
                 file_id: query.file_id,

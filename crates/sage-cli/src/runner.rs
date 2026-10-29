@@ -632,7 +632,7 @@ impl Runner {
                 feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
             });
         }
-        features.par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
+        features.par_sort_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
         sage_core::ml::qvalue::spectrum_q_value(features)
     }
 
@@ -1220,7 +1220,7 @@ impl Runner {
             // regression model for predicting retention time
             outputs
                 .features
-                .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+                .par_sort_by(|a, b| a.poisson.total_cmp(&b.poisson));
             sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
             let alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -1297,6 +1297,9 @@ impl Runner {
         );
         if self.parameters.annotate_matches {
             self.resolve_pmsms_rows(&mut outputs.features)?;
+        }
+        for (index, feature) in outputs.features.iter_mut().enumerate() {
+            feature.psm_id = index + 1;
         }
 
         log::trace!("writing outputs");
