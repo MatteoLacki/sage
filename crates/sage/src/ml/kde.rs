@@ -40,8 +40,8 @@ impl<'a> Kde<'a> {
 
         let sum = self
             .sample
-            .par_iter()
-            .fold(|| 0.0, |acc, xi| acc + self.kernel((x - xi) / h))
+            .iter()
+            .map(|xi| self.kernel((x - xi) / h))
             .sum::<f64>();
 
         sum / self.constant
@@ -111,6 +111,7 @@ impl Builder {
 
         // Calculate PEP for 1000 evenly spaced scores
         let mut bins = (0..self.bins)
+            .into_par_iter()
             .map(|bin| {
                 let score = (bin as f64 * score_step) + min_score;
                 let decoy = decoy.pdf(score) * pi;
