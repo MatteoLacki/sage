@@ -173,13 +173,16 @@ Restrictions, all hard errors from `CompactPeptides::new` or `compress`:
 - ≤ 254 distinct variable-mod masses
 - residues and rows fit `u32`
 
-## Duplicate attributes are arbitrary in sage itself
+## Duplicate attributes
 
 When `reorder_peptides` merges equal peptides from different digests (same sequence,
 mods and mass, from different proteins or protein positions), the survivor's
-`position`, `semi_enzymatic` and `missed_cleavages` belong to whichever duplicate
-`par_sort_unstable_by` left first. That depends on the whole array, so a per-length
-digest and a full digest can keep different ones.
+`position`, `semi_enzymatic` and `missed_cleavages` are the smallest of its duplicates':
+its sort orders on them after mass and `initial_sort`. Until 2026-10-29 it didn't, so
+the survivor was whichever duplicate `par_sort_unstable_by` left first, which changed
+from run to run (178 F9477 rows' `position` between two builds) and between a
+per-length and a full digest. The non-specific direct build keeps the smallest
+`start` instead, which can be a different duplicate.
 
 - **`position`:** read only while applying mods, which is already done, so it
   doesn't matter.

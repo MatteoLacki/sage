@@ -250,11 +250,17 @@ impl Parameters {
         log::trace!("sorting and deduplicating peptides");
 
         let init_size = target_decoys.len();
-        // This is equivalent to a stable sort
+        // Duplicates (equal mass and `initial_sort`) can still differ in position,
+        // semi-enzymatic and missed cleavages; ordering on those too makes the
+        // survivor of `dedup_by` the same on every run.
         target_decoys.par_sort_unstable_by(|a, b| {
             a.monoisotopic
                 .total_cmp(&b.monoisotopic)
                 .then_with(|| a.initial_sort(b))
+                .then_with(|| {
+                    (a.position, a.semi_enzymatic, a.missed_cleavages)
+                        .cmp(&(b.position, b.semi_enzymatic, b.missed_cleavages))
+                })
         });
         target_decoys.dedup_by(|remove, keep| {
             if remove.monoisotopic == keep.monoisotopic
